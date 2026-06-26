@@ -46,6 +46,20 @@
       ]
     },
     {
+      "id": "yunwu",
+      "name": "Yunwu (云雾)",
+      "mode": "anthropic",
+      "baseUrl": "https://yunwu.ai",
+      "keyEnv": "YUNWU_API_KEY",
+      "keyUrl": "https://yunwu.ai",
+      "disable1mContext": true,
+      "models": [
+        { "id": "claude-opus-4-8", "name": "Claude Opus 4.8" },
+        { "id": "claude-opus-4-7", "name": "Claude Opus 4.7" },
+        { "id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6" }
+      ]
+    },
+    {
       "id": "sakana",
       "name": "Sakana (Fugu)",
       "mode": "openai",
