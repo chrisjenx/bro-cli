@@ -4,6 +4,7 @@ import { loadModels, mergeProviders, updateModels, REMOTE_URL } from './models.j
 import { select, promptHidden } from './ui.js';
 import { launch } from './launch.js';
 import { runPool, runPoolAccounts, POOL_PROVIDER } from './pool.js';
+import { runImageGen, IMAGE_PROVIDER } from './imagegen.js';
 import { rememberSelection, lastProvider, lastModelFor } from './state.js';
 
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
@@ -19,6 +20,9 @@ Usage:
                          Add/log in a Claude account for the pool
   bro accounts import <name>
                          Copy this machine's current Claude login into the pool
+  bro image              Image generation — pick an API, then a self-hosted
+                         web UI opens (images save to ./.bro/image-gen)
+  bro image -p <api>     Skip the image API menu (e.g. bro image -p yunwu)
   bro -p <provider>      Skip the provider menu (id or name)
   bro -m <model>         Skip the model menu (use with -p)
   bro -l, --list         List every provider and model
@@ -46,6 +50,7 @@ function parseArgs(argv) {
     else if (t === '--model' || t === '-m') a.model = argv[++i];
     else if (t === '--list' || t === '-l') a.list = true;
     else if (t === 'update' || t === '--update') a.update = true;
+    else if (t === 'image' || t === 'image-gen' || t === '--image') a.image = true;
     else if (t === '--dry-run') a.dryRun = true;
     else if (t === '--safe') a.safe = true;
     else if (t === '--help' || t === '-h') a.help = true;
@@ -63,11 +68,13 @@ function parseArgs(argv) {
 const tagOf = (p) =>
   p.mode === 'pool'
     ? 'rotate accounts'
-    : p.mode === 'native'
-      ? 'native'
-      : p.mode === 'anthropic'
-        ? 'anthropic-api'
-        : 'via proxy';
+    : p.mode === 'image'
+      ? 'web ui'
+      : p.mode === 'native'
+        ? 'native'
+        : p.mode === 'anthropic'
+          ? 'anthropic-api'
+          : 'via proxy';
 const modelLabel = (m) => (m.name ? `${m.name}  ${m.id ? `\x1b[2m(${m.id})\x1b[0m` : ''}` : m.id || '(default)');
 
 export async function main(argv) {
@@ -95,9 +102,15 @@ export async function main(argv) {
 
   ensureDefaultConfig();
   const config = loadConfig();
+
+  // `bro image` goes straight to the image-gen web UI (no claude involved).
+  if (args.image) {
+    return runImageGen({ config, apiId: args.provider, dryRun: args.dryRun });
+  }
+
   const data = await loadModels();
-  // The account pool is always the top option — no models.json entry needed.
-  const providers = [POOL_PROVIDER, ...mergeProviders(data, config.providers)];
+  // The account pool and image gen are always pinned on top — no models.json entry needed.
+  const providers = [POOL_PROVIDER, IMAGE_PROVIDER, ...mergeProviders(data, config.providers)];
 
   if (!providers.length) {
     console.error('No providers available. Check your network or ~/.bro/config.json.');
@@ -132,6 +145,12 @@ export async function main(argv) {
     }).catch(() => null);
     if (!choice) { console.log('Cancelled.'); return 0; }
     provider = choice.value;
+  }
+
+  // Image gen: pick an image API, then serve the local web UI.
+  if (provider.mode === 'image') {
+    if (!args.dryRun) rememberSelection(provider.id, lastModelFor(provider.id) ?? '');
+    return runImageGen({ config, dryRun: args.dryRun });
   }
 
   // Account pool: its own setup → start proxy → launch claude flow.

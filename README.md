@@ -46,6 +46,24 @@ bro accounts remove work      # delete a pooled account
 
 **Failover:** when the serving account's usage/rate limit runs out before any output has streamed, the pool transparently sidelines it and retries the turn on the next account — you just keep going. Set `CLAUDE_POOL_BACKEND=cli` to use the older subprocess backend. Requires Bun (`bro` finds it automatically; install from [bun.sh](https://bun.sh)). See [`pool/README.md`](./pool/README.md) for the pool's own docs, endpoints, and configuration.
 
+## 🎨 Image Gen
+
+`bro image` (also the second option in the menu) doesn't launch Claude at all — it asks which image API to use (Yunwu with `gpt-image-2` first, plus OpenAI), then serves a local web UI and opens it in your browser.
+
+- **Prompt fast** — type, press Enter, keep typing. Every generation is a card that shimmers while it works and fades the image in when it lands.
+- **Concurrent by design** — the batch stepper fires N generations at once, and you can keep firing more while others are still running.
+- **Switch models in the UI** — pick from the API's list (including chat-routed models like `gemini-3.1-flash-image`) or type any custom model id. Size and quality knobs included where the API supports them.
+- **Files land in `./.bro/image-gen/`** of the directory you launched from, with a `history.jsonl` so the gallery survives reloads.
+
+```sh
+bro image             # pick an image API, then the web UI opens
+bro image -p yunwu    # skip the API menu
+```
+
+Keys are shared with the chat provider of the same id, so a saved Yunwu key just works. Add your own APIs via `imageApis` in `~/.bro/config.json` (merged by `id`, same as providers).
+
+## Providers
+
 Claude is next in the list and runs **natively** (your normal Claude login — no proxy). Other Anthropic-compatible providers (OpenRouter, Z.ai) just point Claude at their endpoint. OpenAI-format providers (Sakana, OpenAI, DeepSeek, Groq, …) are routed through [`claude-code-router`](https://github.com/musistudio/claude-code-router), which `bro` installs for you the first time you need it.
 
 ### Flags
