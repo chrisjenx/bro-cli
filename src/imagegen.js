@@ -255,13 +255,14 @@ function readHistory(outDir, limit = 300) {
 
 // ---------- context library (.bro/context — reference images, deduped by hash) ----------
 
-function readContext(ctxDir) {
+function readContext(ctxDir, limit = 500) {
   try {
     return fs
       .readdirSync(ctxDir)
       .filter((f) => TYPE_BY_EXT[path.extname(f).slice(1).toLowerCase()])
       .map((f) => ({ file: f, ts: fs.statSync(path.join(ctxDir, f)).mtimeMs }))
-      .sort((a, b) => b.ts - a.ts);
+      .sort((a, b) => b.ts - a.ts)
+      .slice(0, limit);
   } catch {
     return [];
   }

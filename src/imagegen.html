@@ -491,6 +491,26 @@
   const MAX_ATTACH = 8, MAX_DIM = 2048;
   const ctxUrl = (f) => '/context/' + encodeURIComponent(f);
 
+  // ---- viewport-based image loading ----
+  // Decoded bitmap memory (not DOM node count) is what actually blows up a long
+  // session's memory — so images load their src on approach and drop it again once
+  // scrolled well out of view, instead of every <img> ever created holding a decode.
+  const lazyObserver = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      const img = e.target;
+      if (e.isIntersecting) {
+        if (img.dataset.src && img.src !== img.dataset.src) img.src = img.dataset.src;
+      } else if (img.dataset.src) {
+        img.removeAttribute('src');
+        img.classList.remove('ready');
+      }
+    }
+  }, { rootMargin: '800px 0px' });
+  function lazyImg(img, src) {
+    img.dataset.src = src;
+    lazyObserver.observe(img);
+  }
+
   function renderRefs() {
     attachRow.innerHTML = '';
     attachRow.classList.toggle('has', attachments.length > 0);
@@ -509,6 +529,7 @@
       attachRow.appendChild(chip);
     }
 
+    ctxRow.querySelectorAll('img').forEach((img) => lazyObserver.unobserve(img));
     ctxRow.innerHTML = '';
     ctxBar.classList.toggle('has', ctxItems.length > 0);
     for (const it of ctxItems) {
@@ -517,7 +538,7 @@
       d.className = 'ctx-item' + (sel ? ' sel' : '');
       d.title = sel ? 'Click to detach' : 'Click to attach';
       const img = document.createElement('img');
-      img.src = ctxUrl(it.file);
+      lazyImg(img, ctxUrl(it.file));
       img.alt = it.file;
       const rm = document.createElement('button');
       rm.className = 'rm';
@@ -635,6 +656,13 @@
   const galleryBar = $('galleryBar');
   const syncGalleryBar = () => galleryBar.classList.toggle('has', !!gallery.querySelector('.card'));
 
+  // Always route card removal through here so the lazy-loading observer never
+  // keeps a reference to a detached <img> (that would itself leak memory).
+  function removeCard(card) {
+    card.querySelectorAll('img').forEach((img) => lazyObserver.unobserve(img));
+    card.remove();
+  }
+
   $('deleteAll').onclick = async () => {
     const cards = [...gallery.querySelectorAll('.card')].filter((c) => !c.classList.contains('generating'));
     if (!cards.length) return;
@@ -642,11 +670,22 @@
     if (!confirm('Delete all ' + n + ' generated image' + (n === 1 ? '' : 's') + '? This can’t be undone. (Context images are kept.)')) return;
     const r = await fetch('/api/delete-all', { method: 'POST' });
     if (!r.ok) { toast('Delete failed'); return; }
-    cards.forEach((c) => c.remove());
+    cards.forEach(removeCard);
     if (!gallery.querySelector('.card')) empty.style.display = '';
     syncGalleryBar();
     toast('Deleted ' + (await r.json()).deleted + ' images');
   };
+
+  // Cards accumulate over a session (each generation prepends one) — cap how many
+  // stay in the DOM so memory doesn't grow without bound in long-running sessions.
+  const MAX_CARDS = 400;
+  function trimGallery() {
+    const cards = [...gallery.querySelectorAll('.card')];
+    for (const c of cards.slice(MAX_CARDS).reverse()) {
+      if (c.classList.contains('generating')) continue;
+      removeCard(c);
+    }
+  }
 
   function baseCard() {
     empty.style.display = 'none';
@@ -660,6 +699,7 @@
       '<span class="actions"></span></div></div>';
     gallery.prepend(card);
     syncGalleryBar();
+    trimGallery();
     return card;
   }
 
@@ -669,7 +709,7 @@
     const frame = card.querySelector('.frame');
     frame.innerHTML = '';
     const img = document.createElement('img');
-    img.src = '/images/' + encodeURIComponent(item.file);
+    lazyImg(img, '/images/' + encodeURIComponent(item.file));
     img.alt = item.prompt;
     img.onload = () => img.classList.add('ready');
     img.onclick = () => openLightbox(item);
@@ -695,7 +735,7 @@
     mk('⤓', 'Download', () => { const a = document.createElement('a'); a.href = '/images/' + encodeURIComponent(item.file); a.download = item.file; a.click(); });
     mk('✕', 'Delete', async () => {
       await fetch('/api/delete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ file: item.file }) });
-      card.remove();
+      removeCard(card);
       if (!gallery.querySelector('.card')) empty.style.display = '';
       syncGalleryBar();
     }, 'del');
@@ -737,7 +777,7 @@
         msg.textContent = e.message || 'Generation failed';
         const retry = document.createElement('button');
         retry.textContent = 'Retry';
-        retry.onclick = () => { card.remove(); fireGeneration(prompt, model, size, quality, images); if (!gallery.querySelector('.card')) empty.style.display = ''; };
+        retry.onclick = () => { removeCard(card); fireGeneration(prompt, model, size, quality, images); if (!gallery.querySelector('.card')) empty.style.display = ''; };
         div.append(msg, retry);
         frame.appendChild(div);
         card.querySelector('.time').textContent = fmtSec(Date.now() - started);
