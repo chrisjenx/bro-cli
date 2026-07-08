@@ -17,6 +17,8 @@ export interface Config {
   accountsDir: string;
   /** File where rolling usage counters are persisted between restarts. */
   usageFile: string;
+  /** File where the model routing table is persisted between restarts. */
+  modelsFile: string;
   /** Path to the `claude` executable. */
   claudeBin: string;
   /** Inference backend for /v1/messages: direct OAuth proxy by default, CLI as fallback. */
@@ -64,11 +66,13 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
   const poolDir = process.env.CLAUDE_POOL_DIR || join(homedir(), ".claude-max-pool");
   const accountsDir = join(poolDir, "accounts");
   const usageFile = join(poolDir, "usage.json");
+  const modelsFile = join(poolDir, "models.json");
 
   const config: Config = {
     poolDir,
     accountsDir,
     usageFile,
+    modelsFile,
     claudeBin: process.env.CLAUDE_BIN || "claude",
     backend: backendEnv(),
     anthropicApiBaseUrl: process.env.ANTHROPIC_API_BASE_URL || "https://api.anthropic.com",

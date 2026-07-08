@@ -10,6 +10,7 @@
 
 import type { Config } from "../config.ts";
 import { AccountManager } from "../accounts/manager.ts";
+import { loadModelTable } from "../models.ts";
 import { runClaude } from "../subprocess/claude.ts";
 import type { Account } from "../accounts/types.ts";
 import { runWithFailover } from "./failover.ts";
@@ -32,17 +33,9 @@ const APPEND_SYSTEM_PROMPT =
   "You are being used as an API model endpoint. Respond directly to the user's request. " +
   "Do not ask clarifying questions unless strictly necessary; produce the best answer you can from the information given.";
 
-const MODELS = [
-  "opus",
-  "sonnet",
-  "haiku",
-  "claude-opus-4-8",
-  "claude-sonnet-5",
-  "claude-haiku-4-5",
-];
-
 export function startServer(config: Config): void {
   const mgr = new AccountManager(config);
+  const modelTable = loadModelTable(config.modelsFile);
 
   const server = Bun.serve({
     hostname: config.host,
@@ -73,11 +66,11 @@ export function startServer(config: Config): void {
       if (req.method === "GET" && (path === "/v1/models" || path === "/models")) {
         return json({
           object: "list",
-          data: MODELS.map((m) => ({
-            id: m,
+          data: modelTable.map((m) => ({
+            id: m.id,
             object: "model",
             created: 0,
-            owned_by: "anthropic-claude-max-pool",
+            owned_by: m.provider === "openai" ? "openai-chatgpt-pool" : "anthropic-claude-max-pool",
           })),
         });
       }
