@@ -9,7 +9,7 @@
 
 import type { Config } from "../config.ts";
 import { AccountManager } from "../accounts/manager.ts";
-import type { Account, ClaudeOauthCreds } from "../accounts/types.ts";
+import type { Account, ClaudeOauthCreds, RateLimitSnapshot } from "../accounts/types.ts";
 import type { CliUsage } from "../subprocess/types.ts";
 
 interface ProxyHooks {
@@ -111,6 +111,10 @@ async function tryAccount(
       mgr.recordError(account.name, message);
       return { kind: "retry", reason: authOrNetworkReason(message) };
     }
+  }
+
+  if (hasRateLimitHeaders(upstream.response.headers)) {
+    mgr.recordRateLimitSnapshot(account.name, parseRateLimitSnapshot(upstream.response.headers));
   }
 
   const streamRequested = bodyRequestsStream(bodyText);
@@ -537,6 +541,43 @@ function isRateLimit(type: string, message: string): boolean {
     text.includes("limit reached") ||
     text.includes("too many requests")
   );
+}
+
+const RATE_LIMIT_HEADER_PREFIXES = ["requests", "tokens", "input-tokens", "output-tokens"] as const;
+
+function hasRateLimitHeaders(headers: Headers): boolean {
+  return RATE_LIMIT_HEADER_PREFIXES.some((p) => headers.has(`anthropic-ratelimit-${p}-limit`));
+}
+
+/** Reads Anthropic's `anthropic-ratelimit-*` headers verbatim — present on every direct-OAuth response. */
+function parseRateLimitSnapshot(headers: Headers): RateLimitSnapshot {
+  const intHeader = (name: string): number | null => {
+    const raw = headers.get(name);
+    if (!raw) return null;
+    const n = Number.parseInt(raw, 10);
+    return Number.isFinite(n) ? n : null;
+  };
+  const dateHeader = (name: string): number | null => {
+    const raw = headers.get(name);
+    if (!raw) return null;
+    const parsed = Date.parse(raw);
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+  return {
+    requestsLimit: intHeader("anthropic-ratelimit-requests-limit"),
+    requestsRemaining: intHeader("anthropic-ratelimit-requests-remaining"),
+    requestsReset: dateHeader("anthropic-ratelimit-requests-reset"),
+    tokensLimit: intHeader("anthropic-ratelimit-tokens-limit"),
+    tokensRemaining: intHeader("anthropic-ratelimit-tokens-remaining"),
+    tokensReset: dateHeader("anthropic-ratelimit-tokens-reset"),
+    inputTokensLimit: intHeader("anthropic-ratelimit-input-tokens-limit"),
+    inputTokensRemaining: intHeader("anthropic-ratelimit-input-tokens-remaining"),
+    inputTokensReset: dateHeader("anthropic-ratelimit-input-tokens-reset"),
+    outputTokensLimit: intHeader("anthropic-ratelimit-output-tokens-limit"),
+    outputTokensRemaining: intHeader("anthropic-ratelimit-output-tokens-remaining"),
+    outputTokensReset: dateHeader("anthropic-ratelimit-output-tokens-reset"),
+    updatedAt: Date.now(),
+  };
 }
 
 function resetAtFromHeaders(headers: Headers): number | undefined {

@@ -12,7 +12,7 @@ import { mkdirSync, existsSync, readdirSync, readFileSync, writeFileSync, rmSync
 import { join } from "path";
 import type { Config } from "../config.ts";
 import { defaultClaudeConfigDir } from "../config.ts";
-import type { Account, AccountUsage, CredentialsFile } from "./types.ts";
+import type { Account, AccountUsage, CredentialsFile, RateLimitSnapshot } from "./types.ts";
 import { emptyUsage } from "./types.ts";
 import {
   keychainServiceForConfigDir,
@@ -201,6 +201,12 @@ export class AccountManager {
       available = false;
       const mins = Math.ceil((usage.rateLimitedUntil! - now) / 60000);
       reason = `rate limited — retry in ~${mins} min`;
+    } else {
+      const soft = exhaustedReason(usage.rateLimitStatus, now);
+      if (soft) {
+        available = false;
+        reason = soft;
+      }
     }
 
     return {
@@ -226,9 +232,11 @@ export class AccountManager {
 
   /**
    * Pick an account to serve a request. Honors session affinity when the chosen
-   * account is still available and not excluded; otherwise selects the
-   * least-loaded available account (fewest requests in the current window),
-   * round-robin on ties.
+   * account is still available and not excluded; otherwise prefers the account
+   * with the most real headroom left (per Anthropic's own rate-limit headers,
+   * when we've seen one), falling back to fewest requests in the current
+   * window for accounts we have no live headroom data for yet. Round-robin on
+   * ties.
    *
    * @param exclude account names to skip (e.g. ones already tried this request
    *   during failover).
@@ -249,12 +257,22 @@ export class AccountManager {
     if (available.length === 0) return null;
 
     let best = available[0]!;
+    let bestHeadroom = headroomFraction(best.usage);
     for (const a of available) {
-      if (a.usage.windowRequests < best.usage.windowRequests) best = a;
+      const headroom = headroomFraction(a.usage);
+      if (
+        headroom > bestHeadroom ||
+        (headroom === bestHeadroom && a.usage.windowRequests < best.usage.windowRequests)
+      ) {
+        best = a;
+        bestHeadroom = headroom;
+      }
     }
-    // Round-robin among the accounts tied for the minimum load.
+    // Round-robin among the accounts tied for the best headroom + load.
     const minLoad = best.usage.windowRequests;
-    const tied = available.filter((a) => a.usage.windowRequests === minLoad);
+    const tied = available.filter(
+      (a) => headroomFraction(a.usage) === bestHeadroom && a.usage.windowRequests === minLoad,
+    );
     if (tied.length > 1) {
       best = tied[this.rrCursor % tied.length]!;
       this.rrCursor = (this.rrCursor + 1) % tied.length;
@@ -303,6 +321,13 @@ export class AccountManager {
     this.saveState();
   }
 
+  /** Record Anthropic's latest rate-limit headroom snapshot for this account. */
+  recordRateLimitSnapshot(name: string, snapshot: RateLimitSnapshot): void {
+    const u = this.usageFor(name);
+    u.rateLimitStatus = snapshot;
+    this.saveState();
+  }
+
   clearRateLimit(name: string): void {
     const u = this.usageFor(name);
     u.rateLimitedUntil = null;
@@ -321,4 +346,49 @@ export class AccountManager {
       return 0;
     }
   }
+}
+
+/**
+ * Fraction of headroom [0, 1] left before Anthropic's own limits kick in,
+ * per Anthropic's real remaining/limit headers. 1 (full headroom, i.e. no
+ * penalty) when we have no live snapshot for this account yet — e.g. it just
+ * joined the pool, or it's served via the CLI-subprocess backend, which has
+ * no HTTP access to these headers.
+ */
+function headroomFraction(usage: AccountUsage): number {
+  const rl = usage.rateLimitStatus;
+  if (!rl) return 1;
+  const fractions: number[] = [];
+  const pairs: Array<[number | null, number | null]> = [
+    [rl.requestsRemaining, rl.requestsLimit],
+    [rl.tokensRemaining, rl.tokensLimit],
+  ];
+  for (const [remaining, limit] of pairs) {
+    if (remaining != null && limit != null && limit > 0) {
+      fractions.push(Math.max(0, remaining / limit));
+    }
+  }
+  return fractions.length > 0 ? Math.min(...fractions) : 1;
+}
+
+/**
+ * True (with a human-readable reason) when Anthropic reports zero headroom
+ * left on this account and its reset window hasn't passed yet — i.e. the
+ * account is going to 429 if we route to it, so sideline it proactively.
+ */
+function exhaustedReason(rl: RateLimitSnapshot | null, now: number): string | null {
+  if (!rl) return null;
+  const dimensions: Array<[string, number | null, number | null]> = [
+    ["requests", rl.requestsRemaining, rl.requestsReset],
+    ["tokens", rl.tokensRemaining, rl.tokensReset],
+    ["input tokens", rl.inputTokensRemaining, rl.inputTokensReset],
+    ["output tokens", rl.outputTokensRemaining, rl.outputTokensReset],
+  ];
+  for (const [label, remaining, reset] of dimensions) {
+    if (remaining != null && remaining <= 0 && reset != null && reset > now) {
+      const mins = Math.ceil((reset - now) / 60000);
+      return `usage limit reached (${label}) — resets in ~${mins} min`;
+    }
+  }
+  return null;
 }

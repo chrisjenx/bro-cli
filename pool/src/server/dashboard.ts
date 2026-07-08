@@ -262,9 +262,28 @@ function card(a) {
   const dot = a.available ? "ok" : (a.authenticated ? "warn" : "err");
   const state = a.available ? "Ready" : (a.authenticated ? "Sidelined" : "Logged out");
   const u = a.usage;
-  const reqPct = Math.min(100, (u.windowRequests / 200) * 100);
+  const rl = u.rateLimitStatus;
   const tok = u.windowInputTokens + u.windowOutputTokens;
-  const tokPct = Math.min(100, tok / 1000000 * 100);
+
+  // Prefer Anthropic's own remaining/limit headers over our local estimate.
+  const haveReqData = rl && rl.requestsLimit != null && rl.requestsRemaining != null;
+  const haveTokData = rl && rl.tokensLimit != null && rl.tokensRemaining != null;
+  const reqPct = haveReqData
+    ? Math.min(100, 100 - (Math.max(0, rl.requestsRemaining) / rl.requestsLimit) * 100)
+    : Math.min(100, (u.windowRequests / 200) * 100);
+  const tokPct = haveTokData
+    ? Math.min(100, 100 - (Math.max(0, rl.tokensRemaining) / rl.tokensLimit) * 100)
+    : Math.min(100, tok / 1000000 * 100);
+  const reqNum = haveReqData
+    ? fmtInt(rl.requestsRemaining) + " / " + fmtInt(rl.requestsLimit) + " left"
+    : fmtInt(u.windowRequests) + " req (est.)";
+  const tokNum = haveTokData
+    ? fmtInt(rl.tokensRemaining) + " / " + fmtInt(rl.tokensLimit) + " left"
+    : fmtInt(tok) + " (est.)";
+
+  const resetTs = rl ? (rl.requestsReset ?? rl.tokensReset) : null;
+  const limitResetRow = resetTs
+    ? '<span class="k">Limit resets</span><span class="v">' + timeUntil(resetTs) + "</span>" : "";
   const note = a.unavailableReason
     ? '<div class="note ' + (a.authenticated ? "" : "err") + '">' + esc(a.unavailableReason) + "</div>"
     : (u.lastError ? '<div class="note">Last error: ' + esc(u.lastError) + "</div>" : "");
@@ -279,19 +298,19 @@ function card(a) {
       <span class="k">Status</span><span class="v">\${state}</span>
       <span class="k">Rate tier</span><span class="v">\${esc(a.rateLimitTier || "–")}</span>
       <span class="k">Token</span><span class="v">\${a.tokenExpired ? "auto-refreshing" : "valid · " + timeUntil(a.tokenExpiresAt)}</span>
-      <span class="k">Requests (window)</span><span class="v">\${fmtInt(u.windowRequests)}</span>
       <span class="k">Cost (window)</span><span class="v">\${fmtUsd(u.windowCostUsd)}</span>
       <span class="k">Total requests</span><span class="v">\${fmtInt(u.totalRequests)}</span>
       <span class="k">Last used</span><span class="v">\${ago(u.lastUsedAt)}</span>
+      \${limitResetRow}
       \${cooldownRow}
     </div>
     <div class="bars">
       <div>
-        <div class="bar-label"><span>Window load</span><span class="num">\${fmtInt(u.windowRequests)} req</span></div>
+        <div class="bar-label"><span>Requests\${haveReqData ? "" : " (est.)"}</span><span class="num">\${reqNum}</span></div>
         <div class="bar"><span style="width:\${reqPct}%"></span></div>
       </div>
       <div>
-        <div class="bar-label"><span>Window tokens</span><span class="num">\${fmtInt(tok)}</span></div>
+        <div class="bar-label"><span>Tokens\${haveTokData ? "" : " (est.)"}</span><span class="num">\${tokNum}</span></div>
         <div class="bar"><span style="width:\${tokPct}%"></span></div>
       </div>
     </div>
