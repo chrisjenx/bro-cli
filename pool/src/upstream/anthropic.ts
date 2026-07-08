@@ -543,39 +543,41 @@ function isRateLimit(type: string, message: string): boolean {
   );
 }
 
-const RATE_LIMIT_HEADER_PREFIXES = ["requests", "tokens", "input-tokens", "output-tokens"] as const;
-
 function hasRateLimitHeaders(headers: Headers): boolean {
-  return RATE_LIMIT_HEADER_PREFIXES.some((p) => headers.has(`anthropic-ratelimit-${p}-limit`));
+  // Claude subscription (OAuth) traffic reports a unified rolling-window model.
+  return (
+    headers.has("anthropic-ratelimit-unified-status") ||
+    headers.has("anthropic-ratelimit-unified-5h-status") ||
+    headers.has("anthropic-ratelimit-unified-7d-status")
+  );
 }
 
-/** Reads Anthropic's `anthropic-ratelimit-*` headers verbatim — present on every direct-OAuth response. */
+/**
+ * Reads Anthropic's `anthropic-ratelimit-unified-*` headers verbatim — present
+ * on every direct subscription (OAuth) response. Reset headers are unix seconds.
+ */
 function parseRateLimitSnapshot(headers: Headers): RateLimitSnapshot {
-  const intHeader = (name: string): number | null => {
+  const floatHeader = (name: string): number | null => {
+    const raw = headers.get(name);
+    if (raw == null || raw === "") return null;
+    const n = Number.parseFloat(raw);
+    return Number.isFinite(n) ? n : null;
+  };
+  const epochSecondsHeader = (name: string): number | null => {
     const raw = headers.get(name);
     if (!raw) return null;
     const n = Number.parseInt(raw, 10);
-    return Number.isFinite(n) ? n : null;
+    return Number.isFinite(n) ? n * 1000 : null;
   };
-  const dateHeader = (name: string): number | null => {
-    const raw = headers.get(name);
-    if (!raw) return null;
-    const parsed = Date.parse(raw);
-    return Number.isFinite(parsed) ? parsed : null;
-  };
+  const strHeader = (name: string): string | null => headers.get(name);
   return {
-    requestsLimit: intHeader("anthropic-ratelimit-requests-limit"),
-    requestsRemaining: intHeader("anthropic-ratelimit-requests-remaining"),
-    requestsReset: dateHeader("anthropic-ratelimit-requests-reset"),
-    tokensLimit: intHeader("anthropic-ratelimit-tokens-limit"),
-    tokensRemaining: intHeader("anthropic-ratelimit-tokens-remaining"),
-    tokensReset: dateHeader("anthropic-ratelimit-tokens-reset"),
-    inputTokensLimit: intHeader("anthropic-ratelimit-input-tokens-limit"),
-    inputTokensRemaining: intHeader("anthropic-ratelimit-input-tokens-remaining"),
-    inputTokensReset: dateHeader("anthropic-ratelimit-input-tokens-reset"),
-    outputTokensLimit: intHeader("anthropic-ratelimit-output-tokens-limit"),
-    outputTokensRemaining: intHeader("anthropic-ratelimit-output-tokens-remaining"),
-    outputTokensReset: dateHeader("anthropic-ratelimit-output-tokens-reset"),
+    unifiedStatus: strHeader("anthropic-ratelimit-unified-status"),
+    fiveHourStatus: strHeader("anthropic-ratelimit-unified-5h-status"),
+    fiveHourUtilization: floatHeader("anthropic-ratelimit-unified-5h-utilization"),
+    fiveHourReset: epochSecondsHeader("anthropic-ratelimit-unified-5h-reset"),
+    sevenDayStatus: strHeader("anthropic-ratelimit-unified-7d-status"),
+    sevenDayUtilization: floatHeader("anthropic-ratelimit-unified-7d-utilization"),
+    sevenDayReset: epochSecondsHeader("anthropic-ratelimit-unified-7d-reset"),
     updatedAt: Date.now(),
   };
 }

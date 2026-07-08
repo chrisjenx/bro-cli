@@ -350,44 +350,46 @@ export class AccountManager {
 
 /**
  * Fraction of headroom [0, 1] left before Anthropic's own limits kick in,
- * per Anthropic's real remaining/limit headers. 1 (full headroom, i.e. no
- * penalty) when we have no live snapshot for this account yet — e.g. it just
- * joined the pool, or it's served via the CLI-subprocess backend, which has
- * no HTTP access to these headers.
+ * derived from the tightest unified rolling window's utilization (5h or 7d).
+ * 1 (full headroom, i.e. no penalty) when we have no live snapshot for this
+ * account yet — e.g. it just joined the pool, or it's served via the
+ * CLI-subprocess backend, which has no HTTP access to these headers.
  */
 function headroomFraction(usage: AccountUsage): number {
   const rl = usage.rateLimitStatus;
   if (!rl) return 1;
-  const fractions: number[] = [];
-  const pairs: Array<[number | null, number | null]> = [
-    [rl.requestsRemaining, rl.requestsLimit],
-    [rl.tokensRemaining, rl.tokensLimit],
-  ];
-  for (const [remaining, limit] of pairs) {
-    if (remaining != null && limit != null && limit > 0) {
-      fractions.push(Math.max(0, remaining / limit));
-    }
-  }
-  return fractions.length > 0 ? Math.min(...fractions) : 1;
+  const utilizations = [rl.fiveHourUtilization, rl.sevenDayUtilization].filter(
+    (u): u is number => u != null,
+  );
+  if (utilizations.length === 0) return 1;
+  // The window closest to full (highest utilization) is the binding constraint.
+  return Math.max(0, 1 - Math.max(...utilizations));
+}
+
+/** A unified-window status that means the account can't currently serve traffic. */
+function isBlockingStatus(status: string | null): boolean {
+  if (!status) return false;
+  const s = status.toLowerCase();
+  return s === "rejected" || s === "blocked" || s === "exhausted";
 }
 
 /**
- * True (with a human-readable reason) when Anthropic reports zero headroom
- * left on this account and its reset window hasn't passed yet — i.e. the
- * account is going to 429 if we route to it, so sideline it proactively.
+ * True (with a human-readable reason) when Anthropic reports a unified window
+ * fully consumed (utilization ≥ 1) or explicitly blocked, and that window's
+ * reset hasn't passed yet — i.e. the account is going to 429 if we route to
+ * it, so sideline it proactively.
  */
 function exhaustedReason(rl: RateLimitSnapshot | null, now: number): string | null {
   if (!rl) return null;
-  const dimensions: Array<[string, number | null, number | null]> = [
-    ["requests", rl.requestsRemaining, rl.requestsReset],
-    ["tokens", rl.tokensRemaining, rl.tokensReset],
-    ["input tokens", rl.inputTokensRemaining, rl.inputTokensReset],
-    ["output tokens", rl.outputTokensRemaining, rl.outputTokensReset],
+  const windows: Array<[string, string | null, number | null, number | null]> = [
+    ["5h", rl.fiveHourStatus, rl.fiveHourUtilization, rl.fiveHourReset],
+    ["7d", rl.sevenDayStatus, rl.sevenDayUtilization, rl.sevenDayReset],
   ];
-  for (const [label, remaining, reset] of dimensions) {
-    if (remaining != null && remaining <= 0 && reset != null && reset > now) {
+  for (const [label, status, utilization, reset] of windows) {
+    const spent = (utilization != null && utilization >= 1) || isBlockingStatus(status);
+    if (spent && reset != null && reset > now) {
       const mins = Math.ceil((reset - now) / 60000);
-      return `usage limit reached (${label}) — resets in ~${mins} min`;
+      return `usage limit reached (${label} window) — resets in ~${mins} min`;
     }
   }
   return null;
