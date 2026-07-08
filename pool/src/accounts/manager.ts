@@ -23,6 +23,7 @@ import type {
 } from "./types.ts";
 import { emptyUsage, OPENAI_CREDS_FILENAME, normalizeRateLimitSnapshot, sortRateLimitWindows } from "./types.ts";
 import {
+  deleteKeychainCreds,
   keychainServiceForConfigDir,
   readKeychainCreds,
   readKeychainCredsForConfigDir,
@@ -123,6 +124,12 @@ export class AccountManager {
     const dir = this.configDirFor(name);
     if (!existsSync(dir)) throw new Error(`Account "${name}" does not exist`);
     rmSync(dir, { recursive: true, force: true });
+    // macOS keeps this account's login in the Keychain, independent of the
+    // directory — without this, readCreds()'s Keychain fallback would keep
+    // reporting a removed account as authenticated forever.
+    if (process.platform === "darwin") {
+      deleteKeychainCreds(keychainServiceForConfigDir(dir));
+    }
     delete this.usage[name];
     this.saveState();
   }
@@ -164,6 +171,11 @@ export class AccountManager {
   // ---- status ------------------------------------------------------------
 
   private readCreds(name: string): CredentialsFile | null {
+    // An account that's been removed has no directory. Without this check the
+    // Keychain fallback below would keep resolving credentials for it forever
+    // (macOS never deletes that item on its own), letting a removed account
+    // silently keep serving traffic via stale session affinity in pick().
+    if (!existsSync(this.configDirFor(name))) return null;
     const p = this.credsPath(name);
     if (existsSync(p)) {
       try {
