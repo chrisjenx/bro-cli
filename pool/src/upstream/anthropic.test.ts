@@ -67,10 +67,10 @@ function mockFetch(handler: (url: string, init: RequestInit) => Response | Promi
   return calls;
 }
 
-function jsonResponse(body: unknown, status = 200): Response {
+function jsonResponse(body: unknown, status = 200, extraHeaders: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...extraHeaders },
   });
 }
 
@@ -233,6 +233,84 @@ test("fails over to another account on a start-of-request rate limit", async () 
     expect(failovers).toEqual(["a->b"]);
     expect(mgr.getAccount("a").available).toBe(false);
     expect(mgr.getAccount("b").usage.totalRequests).toBe(1);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("captures Anthropic's rate-limit headers into the account's live snapshot", async () => {
+  const { poolDir, mgr, config } = tempPool(["a"]);
+  try {
+    mockFetch(() =>
+      jsonResponse(
+        {
+          type: "message",
+          content: [{ type: "text", text: "ok" }],
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+        200,
+        {
+          "anthropic-ratelimit-requests-limit": "100",
+          "anthropic-ratelimit-requests-remaining": "42",
+          "anthropic-ratelimit-requests-reset": new Date(Date.now() + 60_000).toISOString(),
+          "anthropic-ratelimit-tokens-limit": "50000",
+          "anthropic-ratelimit-tokens-remaining": "12345",
+          "anthropic-ratelimit-tokens-reset": new Date(Date.now() + 60_000).toISOString(),
+        },
+      ),
+    );
+
+    await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", max_tokens: 8, messages: [{ role: "user", content: "hi" }] },
+      new Headers(),
+      mgr,
+      config,
+      new AbortController().signal,
+    );
+
+    const rl = mgr.getAccount("a").usage.rateLimitStatus;
+    expect(rl).not.toBeNull();
+    expect(rl?.requestsLimit).toBe(100);
+    expect(rl?.requestsRemaining).toBe(42);
+    expect(rl?.tokensLimit).toBe(50000);
+    expect(rl?.tokensRemaining).toBe(12345);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("sidelines an account proactively once Anthropic reports zero remaining requests", async () => {
+  const { poolDir, mgr, config } = tempPool(["a", "b"]);
+  try {
+    mockFetch((_, init) => {
+      const token = new Headers(init.headers).get("authorization");
+      if (token === "Bearer tok-a") {
+        return jsonResponse(
+          { type: "message", content: [], usage: { input_tokens: 1, output_tokens: 1 } },
+          200,
+          {
+            "anthropic-ratelimit-requests-limit": "100",
+            "anthropic-ratelimit-requests-remaining": "0",
+            "anthropic-ratelimit-requests-reset": new Date(Date.now() + 60_000).toISOString(),
+          },
+        );
+      }
+      return jsonResponse({ type: "message", content: [], usage: { input_tokens: 1, output_tokens: 1 } });
+    });
+
+    await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", max_tokens: 8, messages: [{ role: "user", content: "hi" }] },
+      new Headers(),
+      mgr,
+      config,
+      new AbortController().signal,
+    );
+
+    // "a" just got its snapshot recorded (0 remaining); it should no longer be picked.
+    const picked = mgr.pick();
+    expect(picked?.name).toBe("b");
+    expect(mgr.getAccount("a").available).toBe(false);
+    expect(mgr.getAccount("a").unavailableReason).toMatch(/usage limit reached/);
   } finally {
     rmSync(poolDir, { recursive: true, force: true });
   }
