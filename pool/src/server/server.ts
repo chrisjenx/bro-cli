@@ -156,7 +156,7 @@ async function handleOpenAI(
   signal: AbortSignal,
 ): Promise<Response> {
   const parsed = parseOpenAI(body);
-  const first = mgr.pick(parsed.sessionKey);
+  const first = mgr.pick(parsed.sessionKey, undefined, parsed.model);
   if (!first) return json(noAccountError("openai", mgr), 503);
 
   const events = runWithFailover(
@@ -165,6 +165,7 @@ async function handleOpenAI(
     first,
     makeEventFactory(config, parsed.prompt, parsed.model, signal),
     failoverHooks(config),
+    parsed.model,
   );
   if (parsed.stream) {
     return sseResponse(streamOpenAI(events, parsed), first.name);
@@ -186,7 +187,7 @@ async function handleAnthropic(
 
   const legacyBody = body as AnthropicRequest;
   const parsed = parseAnthropic(legacyBody);
-  const first = mgr.pick(parsed.sessionKey);
+  const first = mgr.pick(parsed.sessionKey, undefined, parsed.model);
   if (!first) return json(noAccountError("anthropic", mgr), 503);
 
   const events = runWithFailover(
@@ -195,6 +196,7 @@ async function handleAnthropic(
     first,
     makeEventFactory(config, parsed.prompt, parsed.model, signal),
     failoverHooks(config),
+    parsed.model,
   );
   if (parsed.stream) {
     return sseResponse(streamAnthropic(events, parsed), first.name);

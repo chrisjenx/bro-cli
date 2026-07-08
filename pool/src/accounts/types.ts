@@ -14,38 +14,114 @@ export interface CredentialsFile {
 }
 
 /**
+ * One unified rolling window reported by Anthropic, parsed from an
+ * `anthropic-ratelimit-unified-<key>-{status,utilization,reset}` header triple.
+ *
+ * Account-wide windows use plain duration keys ("5h", "7d"). Model-scoped
+ * windows carry the model family in the key (e.g. "7d-fable", "7d-opus") —
+ * those limits are typically far tighter than the account-wide weekly window,
+ * so routing treats them as binding only for requests targeting that model.
+ */
+export interface RateLimitWindow {
+  /** Window key exactly as it appears in the header name, e.g. "5h", "7d-fable". */
+  key: string;
+  /** Model family the window is scoped to ("fable", "opus", …), null when account-wide. */
+  model: string | null;
+  /** Window status, e.g. "allowed" | "rejected". */
+  status: string | null;
+  /** Fraction of the window consumed, in [0, 1] (0.06 = 6% used). */
+  utilization: number | null;
+  /** When the window resets (epoch ms). */
+  reset: number | null;
+}
+
+/**
  * Anthropic's own view of an account's remaining headroom, taken verbatim from
  * the `anthropic-ratelimit-unified-*` response headers that Claude subscription
  * (OAuth) traffic returns on every direct response, success or error. This is
  * ground truth from Anthropic, unlike the `window*` counters below which are
  * just our own local tally.
  *
- * Subscription plans use a "unified" rolling-window model (a 5-hour window and
- * a 7-day window), each reporting a `utilization` fraction in [0, 1] and a
- * `status` (e.g. "allowed" / "rejected") plus a reset time. This is a
- * different header family than the standard token-bucket API headers
- * (`anthropic-ratelimit-tokens-remaining`, …), which this traffic never sends.
+ * Subscription plans use a "unified" rolling-window model: a 5-hour and a
+ * 7-day account-wide window, plus optional model-scoped windows (e.g. a
+ * separate, lower Fable allowance). Every window we can see in the headers is
+ * captured here, so new window kinds Anthropic starts sending show up without
+ * code changes. This is a different header family than the standard
+ * token-bucket API headers (`anthropic-ratelimit-tokens-remaining`, …), which
+ * this traffic never sends.
  */
 export interface RateLimitSnapshot {
   /** Overall unified status across all windows, e.g. "allowed" | "rejected". */
   unifiedStatus: string | null;
 
-  /** 5-hour rolling window. */
-  fiveHourStatus: string | null;
-  /** Fraction of the 5h window consumed, in [0, 1] (0.06 = 6% used). */
-  fiveHourUtilization: number | null;
-  /** When the 5h window resets (epoch ms). */
-  fiveHourReset: number | null;
-
-  /** 7-day rolling window. */
-  sevenDayStatus: string | null;
-  /** Fraction of the 7d window consumed, in [0, 1]. */
-  sevenDayUtilization: number | null;
-  /** When the 7d window resets (epoch ms). */
-  sevenDayReset: number | null;
+  /** Every unified window seen in the headers, account-wide windows first. */
+  windows: RateLimitWindow[];
 
   /** When this snapshot was captured. */
   updatedAt: number;
+}
+
+/** Duration-shaped key tokens ("5h", "7d", "30d", …) as opposed to model scopes. */
+const DURATION_TOKEN = /^\d+(?:h|hr|hrs|d|day|days|w|wk|mo|min|m)$/i;
+
+/**
+ * Model family a unified-window key is scoped to, or null for account-wide
+ * windows. "7d-fable" → "fable"; "5h" → null. Tolerates either token order
+ * and `_` separators, since the exact header shape is undocumented.
+ */
+export function windowModelOf(key: string): string | null {
+  const scopes = key.split(/[-_]/).filter((t) => t !== "" && !DURATION_TOKEN.test(t));
+  return scopes.length > 0 ? scopes.join("-").toLowerCase() : null;
+}
+
+/** Model families we route on, matched as substrings of the requested model id. */
+const MODEL_FAMILIES = ["fable", "mythos", "opus", "sonnet", "haiku"] as const;
+
+/**
+ * Canonical model family ("fable", "opus", …) of a requested model id, used to
+ * match requests against model-scoped unified windows. Null when unknown.
+ */
+export function modelFamilyOf(modelId: string | undefined | null): string | null {
+  if (!modelId) return null;
+  const lower = modelId.toLowerCase();
+  for (const family of MODEL_FAMILIES) {
+    if (lower.includes(family)) return family;
+  }
+  return null;
+}
+
+/**
+ * Coerce a persisted snapshot into the current shape. Older pool versions
+ * stored fixed `fiveHour*` / `sevenDay*` fields instead of `windows`; usage
+ * state persists across upgrades, so convert those on load.
+ */
+export function normalizeRateLimitSnapshot(raw: unknown): RateLimitSnapshot | null {
+  if (raw == null || typeof raw !== "object") return null;
+  const snap = raw as Record<string, unknown>;
+  const unifiedStatus = typeof snap.unifiedStatus === "string" ? snap.unifiedStatus : null;
+  const updatedAt = typeof snap.updatedAt === "number" ? snap.updatedAt : Date.now();
+
+  if (Array.isArray(snap.windows)) {
+    return { unifiedStatus, windows: snap.windows as RateLimitWindow[], updatedAt };
+  }
+
+  const legacy = (key: string, prefix: string): RateLimitWindow | null => {
+    const status = snap[`${prefix}Status`];
+    const utilization = snap[`${prefix}Utilization`];
+    const reset = snap[`${prefix}Reset`];
+    if (status == null && utilization == null && reset == null) return null;
+    return {
+      key,
+      model: null,
+      status: typeof status === "string" ? status : null,
+      utilization: typeof utilization === "number" ? utilization : null,
+      reset: typeof reset === "number" ? reset : null,
+    };
+  };
+  const windows = [legacy("5h", "fiveHour"), legacy("7d", "sevenDay")].filter(
+    (w): w is RateLimitWindow => w != null,
+  );
+  return { unifiedStatus, windows, updatedAt };
 }
 
 /** Rolling + lifetime usage counters for one account. */
