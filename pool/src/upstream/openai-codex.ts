@@ -285,14 +285,19 @@ async function streamCodexResponse(
     });
 
     // Drain until we can decide: either content committed, an early rate-limit
-    // error surfaced, or the upstream stream ended.
+    // error surfaced, the upstream stream ended, or we've buffered enough
+    // non-content preamble (64 KiB, matching anthropic.ts's prefix cap) that
+    // we should commit and stream the rest through normally rather than risk
+    // unbounded buffering against a misbehaving upstream.
     let upstreamDone = false;
-    while (!committed && !initialRateLimit && !upstreamDone) {
+    let prefixBytes = 0;
+    while (!committed && !initialRateLimit && !upstreamDone && prefixBytes < 64 * 1024) {
       const { value, done: d } = await reader.read();
       if (d) {
         upstreamDone = true;
         break;
       }
+      if (value) prefixBytes += value.byteLength;
       parser.push(value);
     }
 

@@ -135,4 +135,76 @@ describe("proxyCodexMessages", () => {
       rmSync(poolDir, { recursive: true, force: true });
     }
   });
+
+  test("streaming: large non-content preamble before the first content frame doesn't buffer unbounded", async () => {
+    // A misbehaving/slow upstream can trickle droppable events (e.g. dropped
+    // reasoning items) for a long time before ever emitting content. The
+    // early-buffer loop in streamCodexResponse must cap at 64 KiB (mirroring
+    // anthropic.ts's prepareStreamingResponse) rather than buffer forever.
+    // Build >64KB of `response.output_item.added` events whose item type is
+    // "reasoning" -- these translate to zero frames (see codex-translate.ts
+    // "reasoning etc." case) and so never "commit" the response.
+    const padding = "x".repeat(2048);
+    const preambleEvents: string[] = [];
+    let preambleBytes = 0;
+    while (preambleBytes < 70 * 1024) {
+      const line = `data: {"type":"response.output_item.added","item":{"type":"reasoning","pad":"${padding}"}}`;
+      preambleEvents.push(line, "");
+      preambleBytes += line.length + 1;
+    }
+    const fullSse = [
+      'data: {"type":"response.created","response":{"id":"r1"}}',
+      "",
+      ...preambleEvents,
+      'data: {"type":"response.output_item.added","item":{"type":"message"}}',
+      "",
+      'data: {"type":"response.output_text.delta","delta":"Hi"}',
+      "",
+      'data: {"type":"response.output_item.done","item":{"type":"message"}}',
+      "",
+      'data: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":1}}}',
+      "",
+      "",
+    ].join("\n");
+
+    const { poolDir, mgr } = tempOpenAIPool(["gpt1"]);
+    try {
+      const config = loadConfig({ poolDir, accountsDir: join(poolDir, "accounts"), usageFile: join(poolDir, "usage.json") });
+      const fakeFetch = (async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) =>
+        new Response(fullSse, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        })) as typeof fetch;
+
+      const res = await Promise.race([
+        proxyCodexMessages(
+          { model: "gpt", messages: [{ role: "user", content: "hi" }], stream: true },
+          mgr,
+          config,
+          new AbortController().signal,
+          { id: "gpt", provider: "openai", upstreamModel: "gpt-5.2-codex" },
+          {},
+          fakeFetch,
+        ),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("proxyCodexMessages did not commit/return in time")), 5_000),
+        ),
+      ]);
+
+      expect(res.status).toBe(200);
+      expect(res.body).not.toBeNull();
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      let full = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        full += decoder.decode(value);
+      }
+      expect(full).toContain('"text_delta"');
+      expect(full).toContain("Hi");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
 });
