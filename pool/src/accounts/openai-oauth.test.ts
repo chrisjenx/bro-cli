@@ -16,6 +16,38 @@ describe("normalizeCodexAuthJson", () => {
     expect(normalizeCodexAuthJson({})).toBeNull();
     expect(normalizeCodexAuthJson(null)).toBeNull();
   });
+
+  test("derives accountId and planType from id_token claims when tokens.account_id is absent (browser login)", () => {
+    const payload = {
+      "https://api.openai.com/auth": {
+        chatgpt_account_id: "acc_from_jwt",
+        chatgpt_plan_type: "pro",
+      },
+    };
+    const idToken = `header.${Buffer.from(JSON.stringify(payload)).toString("base64url")}.sig`;
+    const creds = normalizeCodexAuthJson({
+      tokens: { access_token: "at1", refresh_token: "rt1", id_token: idToken },
+    });
+    expect(creds).toEqual(
+      expect.objectContaining({
+        accessToken: "at1",
+        refreshToken: "rt1",
+        accountId: "acc_from_jwt",
+        planType: "pro",
+      }),
+    );
+  });
+
+  test("bare tokens.account_id still wins over id_token claims", () => {
+    const payload = {
+      "https://api.openai.com/auth": { chatgpt_account_id: "acc_from_jwt", chatgpt_plan_type: "pro" },
+    };
+    const idToken = `header.${Buffer.from(JSON.stringify(payload)).toString("base64url")}.sig`;
+    const creds = normalizeCodexAuthJson({
+      tokens: { access_token: "at1", account_id: "acc_bare", id_token: idToken },
+    });
+    expect(creds).toEqual(expect.objectContaining({ accountId: "acc_bare" }));
+  });
 });
 
 describe("refreshOpenAIToken", () => {
