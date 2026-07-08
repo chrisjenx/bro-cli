@@ -265,25 +265,23 @@ function card(a) {
   const rl = u.rateLimitStatus;
   const tok = u.windowInputTokens + u.windowOutputTokens;
 
-  // Prefer Anthropic's own remaining/limit headers over our local estimate.
-  const haveReqData = rl && rl.requestsLimit != null && rl.requestsRemaining != null;
-  const haveTokData = rl && rl.tokensLimit != null && rl.tokensRemaining != null;
-  const reqPct = haveReqData
-    ? Math.min(100, 100 - (Math.max(0, rl.requestsRemaining) / rl.requestsLimit) * 100)
-    : Math.min(100, (u.windowRequests / 200) * 100);
-  const tokPct = haveTokData
-    ? Math.min(100, 100 - (Math.max(0, rl.tokensRemaining) / rl.tokensLimit) * 100)
-    : Math.min(100, tok / 1000000 * 100);
-  const reqNum = haveReqData
-    ? fmtInt(rl.requestsRemaining) + " / " + fmtInt(rl.requestsLimit) + " left"
-    : fmtInt(u.windowRequests) + " req (est.)";
-  const tokNum = haveTokData
-    ? fmtInt(rl.tokensRemaining) + " / " + fmtInt(rl.tokensLimit) + " left"
-    : fmtInt(tok) + " (est.)";
+  // Anthropic's unified rolling windows (subscription traffic): a 5h and a 7d
+  // window, each with a utilization fraction in [0,1]. Show those when we have
+  // them; otherwise fall back to our local "(est.)" tally.
+  const have5h = rl && rl.fiveHourUtilization != null;
+  const have7d = rl && rl.sevenDayUtilization != null;
 
-  const resetTs = rl ? (rl.requestsReset ?? rl.tokensReset) : null;
-  const limitResetRow = resetTs
-    ? '<span class="k">Limit resets</span><span class="v">' + timeUntil(resetTs) + "</span>" : "";
+  const pct5h = have5h ? Math.min(100, Math.max(0, rl.fiveHourUtilization * 100)) : 0;
+  const pct7d = have7d ? Math.min(100, Math.max(0, rl.sevenDayUtilization * 100)) : 0;
+  const bar5hLabel = have5h
+    ? '<div class="bar-label"><span>5h window · used</span><span class="num">' + pct5h.toFixed(0) + "% · resets " + timeUntil(rl.fiveHourReset) + '</span></div><div class="bar"><span style="width:' + pct5h + '%"></span></div>'
+    : '<div class="bar-label"><span>Requests (est.)</span><span class="num">' + fmtInt(u.windowRequests) + ' req</span></div><div class="bar"><span style="width:' + Math.min(100, (u.windowRequests / 200) * 100) + '%"></span></div>';
+  const bar7dLabel = have7d
+    ? '<div class="bar-label"><span>7d window · used</span><span class="num">' + pct7d.toFixed(0) + "% · resets " + timeUntil(rl.sevenDayReset) + '</span></div><div class="bar"><span style="width:' + pct7d + '%"></span></div>'
+    : '<div class="bar-label"><span>Tokens (est.)</span><span class="num">' + fmtInt(tok) + '</span></div><div class="bar"><span style="width:' + Math.min(100, tok / 1000000 * 100) + '%"></span></div>';
+
+  const limitStatusRow = rl && rl.unifiedStatus
+    ? '<span class="k">Usage status</span><span class="v">' + esc(rl.unifiedStatus) + "</span>" : "";
   const note = a.unavailableReason
     ? '<div class="note ' + (a.authenticated ? "" : "err") + '">' + esc(a.unavailableReason) + "</div>"
     : (u.lastError ? '<div class="note">Last error: ' + esc(u.lastError) + "</div>" : "");
@@ -301,18 +299,12 @@ function card(a) {
       <span class="k">Cost (window)</span><span class="v">\${fmtUsd(u.windowCostUsd)}</span>
       <span class="k">Total requests</span><span class="v">\${fmtInt(u.totalRequests)}</span>
       <span class="k">Last used</span><span class="v">\${ago(u.lastUsedAt)}</span>
-      \${limitResetRow}
+      \${limitStatusRow}
       \${cooldownRow}
     </div>
     <div class="bars">
-      <div>
-        <div class="bar-label"><span>Requests\${haveReqData ? "" : " (est.)"}</span><span class="num">\${reqNum}</span></div>
-        <div class="bar"><span style="width:\${reqPct}%"></span></div>
-      </div>
-      <div>
-        <div class="bar-label"><span>Tokens\${haveTokData ? "" : " (est.)"}</span><span class="num">\${tokNum}</span></div>
-        <div class="bar"><span style="width:\${tokPct}%"></span></div>
-      </div>
+      <div>\${bar5hLabel}</div>
+      <div>\${bar7dLabel}</div>
     </div>
     \${note}
   </div>\`;

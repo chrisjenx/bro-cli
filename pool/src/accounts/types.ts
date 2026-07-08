@@ -15,23 +15,35 @@ export interface CredentialsFile {
 
 /**
  * Anthropic's own view of an account's remaining headroom, taken verbatim from
- * the `anthropic-ratelimit-*` response headers (present on every direct-OAuth
- * response, success or error). This is ground truth from Anthropic, unlike the
- * `window*` counters below which are just our own local tally.
+ * the `anthropic-ratelimit-unified-*` response headers that Claude subscription
+ * (OAuth) traffic returns on every direct response, success or error. This is
+ * ground truth from Anthropic, unlike the `window*` counters below which are
+ * just our own local tally.
+ *
+ * Subscription plans use a "unified" rolling-window model (a 5-hour window and
+ * a 7-day window), each reporting a `utilization` fraction in [0, 1] and a
+ * `status` (e.g. "allowed" / "rejected") plus a reset time. This is a
+ * different header family than the standard token-bucket API headers
+ * (`anthropic-ratelimit-tokens-remaining`, …), which this traffic never sends.
  */
 export interface RateLimitSnapshot {
-  requestsLimit: number | null;
-  requestsRemaining: number | null;
-  requestsReset: number | null;
-  tokensLimit: number | null;
-  tokensRemaining: number | null;
-  tokensReset: number | null;
-  inputTokensLimit: number | null;
-  inputTokensRemaining: number | null;
-  inputTokensReset: number | null;
-  outputTokensLimit: number | null;
-  outputTokensRemaining: number | null;
-  outputTokensReset: number | null;
+  /** Overall unified status across all windows, e.g. "allowed" | "rejected". */
+  unifiedStatus: string | null;
+
+  /** 5-hour rolling window. */
+  fiveHourStatus: string | null;
+  /** Fraction of the 5h window consumed, in [0, 1] (0.06 = 6% used). */
+  fiveHourUtilization: number | null;
+  /** When the 5h window resets (epoch ms). */
+  fiveHourReset: number | null;
+
+  /** 7-day rolling window. */
+  sevenDayStatus: string | null;
+  /** Fraction of the 7d window consumed, in [0, 1]. */
+  sevenDayUtilization: number | null;
+  /** When the 7d window resets (epoch ms). */
+  sevenDayReset: number | null;
+
   /** When this snapshot was captured. */
   updatedAt: number;
 }

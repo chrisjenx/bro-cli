@@ -31,18 +31,13 @@ function tempPool(accountNames: string[]): { poolDir: string; mgr: AccountManage
 
 function snapshot(overrides: Partial<RateLimitSnapshot> = {}): RateLimitSnapshot {
   return {
-    requestsLimit: null,
-    requestsRemaining: null,
-    requestsReset: null,
-    tokensLimit: null,
-    tokensRemaining: null,
-    tokensReset: null,
-    inputTokensLimit: null,
-    inputTokensRemaining: null,
-    inputTokensReset: null,
-    outputTokensLimit: null,
-    outputTokensRemaining: null,
-    outputTokensReset: null,
+    unifiedStatus: "allowed",
+    fiveHourStatus: "allowed",
+    fiveHourUtilization: null,
+    fiveHourReset: null,
+    sevenDayStatus: "allowed",
+    sevenDayUtilization: null,
+    sevenDayReset: null,
     updatedAt: Date.now(),
     ...overrides,
   };
@@ -51,13 +46,14 @@ function snapshot(overrides: Partial<RateLimitSnapshot> = {}): RateLimitSnapshot
 test("pick() prefers the account with more real headroom over pure round-robin", async () => {
   const { poolDir, mgr } = tempPool(["low-headroom", "high-headroom"]);
   try {
+    // low-headroom has burned 95% of its 5h window; high-headroom only 10%.
     mgr.recordRateLimitSnapshot(
       "low-headroom",
-      snapshot({ requestsLimit: 100, requestsRemaining: 5, tokensLimit: 100000, tokensRemaining: 5000 }),
+      snapshot({ fiveHourUtilization: 0.95, sevenDayUtilization: 0.5 }),
     );
     mgr.recordRateLimitSnapshot(
       "high-headroom",
-      snapshot({ requestsLimit: 100, requestsRemaining: 90, tokensLimit: 100000, tokensRemaining: 90000 }),
+      snapshot({ fiveHourUtilization: 0.1, sevenDayUtilization: 0.2 }),
     );
 
     const picked = mgr.pick();
@@ -72,7 +68,7 @@ test("accounts with no snapshot yet are treated as full headroom (no penalty)", 
   try {
     mgr.recordRateLimitSnapshot(
       "known-partial",
-      snapshot({ requestsLimit: 100, requestsRemaining: 50, tokensLimit: 100000, tokensRemaining: 50000 }),
+      snapshot({ fiveHourUtilization: 0.5, sevenDayUtilization: 0.5 }),
     );
 
     const picked = mgr.pick();
@@ -96,35 +92,34 @@ test("falls back to fewest-requests tie-break when headroom is equal", async () 
   }
 });
 
-test("getAccount() proactively sidelines an account with zero remaining headroom before its reset", async () => {
+test("getAccount() proactively sidelines an account with a fully-consumed window before its reset", async () => {
   const { poolDir, mgr } = tempPool(["exhausted"]);
   try {
     mgr.recordRateLimitSnapshot(
       "exhausted",
       snapshot({
-        requestsLimit: 100,
-        requestsRemaining: 0,
-        requestsReset: Date.now() + 10 * 60_000,
-        tokensLimit: 100000,
-        tokensRemaining: 50000,
+        fiveHourStatus: "rejected",
+        fiveHourUtilization: 1,
+        fiveHourReset: Date.now() + 10 * 60_000,
+        sevenDayUtilization: 0.5,
       }),
     );
 
     const acct = mgr.getAccount("exhausted");
     expect(acct.available).toBe(false);
-    expect(acct.unavailableReason).toMatch(/usage limit reached \(requests\)/);
+    expect(acct.unavailableReason).toMatch(/usage limit reached \(5h window\)/);
     expect(mgr.pick()).toBeNull();
   } finally {
     rmSync(poolDir, { recursive: true, force: true });
   }
 });
 
-test("an account with zero remaining is available again once its reset has passed", async () => {
+test("an account with a spent window is available again once its reset has passed", async () => {
   const { poolDir, mgr } = tempPool(["reset-account"]);
   try {
     mgr.recordRateLimitSnapshot(
       "reset-account",
-      snapshot({ requestsLimit: 100, requestsRemaining: 0, requestsReset: Date.now() - 1000 }),
+      snapshot({ fiveHourStatus: "rejected", fiveHourUtilization: 1, fiveHourReset: Date.now() - 1000 }),
     );
 
     const acct = mgr.getAccount("reset-account");

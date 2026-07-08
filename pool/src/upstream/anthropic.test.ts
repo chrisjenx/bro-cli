@@ -238,9 +238,10 @@ test("fails over to another account on a start-of-request rate limit", async () 
   }
 });
 
-test("captures Anthropic's rate-limit headers into the account's live snapshot", async () => {
+test("captures Anthropic's unified rate-limit headers into the account's live snapshot", async () => {
   const { poolDir, mgr, config } = tempPool(["a"]);
   try {
+    const resetSec = Math.floor(Date.now() / 1000) + 3600;
     mockFetch(() =>
       jsonResponse(
         {
@@ -250,12 +251,13 @@ test("captures Anthropic's rate-limit headers into the account's live snapshot",
         },
         200,
         {
-          "anthropic-ratelimit-requests-limit": "100",
-          "anthropic-ratelimit-requests-remaining": "42",
-          "anthropic-ratelimit-requests-reset": new Date(Date.now() + 60_000).toISOString(),
-          "anthropic-ratelimit-tokens-limit": "50000",
-          "anthropic-ratelimit-tokens-remaining": "12345",
-          "anthropic-ratelimit-tokens-reset": new Date(Date.now() + 60_000).toISOString(),
+          "anthropic-ratelimit-unified-status": "allowed",
+          "anthropic-ratelimit-unified-5h-status": "allowed",
+          "anthropic-ratelimit-unified-5h-utilization": "0.06",
+          "anthropic-ratelimit-unified-5h-reset": String(resetSec),
+          "anthropic-ratelimit-unified-7d-status": "allowed",
+          "anthropic-ratelimit-unified-7d-utilization": "0.17",
+          "anthropic-ratelimit-unified-7d-reset": String(resetSec + 1000),
         },
       ),
     );
@@ -270,18 +272,19 @@ test("captures Anthropic's rate-limit headers into the account's live snapshot",
 
     const rl = mgr.getAccount("a").usage.rateLimitStatus;
     expect(rl).not.toBeNull();
-    expect(rl?.requestsLimit).toBe(100);
-    expect(rl?.requestsRemaining).toBe(42);
-    expect(rl?.tokensLimit).toBe(50000);
-    expect(rl?.tokensRemaining).toBe(12345);
+    expect(rl?.unifiedStatus).toBe("allowed");
+    expect(rl?.fiveHourUtilization).toBeCloseTo(0.06);
+    expect(rl?.fiveHourReset).toBe(resetSec * 1000);
+    expect(rl?.sevenDayUtilization).toBeCloseTo(0.17);
   } finally {
     rmSync(poolDir, { recursive: true, force: true });
   }
 });
 
-test("sidelines an account proactively once Anthropic reports zero remaining requests", async () => {
+test("sidelines an account proactively once a unified window is fully consumed", async () => {
   const { poolDir, mgr, config } = tempPool(["a", "b"]);
   try {
+    const resetSec = Math.floor(Date.now() / 1000) + 3600;
     mockFetch((_, init) => {
       const token = new Headers(init.headers).get("authorization");
       if (token === "Bearer tok-a") {
@@ -289,9 +292,10 @@ test("sidelines an account proactively once Anthropic reports zero remaining req
           { type: "message", content: [], usage: { input_tokens: 1, output_tokens: 1 } },
           200,
           {
-            "anthropic-ratelimit-requests-limit": "100",
-            "anthropic-ratelimit-requests-remaining": "0",
-            "anthropic-ratelimit-requests-reset": new Date(Date.now() + 60_000).toISOString(),
+            "anthropic-ratelimit-unified-status": "rejected",
+            "anthropic-ratelimit-unified-5h-status": "rejected",
+            "anthropic-ratelimit-unified-5h-utilization": "1",
+            "anthropic-ratelimit-unified-5h-reset": String(resetSec),
           },
         );
       }
@@ -306,7 +310,7 @@ test("sidelines an account proactively once Anthropic reports zero remaining req
       new AbortController().signal,
     );
 
-    // "a" just got its snapshot recorded (0 remaining); it should no longer be picked.
+    // "a" just got its snapshot recorded (5h window spent); it should no longer be picked.
     const picked = mgr.pick();
     expect(picked?.name).toBe("b");
     expect(mgr.getAccount("a").available).toBe(false);
