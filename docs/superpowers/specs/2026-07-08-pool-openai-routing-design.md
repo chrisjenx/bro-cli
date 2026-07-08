@@ -50,6 +50,15 @@ account/plan info — the contents of Codex's `auth.json`) instead of Claude's
 `AccountManager` becomes provider-aware:
 - `pick(sessionKey, provider)` selects only from accounts of the requested
   provider.
+- Session stickiness is keyed per provider: `(sessionKey, provider) → account`.
+  A Claude Code session that switches `/model` between providers mid-session
+  holds one pin per provider, so its GPT requests keep hitting the same
+  ChatGPT subscription while its Claude requests keep hitting the same Claude
+  account. Stickiness matters especially for OpenAI: the Codex backend caches
+  prompts server-side per account, so re-routing a live session to another sub
+  re-ingests the whole conversation (slower, wastes window headroom). Pins
+  break only when the pinned account becomes unavailable (cooldown / auth
+  failure), matching existing behavior.
 - Token refresh dispatches per provider (Anthropic OAuth token endpoint vs.
   OpenAI's OAuth token endpoint, as used by the Codex CLI refresh flow).
 - Usage counters, stickiness, cooldown, and persistence are shared logic.
