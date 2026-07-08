@@ -20,6 +20,8 @@ import {
   objectProp,
   stringProp,
   numberProp,
+  isRateLimit as isRateLimitShared,
+  retryAfterMs,
 } from "./shared.ts";
 import type { SseEvent } from "./shared.ts";
 
@@ -487,14 +489,7 @@ function classifySseError(data: Record<string, unknown> | null): RetryReason {
 }
 
 function isRateLimit(type: string, message: string): boolean {
-  const text = `${type}\n${message}`.toLowerCase();
-  return (
-    text.includes("rate_limit") ||
-    text.includes("rate limit") ||
-    text.includes("usage limit") ||
-    text.includes("limit reached") ||
-    text.includes("too many requests")
-  );
+  return isRateLimitShared(`${type}\n${message}`);
 }
 
 function hasRateLimitHeaders(headers: Headers): boolean {
@@ -537,13 +532,8 @@ function parseRateLimitSnapshot(headers: Headers): RateLimitSnapshot {
 }
 
 function resetAtFromHeaders(headers: Headers): number | undefined {
-  const retryAfter = headers.get("retry-after");
-  if (retryAfter) {
-    const seconds = Number.parseInt(retryAfter, 10);
-    if (Number.isFinite(seconds)) return Date.now() + seconds * 1000;
-    const parsed = Date.parse(retryAfter);
-    if (Number.isFinite(parsed)) return parsed;
-  }
+  const viaRetryAfter = retryAfterMs(headers);
+  if (viaRetryAfter !== undefined) return viaRetryAfter;
 
   for (const name of [
     "anthropic-ratelimit-requests-reset",

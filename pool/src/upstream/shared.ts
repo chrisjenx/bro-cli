@@ -110,3 +110,33 @@ export function numberProp(value: Record<string, unknown> | null, key: string): 
   const raw = value?.[key];
   return typeof raw === "number" && Number.isFinite(raw) ? raw : undefined;
 }
+
+/**
+ * Phrase-sniffs an error type/message for rate-limit language. Shared by
+ * anthropic.ts and openai-codex.ts so both backends agree on what counts as
+ * "rate limited" (their upstreams don't always agree on error shapes).
+ */
+export function isRateLimit(text: string): boolean {
+  const lower = text.toLowerCase();
+  return (
+    lower.includes("rate_limit") ||
+    lower.includes("rate limit") ||
+    lower.includes("usage limit") ||
+    lower.includes("limit reached") ||
+    lower.includes("too many requests")
+  );
+}
+
+/**
+ * Parses the standard `retry-after` header: an integer number of seconds, or
+ * (per HTTP spec) an HTTP-date. Returns an absolute epoch-ms reset time.
+ */
+export function retryAfterMs(headers: Headers): number | undefined {
+  const retryAfter = headers.get("retry-after");
+  if (!retryAfter) return undefined;
+  const seconds = Number.parseInt(retryAfter, 10);
+  if (Number.isFinite(seconds)) return Date.now() + seconds * 1000;
+  const parsed = Date.parse(retryAfter);
+  if (Number.isFinite(parsed)) return parsed;
+  return undefined;
+}

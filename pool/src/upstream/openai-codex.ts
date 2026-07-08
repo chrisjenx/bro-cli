@@ -13,9 +13,9 @@ import { AccountManager } from "../accounts/manager.ts";
 import type { Account, OpenAIOauthCreds, RateLimitSnapshot } from "../accounts/types.ts";
 import type { ModelRoute } from "../models.ts";
 import { refreshOpenAIToken } from "../accounts/openai-oauth.ts";
-import { anthropicToCodexRequest, CodexToAnthropicStream, collectAnthropicMessage } from "./codex-translate.ts";
+import { anthropicToCodexRequest, CodexToAnthropicStream } from "./codex-translate.ts";
 import { CODEX_RESPONSES_URL, CODEX_ORIGINATOR, CODEX_ACCOUNT_ID_HEADER, CODEX_RATE_LIMIT_HEADERS } from "./codex-constants.ts";
-import { anthropicError, makeAbort, SseParser } from "./shared.ts";
+import { anthropicError, makeAbort, SseParser, isRateLimit, retryAfterMs } from "./shared.ts";
 
 interface ProxyHooks {
   onFailover?: (from: string, to: string) => void;
@@ -82,6 +82,10 @@ export async function proxyCodexMessages(
   );
 }
 
+function authReason(message: string, status = 401): RetryReason {
+  return { status, type: "authentication_error", message, rateLimited: false };
+}
+
 async function tryCodexAccount(
   account: Account,
   codexBody: Record<string, unknown>,
@@ -98,12 +102,12 @@ async function tryCodexAccount(
   } catch (err) {
     const message = (err as Error).message;
     mgr.recordError(account.name, message);
-    return { kind: "retry", reason: { status: 401, type: "authentication_error", message, rateLimited: false } };
+    return { kind: "retry", reason: authReason(message) };
   }
   if (!creds?.accessToken) {
     const message = `Account "${account.name}" has no OpenAI access token`;
     mgr.recordError(account.name, message);
-    return { kind: "retry", reason: { status: 401, type: "authentication_error", message, rateLimited: false } };
+    return { kind: "retry", reason: authReason(message) };
   }
 
   let res: Response;
@@ -125,12 +129,12 @@ async function tryCodexAccount(
     } catch (err) {
       const message = (err as Error).message;
       mgr.recordError(account.name, message);
-      return { kind: "retry", reason: { status: 401, type: "authentication_error", message, rateLimited: false } };
+      return { kind: "retry", reason: authReason(message) };
     }
     if (!creds?.accessToken) {
       const message = `Account "${account.name}" has no OpenAI access token after refresh`;
       mgr.recordError(account.name, message);
-      return { kind: "retry", reason: { status: 401, type: "authentication_error", message, rateLimited: false } };
+      return { kind: "retry", reason: authReason(message) };
     }
     try {
       const retryAttempt = await fetchCodex(creds, codexBody, config, signal, fetchFn);
@@ -145,7 +149,7 @@ async function tryCodexAccount(
       abortCleanup();
       const message = `Account "${account.name}" is not authorized against the Codex backend`;
       mgr.recordError(account.name, message);
-      return { kind: "retry", reason: { status: res.status, type: "authentication_error", message, rateLimited: false } };
+      return { kind: "retry", reason: authReason(message, res.status) };
     }
   }
 
@@ -270,7 +274,7 @@ async function streamCodexResponse(
     const parser = new SseParser((event) => {
       const frames = translator.handleEvent(event);
       if (translator.sawError && !committed) {
-        if (isRateLimitMessage(translator.sawError.message)) {
+        if (isRateLimit(translator.sawError.message)) {
           initialRateLimit = {
             status: 429,
             type: translator.sawError.type,
@@ -361,10 +365,11 @@ async function streamCodexResponse(
     };
   }
 
-  // Non-stream: collect the entire upstream body, then fold into one message.
-  const frames: string[] = [];
+  // Non-stream: drain the entire upstream body through the translator, then
+  // fold its accumulated structured state into one message (no re-parsing of
+  // emitted SSE frame strings).
   const collector = new SseParser((event) => {
-    frames.push(...translator.handleEvent(event));
+    translator.handleEvent(event);
   });
   try {
     while (true) {
@@ -373,7 +378,7 @@ async function streamCodexResponse(
       collector.push(value);
     }
     collector.end();
-    frames.push(...translator.finish());
+    translator.finish();
   } catch (err) {
     cleanup();
     mgr.recordError(account.name, (err as Error).message);
@@ -382,7 +387,7 @@ async function streamCodexResponse(
   cleanup();
 
   if (translator.sawError) {
-    if (isRateLimitMessage(translator.sawError.message)) {
+    if (isRateLimit(translator.sawError.message)) {
       mgr.markRateLimited(account.name);
       return {
         kind: "retry",
@@ -396,7 +401,7 @@ async function streamCodexResponse(
     };
   }
 
-  const message = collectAnthropicMessage(frames);
+  const message = translator.toAnthropicMessage();
   mgr.recordSuccess(account.name, translator.usage, 0);
   return {
     kind: "response",
@@ -408,17 +413,6 @@ async function streamCodexResponse(
       },
     }),
   };
-}
-
-function isRateLimitMessage(message: string): boolean {
-  const text = message.toLowerCase();
-  return (
-    text.includes("rate_limit") ||
-    text.includes("rate limit") ||
-    text.includes("usage limit") ||
-    text.includes("limit reached") ||
-    text.includes("too many requests")
-  );
 }
 
 /**
@@ -468,17 +462,13 @@ export function parseCodexRateLimitSnapshot(headers: Headers): RateLimitSnapshot
 }
 
 function resetAtFromCodexHeaders(headers: Headers): number | undefined {
+  const viaRetryAfter = retryAfterMs(headers);
+  if (viaRetryAfter !== undefined) return viaRetryAfter;
+
   const primaryResetAt = headers.get(CODEX_RATE_LIMIT_HEADERS.primaryResetAt);
   if (primaryResetAt) {
     const n = Number.parseInt(primaryResetAt, 10);
     if (Number.isFinite(n)) return n * 1000;
-  }
-  const retryAfter = headers.get("retry-after");
-  if (retryAfter) {
-    const seconds = Number.parseInt(retryAfter, 10);
-    if (Number.isFinite(seconds)) return Date.now() + seconds * 1000;
-    const parsed = Date.parse(retryAfter);
-    if (Number.isFinite(parsed)) return parsed;
   }
   return undefined;
 }

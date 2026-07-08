@@ -110,6 +110,14 @@ export class CodexToAnthropicStream {
   private started = false;
   private finished = false;
 
+  // Structured accumulation for the non-streaming (folded) response. Built
+  // from the same events as the SSE frames below — no string round-trip
+  // through the emitted frames is needed to reconstruct the final message.
+  private msgId: string | undefined;
+  private model: string | undefined;
+  private content: Array<Record<string, unknown>> = [];
+  private argsAccum = new Map<number, string>();
+
   constructor(private modelId: string) {}
 
   handleEvent(event: { event: string; data: string }): string[] {
@@ -124,6 +132,8 @@ export class CodexToAnthropicStream {
       case "response.created":
         if (this.started) return [];
         this.started = true;
+        this.msgId = msgId(data);
+        this.model = this.modelId;
         return [frame("message_start", {
           type: "message_start",
           message: {
@@ -146,20 +156,25 @@ export class CodexToAnthropicStream {
         }
         return []; // reasoning etc.
       }
-      case "response.output_text.delta":
-        return this.blockOpen
-          ? [frame("content_block_delta", {
-              type: "content_block_delta", index: this.index,
-              delta: { type: "text_delta", text: String(data.delta ?? "") },
-            })]
-          : [];
-      case "response.function_call_arguments.delta":
-        return this.blockOpen
-          ? [frame("content_block_delta", {
-              type: "content_block_delta", index: this.index,
-              delta: { type: "input_json_delta", partial_json: String(data.delta ?? "") },
-            })]
-          : [];
+      case "response.output_text.delta": {
+        if (!this.blockOpen) return [];
+        const text = String(data.delta ?? "");
+        const block = this.content[this.index];
+        if (block) block.text = (typeof block.text === "string" ? block.text : "") + text;
+        return [frame("content_block_delta", {
+          type: "content_block_delta", index: this.index,
+          delta: { type: "text_delta", text },
+        })];
+      }
+      case "response.function_call_arguments.delta": {
+        if (!this.blockOpen) return [];
+        const delta = String(data.delta ?? "");
+        this.argsAccum.set(this.index, (this.argsAccum.get(this.index) ?? "") + delta);
+        return [frame("content_block_delta", {
+          type: "content_block_delta", index: this.index,
+          delta: { type: "input_json_delta", partial_json: delta },
+        })];
+      }
       case "response.output_item.done":
         return this.closeBlock();
       case "response.completed": {
@@ -203,6 +218,7 @@ export class CodexToAnthropicStream {
   private openBlock(contentBlock: Record<string, unknown>): string {
     this.index += 1;
     this.blockOpen = true;
+    this.content[this.index] = contentBlock;
     return frame("content_block_start", {
       type: "content_block_start", index: this.index, content_block: contentBlock,
     });
@@ -211,7 +227,36 @@ export class CodexToAnthropicStream {
   private closeBlock(): string[] {
     if (!this.blockOpen) return [];
     this.blockOpen = false;
-    return [frame("content_block_stop", { type: "content_block_stop", index: this.index })];
+    const idx = this.index;
+    const block = this.content[idx];
+    if (block && block.type === "tool_use") {
+      const raw = this.argsAccum.get(idx) ?? "";
+      try {
+        block.input = JSON.parse(raw);
+      } catch {
+        block.input = {};
+      }
+      this.argsAccum.delete(idx);
+    }
+    return [frame("content_block_stop", { type: "content_block_stop", index: idx })];
+  }
+
+  /**
+   * Returns the non-streaming Anthropic message built from structured state
+   * accumulated in handleEvent() — no re-parsing of emitted SSE frames.
+   * Call after finish() so stop_reason/usage reflect the completed response.
+   */
+  toAnthropicMessage(): Record<string, unknown> {
+    return {
+      id: this.msgId,
+      type: "message",
+      role: "assistant",
+      model: this.model,
+      content: this.content,
+      stop_reason: this.stopReason ?? "end_turn",
+      stop_sequence: null,
+      usage: { input_tokens: this.usage.input_tokens, output_tokens: this.usage.output_tokens },
+    };
   }
 }
 
@@ -222,88 +267,4 @@ function frame(eventName: string, payload: Record<string, unknown>): string {
 function msgId(data: Record<string, unknown>): string {
   const r = data.response as Record<string, unknown> | undefined;
   return typeof r?.id === "string" ? r.id : `msg_${Date.now().toString(36)}`;
-}
-
-export function collectAnthropicMessage(frames: string[]): Record<string, unknown> {
-  const msg: Record<string, unknown> = {
-    id: undefined,
-    type: "message",
-    role: "assistant",
-    model: undefined,
-    content: [] as Array<Record<string, unknown>>,
-    stop_reason: null,
-    stop_sequence: null,
-    usage: { input_tokens: 0, output_tokens: 0 },
-  };
-  const content = msg.content as Array<Record<string, unknown>>;
-  const argsAccum = new Map<number, string>();
-
-  for (const f of frames) {
-    const parts = f.split("\ndata: ");
-    if (parts.length < 2) continue;
-    let payload: Record<string, unknown>;
-    try {
-      payload = JSON.parse(parts[1]!.trim());
-    } catch {
-      continue;
-    }
-    const type = payload.type as string | undefined;
-    switch (type) {
-      case "message_start": {
-        const m = (payload.message ?? {}) as Record<string, unknown>;
-        if (typeof m.id === "string") msg.id = m.id;
-        if (typeof m.model === "string") msg.model = m.model;
-        break;
-      }
-      case "content_block_start": {
-        const idx = Number(payload.index);
-        const block = JSON.parse(JSON.stringify(payload.content_block ?? {}));
-        content[idx] = block;
-        if (block.type === "tool_use") argsAccum.set(idx, "");
-        break;
-      }
-      case "content_block_delta": {
-        const idx = Number(payload.index);
-        const delta = (payload.delta ?? {}) as Record<string, unknown>;
-        const block = content[idx];
-        if (!block) break;
-        if (delta.type === "text_delta" && typeof delta.text === "string") {
-          block.text = (typeof block.text === "string" ? block.text : "") + delta.text;
-        } else if (delta.type === "input_json_delta" && typeof delta.partial_json === "string") {
-          argsAccum.set(idx, (argsAccum.get(idx) ?? "") + delta.partial_json);
-        }
-        break;
-      }
-      case "content_block_stop": {
-        const idx = Number(payload.index);
-        const block = content[idx];
-        if (block && block.type === "tool_use" && argsAccum.has(idx)) {
-          const raw = argsAccum.get(idx) ?? "";
-          try {
-            block.input = JSON.parse(raw);
-          } catch {
-            block.input = {};
-          }
-        }
-        break;
-      }
-      case "message_delta": {
-        const delta = (payload.delta ?? {}) as Record<string, unknown>;
-        if (typeof delta.stop_reason === "string" || delta.stop_reason === null) {
-          msg.stop_reason = delta.stop_reason;
-        }
-        const usage = (payload.usage ?? {}) as Record<string, unknown>;
-        if (typeof usage.input_tokens === "number" || typeof usage.output_tokens === "number") {
-          msg.usage = {
-            input_tokens: typeof usage.input_tokens === "number" ? usage.input_tokens : (msg.usage as Record<string, unknown>).input_tokens,
-            output_tokens: typeof usage.output_tokens === "number" ? usage.output_tokens : (msg.usage as Record<string, unknown>).output_tokens,
-          };
-        }
-        break;
-      }
-      default:
-        break;
-    }
-  }
-  return msg;
 }

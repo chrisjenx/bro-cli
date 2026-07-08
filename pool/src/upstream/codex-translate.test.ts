@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { anthropicToCodexRequest, CodexToAnthropicStream, collectAnthropicMessage } from "./codex-translate.ts";
+import { anthropicToCodexRequest, CodexToAnthropicStream } from "./codex-translate.ts";
 
 const parse = (frame: string) => JSON.parse(frame.split("\ndata: ")[1]!.trim());
 
@@ -96,22 +96,40 @@ describe("CodexToAnthropicStream", () => {
     expect(s.stopReason).toBe("tool_use");
   });
 
-  test("collectAnthropicMessage folds frames into a non-stream message", () => {
+  test("toAnthropicMessage folds structured state into a non-stream message (text)", () => {
     const s = new CodexToAnthropicStream("gpt");
-    const frames = [
-      ...s.handleEvent(ev("response.created", { response: { id: "r1" } })),
-      ...s.handleEvent(ev("response.output_item.added", { item: { type: "message" } })),
-      ...s.handleEvent(ev("response.output_text.delta", { delta: "Hi" })),
-      ...s.handleEvent(ev("response.output_item.done", { item: { type: "message" } })),
-      ...s.handleEvent(ev("response.completed", { response: { usage: { input_tokens: 3, output_tokens: 1 } } })),
-      ...s.finish(),
-    ];
-    const msg = collectAnthropicMessage(frames);
+    s.handleEvent(ev("response.created", { response: { id: "r1" } }));
+    s.handleEvent(ev("response.output_item.added", { item: { type: "message" } }));
+    s.handleEvent(ev("response.output_text.delta", { delta: "Hi" }));
+    s.handleEvent(ev("response.output_item.done", { item: { type: "message" } }));
+    s.handleEvent(ev("response.completed", { response: { usage: { input_tokens: 3, output_tokens: 1 } } }));
+    s.finish();
+    const msg = s.toAnthropicMessage();
     expect(msg).toMatchObject({
-      type: "message", role: "assistant",
+      id: "r1",
+      type: "message", role: "assistant", model: "gpt",
       content: [{ type: "text", text: "Hi" }],
       stop_reason: "end_turn",
+      stop_sequence: null,
       usage: { input_tokens: 3, output_tokens: 1 },
+    });
+  });
+
+  test("toAnthropicMessage parses tool_use input from accumulated function-call arguments", () => {
+    const s = new CodexToAnthropicStream("gpt");
+    s.handleEvent(ev("response.created", { response: { id: "r1" } }));
+    s.handleEvent(ev("response.output_item.added", { item: { type: "function_call", call_id: "c1", name: "read_file" } }));
+    s.handleEvent(ev("response.function_call_arguments.delta", { delta: '{"path":' }));
+    s.handleEvent(ev("response.function_call_arguments.delta", { delta: '"a"}' }));
+    s.handleEvent(ev("response.output_item.done", { item: { type: "function_call" } }));
+    s.handleEvent(ev("response.completed", { response: { usage: { input_tokens: 1, output_tokens: 2 } } }));
+    s.finish();
+    const msg = s.toAnthropicMessage();
+    expect(msg).toMatchObject({
+      id: "r1",
+      content: [{ type: "tool_use", id: "c1", name: "read_file", input: { path: "a" } }],
+      stop_reason: "tool_use",
+      usage: { input_tokens: 1, output_tokens: 2 },
     });
   });
 
