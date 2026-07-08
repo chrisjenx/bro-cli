@@ -10,7 +10,7 @@
 
 import type { Config } from "../config.ts";
 import { AccountManager } from "../accounts/manager.ts";
-import type { Account, OpenAIOauthCreds, RateLimitSnapshot } from "../accounts/types.ts";
+import type { Account, OpenAIOauthCreds, RateLimitSnapshot, RateLimitWindow } from "../accounts/types.ts";
 import type { ModelRoute } from "../models.ts";
 import { refreshOpenAIToken } from "../accounts/openai-oauth.ts";
 import { anthropicToCodexRequest, CodexToAnthropicStream } from "./codex-translate.ts";
@@ -439,26 +439,29 @@ export function parseCodexRateLimitSnapshot(headers: Headers): RateLimitSnapshot
     return usedPercent < 100 ? "allowed" : "rejected";
   };
 
-  const primaryPct = pct(CODEX_RATE_LIMIT_HEADERS.primaryUsedPercent);
-  const secondaryPct = pct(CODEX_RATE_LIMIT_HEADERS.secondaryUsedPercent);
-  const fiveHourStatus = statusFor(primaryPct);
-  const sevenDayStatus = statusFor(secondaryPct);
-
-  let unifiedStatus: string | null = null;
-  if (fiveHourStatus || sevenDayStatus) {
-    unifiedStatus = fiveHourStatus === "rejected" || sevenDayStatus === "rejected" ? "rejected" : "allowed";
-  }
-
-  return {
-    unifiedStatus,
-    fiveHourStatus,
-    fiveHourUtilization: primaryPct == null ? null : primaryPct / 100,
-    fiveHourReset: resetAt(CODEX_RATE_LIMIT_HEADERS.primaryResetAt),
-    sevenDayStatus,
-    sevenDayUtilization: secondaryPct == null ? null : secondaryPct / 100,
-    sevenDayReset: resetAt(CODEX_RATE_LIMIT_HEADERS.secondaryResetAt),
-    updatedAt: Date.now(),
+  // Codex's primary/secondary windows map onto the pool's account-wide unified
+  // windows (model === null): primary → "5h", secondary → "7d". Codex has no
+  // model-scoped windows, so these are the only two.
+  const windows: RateLimitWindow[] = [];
+  const addWindow = (key: string, usedName: string, resetName: string): void => {
+    const usedPct = pct(usedName);
+    const reset = resetAt(resetName);
+    if (usedPct == null && reset == null) return;
+    windows.push({
+      key,
+      model: null,
+      status: statusFor(usedPct),
+      utilization: usedPct == null ? null : usedPct / 100,
+      reset,
+    });
   };
+  addWindow("5h", CODEX_RATE_LIMIT_HEADERS.primaryUsedPercent, CODEX_RATE_LIMIT_HEADERS.primaryResetAt);
+  addWindow("7d", CODEX_RATE_LIMIT_HEADERS.secondaryUsedPercent, CODEX_RATE_LIMIT_HEADERS.secondaryResetAt);
+
+  const unifiedStatus =
+    windows.length === 0 ? null : windows.some((w) => w.status === "rejected") ? "rejected" : "allowed";
+
+  return { unifiedStatus, windows, updatedAt: Date.now() };
 }
 
 export function resetAtFromCodexHeaders(headers: Headers): number | undefined {

@@ -39,24 +39,27 @@ describe("parseCodexRateLimitSnapshot", () => {
       "x-codex-secondary-reset-at": String(inOneDay),
     });
     const s = parseCodexRateLimitSnapshot(h);
-    expect(s.fiveHourUtilization).toBeCloseTo(0.425);
-    expect(s.fiveHourStatus).toBe("allowed");
-    expect(s.fiveHourReset).toBe(inOneHour * 1000);
-    expect(s.sevenDayUtilization).toBeCloseTo(0.1);
-    expect(s.sevenDayReset).toBe(inOneDay * 1000);
+    const five = s.windows.find((w) => w.key === "5h");
+    const seven = s.windows.find((w) => w.key === "7d");
+    expect(five?.utilization).toBeCloseTo(0.425);
+    expect(five?.status).toBe("allowed");
+    expect(five?.reset).toBe(inOneHour * 1000);
+    expect(five?.model).toBeNull();
+    expect(seven?.utilization).toBeCloseTo(0.1);
+    expect(seven?.reset).toBe(inOneDay * 1000);
     expect(s.unifiedStatus).toBe("allowed");
   });
 
   test("exhausted primary window reads as rejected", () => {
     const h = new Headers({ "x-codex-primary-used-percent": "100" });
     const s = parseCodexRateLimitSnapshot(h);
-    expect(s.fiveHourStatus).toBe("rejected");
+    expect(s.windows.find((w) => w.key === "5h")?.status).toBe("rejected");
     expect(s.unifiedStatus).toBe("rejected");
   });
 
-  test("no headers → all-null snapshot", () => {
+  test("no headers → empty windows, null unified status", () => {
     const s = parseCodexRateLimitSnapshot(new Headers());
-    expect(s.fiveHourUtilization).toBeNull();
+    expect(s.windows).toEqual([]);
     expect(s.unifiedStatus).toBeNull();
   });
 });
@@ -125,7 +128,9 @@ describe("proxyCodexMessages", () => {
       const msg = (await res.json()) as { content: unknown };
       expect(msg.content).toEqual([{ type: "text", text: "Hi" }]);
       expect(mgr.getAccount("gpt1").usage.windowRequests).toBe(1);
-      expect(mgr.getAccount("gpt1").usage.rateLimitStatus?.fiveHourUtilization).toBeCloseTo(0.05);
+      expect(
+        mgr.getAccount("gpt1").usage.rateLimitStatus?.windows.find((w) => w.key === "5h")?.utilization,
+      ).toBeCloseTo(0.05);
     } finally {
       rmSync(poolDir, { recursive: true, force: true });
     }

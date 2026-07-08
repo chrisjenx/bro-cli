@@ -260,6 +260,20 @@ function ago(ts) {
 }
 function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
 
+// "5h" -> "5h window"; "7d-fable" (model "fable") -> "Fable · 7d window".
+function windowLabel(w) {
+  const dur = w.key.split(/[-_]/).filter((t) => /^\\d/.test(t)).join(" ") || w.key;
+  const scope = w.model ? w.model.charAt(0).toUpperCase() + w.model.slice(1) + " · " : "";
+  return scope + dur + " window";
+}
+
+function windowBar(w) {
+  const pct = w.utilization != null ? Math.min(100, Math.max(0, w.utilization * 100)) : 0;
+  return '<div><div class="bar-label"><span>' + esc(windowLabel(w)) + ' · used</span><span class="num">'
+    + pct.toFixed(0) + "% · resets " + timeUntil(w.reset)
+    + '</span></div><div class="bar"><span style="width:' + pct + '%"></span></div></div>';
+}
+
 function card(a) {
   const dot = a.available ? "ok" : (a.authenticated ? "warn" : "err");
   const state = a.available ? "Ready" : (a.authenticated ? "Sidelined" : "Logged out");
@@ -267,20 +281,17 @@ function card(a) {
   const rl = u.rateLimitStatus;
   const tok = u.windowInputTokens + u.windowOutputTokens;
 
-  // Anthropic's unified rolling windows (subscription traffic): a 5h and a 7d
-  // window, each with a utilization fraction in [0,1]. Show those when we have
-  // them; otherwise fall back to our local "(est.)" tally.
-  const have5h = rl && rl.fiveHourUtilization != null;
-  const have7d = rl && rl.sevenDayUtilization != null;
-
-  const pct5h = have5h ? Math.min(100, Math.max(0, rl.fiveHourUtilization * 100)) : 0;
-  const pct7d = have7d ? Math.min(100, Math.max(0, rl.sevenDayUtilization * 100)) : 0;
-  const bar5hLabel = have5h
-    ? '<div class="bar-label"><span>5h window · used</span><span class="num">' + pct5h.toFixed(0) + "% · resets " + timeUntil(rl.fiveHourReset) + '</span></div><div class="bar"><span style="width:' + pct5h + '%"></span></div>'
-    : '<div class="bar-label"><span>Requests (est.)</span><span class="num">' + fmtInt(u.windowRequests) + ' req</span></div><div class="bar"><span style="width:' + Math.min(100, (u.windowRequests / 200) * 100) + '%"></span></div>';
-  const bar7dLabel = have7d
-    ? '<div class="bar-label"><span>7d window · used</span><span class="num">' + pct7d.toFixed(0) + "% · resets " + timeUntil(rl.sevenDayReset) + '</span></div><div class="bar"><span style="width:' + pct7d + '%"></span></div>'
-    : '<div class="bar-label"><span>Tokens (est.)</span><span class="num">' + fmtInt(tok) + '</span></div><div class="bar"><span style="width:' + Math.min(100, tok / 1000000 * 100) + '%"></span></div>';
+  // Anthropic's unified rolling windows (subscription traffic): the account-wide
+  // 5h and 7d windows plus any model-scoped ones (e.g. Fable's separate, lower
+  // allowance), each with a utilization fraction in [0,1]. Show every window we
+  // have; fall back to our local "(est.)" tally per account-wide slot that's
+  // still missing (e.g. a freshly-added account with 5h data but no 7d yet).
+  const wins = (rl && Array.isArray(rl.windows) ? rl.windows : []).filter((w) => w.utilization != null);
+  const have5h = wins.some((w) => w.key === "5h");
+  const have7d = wins.some((w) => w.key === "7d");
+  const barsHtml = wins.map(windowBar).join("")
+    + (have5h ? "" : '<div><div class="bar-label"><span>Requests (est.)</span><span class="num">' + fmtInt(u.windowRequests) + ' req</span></div><div class="bar"><span style="width:' + Math.min(100, (u.windowRequests / 200) * 100) + '%"></span></div></div>')
+    + (have7d ? "" : '<div><div class="bar-label"><span>Tokens (est.)</span><span class="num">' + fmtInt(tok) + '</span></div><div class="bar"><span style="width:' + Math.min(100, tok / 1000000 * 100) + '%"></span></div></div>');
 
   const limitStatusRow = rl && rl.unifiedStatus
     ? '<span class="k">Usage status</span><span class="v">' + esc(rl.unifiedStatus) + "</span>" : "";
@@ -305,10 +316,7 @@ function card(a) {
       \${limitStatusRow}
       \${cooldownRow}
     </div>
-    <div class="bars">
-      <div>\${bar5hLabel}</div>
-      <div>\${bar7dLabel}</div>
-    </div>
+    <div class="bars">\${barsHtml}</div>
     \${note}
   </div>\`;
 }
