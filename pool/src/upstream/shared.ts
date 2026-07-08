@@ -1,0 +1,112 @@
+/**
+ * Helpers shared across upstream proxy backends (Anthropic direct, Codex).
+ */
+
+import type { Config } from "../config.ts";
+
+export interface SseEvent {
+  event: string;
+  data: string;
+}
+
+export class SseParser {
+  private decoder = new TextDecoder();
+  private buffer = "";
+  private eventName = "";
+  private data: string[] = [];
+
+  constructor(private onEvent: (event: SseEvent) => void) {}
+
+  push(chunk: Uint8Array): void {
+    this.pushText(this.decoder.decode(chunk, { stream: true }));
+  }
+
+  end(): void {
+    const rest = this.decoder.decode();
+    if (rest) this.pushText(rest);
+  }
+
+  private pushText(text: string): void {
+    this.buffer += text;
+    while (true) {
+      const i = this.buffer.indexOf("\n");
+      if (i < 0) return;
+      const raw = this.buffer.slice(0, i);
+      this.buffer = this.buffer.slice(i + 1);
+      this.line(raw.endsWith("\r") ? raw.slice(0, -1) : raw);
+    }
+  }
+
+  private line(line: string): void {
+    if (line === "") {
+      this.dispatch();
+      return;
+    }
+    if (line.startsWith(":")) return;
+
+    const colon = line.indexOf(":");
+    const field = colon < 0 ? line : line.slice(0, colon);
+    let value = colon < 0 ? "" : line.slice(colon + 1);
+    if (value.startsWith(" ")) value = value.slice(1);
+
+    if (field === "event") this.eventName = value;
+    else if (field === "data") this.data.push(value);
+  }
+
+  private dispatch(): void {
+    if (!this.eventName && this.data.length === 0) return;
+    this.onEvent({ event: this.eventName || "message", data: this.data.join("\n") });
+    this.eventName = "";
+    this.data = [];
+  }
+}
+
+export function anthropicError(status: number, type: string, message: string): Response {
+  return new Response(JSON.stringify({ type: "error", error: { type, message } }), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+export function makeAbort(config: Config, signal: AbortSignal): { signal: AbortSignal; cleanup: () => void } {
+  const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  signal.addEventListener("abort", onAbort, { once: true });
+  const timeout = setTimeout(() => controller.abort(), config.requestTimeoutMs);
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      clearTimeout(timeout);
+      signal.removeEventListener("abort", onAbort);
+    },
+  };
+}
+
+export function parseJson(text: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    return asObject(parsed);
+  } catch {
+    return null;
+  }
+}
+
+export function asObject(value: unknown): Record<string, unknown> | null {
+  return value != null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+export function objectProp(value: Record<string, unknown> | null, key: string): Record<string, unknown> | null {
+  return asObject(value?.[key]);
+}
+
+export function stringProp(value: Record<string, unknown> | null, key: string): string | undefined {
+  const raw = value?.[key];
+  return typeof raw === "string" ? raw : undefined;
+}
+
+export function numberProp(value: Record<string, unknown> | null, key: string): number | undefined {
+  const raw = value?.[key];
+  return typeof raw === "number" && Number.isFinite(raw) ? raw : undefined;
+}

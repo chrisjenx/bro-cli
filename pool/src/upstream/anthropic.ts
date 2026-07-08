@@ -11,6 +11,17 @@ import type { Config } from "../config.ts";
 import { AccountManager } from "../accounts/manager.ts";
 import type { Account, ClaudeOauthCreds, RateLimitSnapshot } from "../accounts/types.ts";
 import type { CliUsage } from "../subprocess/types.ts";
+import {
+  anthropicError,
+  makeAbort,
+  SseParser,
+  parseJson,
+  asObject,
+  objectProp,
+  stringProp,
+  numberProp,
+} from "./shared.ts";
+import type { SseEvent } from "./shared.ts";
 
 interface ProxyHooks {
   onFailover?: (from: string, to: string) => void;
@@ -443,63 +454,6 @@ class StreamUsageTap {
   }
 }
 
-interface SseEvent {
-  event: string;
-  data: string;
-}
-
-class SseParser {
-  private decoder = new TextDecoder();
-  private buffer = "";
-  private eventName = "";
-  private data: string[] = [];
-
-  constructor(private onEvent: (event: SseEvent) => void) {}
-
-  push(chunk: Uint8Array): void {
-    this.pushText(this.decoder.decode(chunk, { stream: true }));
-  }
-
-  end(): void {
-    const rest = this.decoder.decode();
-    if (rest) this.pushText(rest);
-  }
-
-  private pushText(text: string): void {
-    this.buffer += text;
-    while (true) {
-      const i = this.buffer.indexOf("\n");
-      if (i < 0) return;
-      const raw = this.buffer.slice(0, i);
-      this.buffer = this.buffer.slice(i + 1);
-      this.line(raw.endsWith("\r") ? raw.slice(0, -1) : raw);
-    }
-  }
-
-  private line(line: string): void {
-    if (line === "") {
-      this.dispatch();
-      return;
-    }
-    if (line.startsWith(":")) return;
-
-    const colon = line.indexOf(":");
-    const field = colon < 0 ? line : line.slice(0, colon);
-    let value = colon < 0 ? "" : line.slice(colon + 1);
-    if (value.startsWith(" ")) value = value.slice(1);
-
-    if (field === "event") this.eventName = value;
-    else if (field === "data") this.data.push(value);
-  }
-
-  private dispatch(): void {
-    if (!this.eventName && this.data.length === 0) return;
-    this.onEvent({ event: this.eventName || "message", data: this.data.join("\n") });
-    this.eventName = "";
-    this.data = [];
-  }
-}
-
 function recordJsonUsage(text: string, mgr: AccountManager, accountName: string): void {
   const json = parseJson(text);
   const usage = objectProp(json, "usage");
@@ -664,13 +618,6 @@ function responseHeaders(source: Headers, accountName: string): Headers {
   return headers;
 }
 
-function anthropicError(status: number, type: string, message: string): Response {
-  return new Response(JSON.stringify({ type: "error", error: { type, message } }), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
-}
-
 function bytesStream(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
   return new ReadableStream<Uint8Array>({
     start(controller) {
@@ -678,20 +625,6 @@ function bytesStream(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
       controller.close();
     },
   });
-}
-
-function makeAbort(config: Config, signal: AbortSignal): { signal: AbortSignal; cleanup: () => void } {
-  const controller = new AbortController();
-  const onAbort = () => controller.abort();
-  signal.addEventListener("abort", onAbort, { once: true });
-  const timeout = setTimeout(() => controller.abort(), config.requestTimeoutMs);
-  return {
-    signal: controller.signal,
-    cleanup: () => {
-      clearTimeout(timeout);
-      signal.removeEventListener("abort", onAbort);
-    },
-  };
 }
 
 function extractSessionKey(body: unknown): string | undefined {
@@ -724,31 +657,3 @@ function safeErrorText(text: string): string {
   return stringProp(error, "message") ?? (text.slice(0, 500) || "unknown OAuth error");
 }
 
-function parseJson(text: string): Record<string, unknown> | null {
-  try {
-    const parsed = JSON.parse(text) as unknown;
-    return asObject(parsed);
-  } catch {
-    return null;
-  }
-}
-
-function asObject(value: unknown): Record<string, unknown> | null {
-  return value != null && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : null;
-}
-
-function objectProp(value: Record<string, unknown> | null, key: string): Record<string, unknown> | null {
-  return asObject(value?.[key]);
-}
-
-function stringProp(value: Record<string, unknown> | null, key: string): string | undefined {
-  const raw = value?.[key];
-  return typeof raw === "string" ? raw : undefined;
-}
-
-function numberProp(value: Record<string, unknown> | null, key: string): number | undefined {
-  const raw = value?.[key];
-  return typeof raw === "number" && Number.isFinite(raw) ? raw : undefined;
-}
