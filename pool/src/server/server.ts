@@ -10,12 +10,13 @@
 
 import type { Config } from "../config.ts";
 import { AccountManager } from "../accounts/manager.ts";
-import { loadModelTable } from "../models.ts";
+import { loadModelTable, resolveModel, type ModelRoute } from "../models.ts";
 import { runClaude } from "../subprocess/claude.ts";
 import type { Account } from "../accounts/types.ts";
 import { runWithFailover } from "./failover.ts";
 import { dashboardHtml } from "./dashboard.ts";
 import { proxyAnthropicMessages } from "../upstream/anthropic.ts";
+import { proxyCodexMessages } from "../upstream/openai-codex.ts";
 import {
   parseOpenAI,
   collectOpenAI,
@@ -90,7 +91,7 @@ export function startServer(config: Config): void {
 
         return path === "/v1/chat/completions"
           ? handleOpenAI(body as OpenAIChatRequest, mgr, config, req.signal)
-          : handleAnthropic(body, req.headers, mgr, config, req.signal);
+          : handleAnthropic(body, req.headers, mgr, config, req.signal, modelTable);
       }
 
       return json({ error: "not found" }, 404);
@@ -166,14 +167,28 @@ async function handleOpenAI(
   return json(out, status, { "X-Pool-Account": first.name });
 }
 
+/** Pure decision of which model route a request body should use — no I/O. */
+export function routeForRequest(table: ModelRoute[], body: unknown): ModelRoute {
+  const model =
+    typeof (body as Record<string, unknown>)?.model === "string"
+      ? String((body as Record<string, unknown>).model)
+      : "";
+  return resolveModel(table, model);
+}
+
 async function handleAnthropic(
   body: unknown,
   headers: Headers,
   mgr: AccountManager,
   config: Config,
   signal: AbortSignal,
+  modelTable: ModelRoute[],
 ): Promise<Response> {
   if (config.backend === "oauth") {
+    const route = routeForRequest(modelTable, body);
+    if (route.provider === "openai") {
+      return proxyCodexMessages(body, mgr, config, signal, route, failoverHooks(config));
+    }
     return proxyAnthropicMessages(body, headers, mgr, config, signal, failoverHooks(config));
   }
 

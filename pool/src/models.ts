@@ -1,6 +1,7 @@
 /** Model-id → provider routing table, persisted at <poolDir>/models.json. */
 import { existsSync, readFileSync, writeFileSync } from "fs";
 import type { Provider } from "./accounts/types.ts";
+import type { AccountManager } from "./accounts/manager.ts";
 
 export interface ModelRoute {
   id: string;
@@ -42,6 +43,29 @@ export function resolveModel(table: ModelRoute[], modelId: string): ModelRoute {
     table.find((m) => m.id === modelId) ??
     { id: modelId, provider: "anthropic", upstreamModel: modelId }
   );
+}
+
+/**
+ * Refreshes the `openai` entries in `table` from an authenticated OpenAI
+ * (ChatGPT-subscription) account, if one exists. There is no documented Codex
+ * Responses-API model-listing endpoint in the open-source Codex CLI (verified
+ * during Task 1/8 research — codex-rs has no `GET .../models` call in its
+ * client), so this currently keeps the existing `openai` entries unchanged and
+ * prints a notice; it's structured so a real endpoint can be wired in later
+ * without changing the `models update` CLI contract.
+ */
+export async function updateOpenAIModels(mgr: AccountManager, table: ModelRoute[]): Promise<ModelRoute[]> {
+  const names = mgr.listNames().filter((n) => mgr.providerFor(n) === "openai");
+  const account = names.find((n) => mgr.getOpenAICreds(n)?.accessToken);
+  if (!account) {
+    console.log("No authenticated OpenAI account found — skipping models update.");
+    return table;
+  }
+  console.log(
+    "Codex has no documented model-list endpoint; keeping existing openai entries. " +
+      "Edit models.json manually to add/remove OpenAI model ids.",
+  );
+  return table;
 }
 
 function isModelRoute(v: unknown): v is ModelRoute {

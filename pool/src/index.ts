@@ -8,7 +8,7 @@
 
 import { loadConfig, type Config } from "./config.ts";
 import { startServer } from "./server/server.ts";
-import { runAccountsCommand } from "./cli.ts";
+import { runAccountsCommand, runModelsCommand } from "./cli.ts";
 
 function parseServeFlags(args: string[]): Partial<Config> {
   const overrides: Partial<Config> = {};
@@ -37,6 +37,10 @@ Usage:
   bun run src/index.ts accounts import <name>
   bun run src/index.ts accounts add <name>
   bun run src/index.ts accounts remove <name>
+  bun run src/index.ts accounts login <name> --provider openai
+  bun run src/index.ts accounts import <name> --provider openai
+  bun run src/index.ts models list
+  bun run src/index.ts models update
 
 Environment:
   CLAUDE_POOL_DIR     Pool directory (default ~/.claude-max-pool)
@@ -59,6 +63,11 @@ async function main(): Promise<number> {
   if (command === "accounts") {
     const config = loadConfig();
     return runAccountsCommand(config, rest);
+  }
+
+  if (command === "models") {
+    const config = loadConfig();
+    return runModelsCommand(config, rest);
   }
 
   if (command === "serve" || command === undefined) {

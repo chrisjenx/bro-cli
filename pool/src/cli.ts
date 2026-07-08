@@ -10,17 +10,32 @@
  *   accounts remove <name>        Delete an account and its credentials.
  */
 
+import { homedir } from "os";
+import { join } from "path";
+import { readFileSync } from "fs";
 import type { Config } from "./config.ts";
 import { AccountManager } from "./accounts/manager.ts";
+import { loginOpenAI } from "./accounts/openai-login.ts";
+import { normalizeCodexAuthJson } from "./accounts/openai-oauth.ts";
+import { loadModelTable, saveModelTable, updateOpenAIModels } from "./models.ts";
 
 function fmtWhen(ts: number | null): string {
   if (!ts) return "never";
   return new Date(ts).toLocaleString();
 }
 
-export async function runAccountsCommand(config: Config, args: string[]): Promise<number> {
+/** Pulls `--provider <name>` out of args, defaulting to "anthropic". */
+function extractProvider(args: string[]): { provider: string; positional: string[] } {
+  const idx = args.indexOf("--provider");
+  const provider = idx === -1 ? "anthropic" : (args[idx + 1] ?? "anthropic");
+  const positional = args.filter((a, i) => a !== "--provider" && args[i - 1] !== "--provider");
+  return { provider, positional };
+}
+
+export async function runAccountsCommand(config: Config, rawArgs: string[]): Promise<number> {
   const mgr = new AccountManager(config);
-  const [sub, name] = args;
+  const { provider, positional } = extractProvider(rawArgs);
+  const [sub, name] = positional;
 
   switch (sub) {
     case undefined:
@@ -49,7 +64,7 @@ Pool dir: ${config.accountsDir}`);
       console.log(`Pool dir: ${config.accountsDir}\n`);
       for (const a of accounts) {
         const state = a.available ? "READY" : a.authenticated ? "SIDELINED" : "LOGGED OUT";
-        console.log(`● ${a.name}  [${state}]`);
+        console.log(`● ${a.name}  [${a.provider}] [${state}]`);
         console.log(`    plan:      ${a.subscriptionType ?? "unknown"}   tier: ${a.rateLimitTier ?? "-"}`);
         console.log(
           `    token:     ${a.tokenExpired ? "expired (auto-refreshes on use)" : "valid until " + fmtWhen(a.tokenExpiresAt)}`,
@@ -75,6 +90,19 @@ Pool dir: ${config.accountsDir}`);
     case "login": {
       if (!name) return usageErr("accounts login <name>");
       if (!mgr.listNames().includes(name)) mgr.create(name);
+
+      if (provider === "openai") {
+        console.log(`Logging in to ChatGPT (subscription OAuth) for "${name}".`);
+        const ok = await loginOpenAI(mgr, name);
+        if (ok) {
+          const acct = mgr.getAccount(name);
+          console.log(`\n✓ "${name}" is authenticated (${acct.subscriptionType ?? "plan unknown"}).`);
+          return 0;
+        }
+        console.log(`\n⚠ Login for "${name}" did not complete. Try again.`);
+        return 1;
+      }
+
       const dir = mgr.configDirFor(name);
       console.log(`Opening interactive Claude login for "${name}".`);
       console.log(`Config dir: ${dir}`);
@@ -105,6 +133,28 @@ Pool dir: ${config.accountsDir}`);
 
     case "import": {
       if (!name) return usageErr("accounts import <name>");
+
+      if (provider === "openai") {
+        const src = join(homedir(), ".codex", "auth.json");
+        let raw: unknown;
+        try {
+          raw = JSON.parse(readFileSync(src, "utf8"));
+        } catch {
+          console.error(`No Codex login found at ${src}. Log in with \`codex login\` first.`);
+          return 1;
+        }
+        const creds = normalizeCodexAuthJson(raw);
+        if (!creds) {
+          console.error(`${src} did not contain usable credentials. Log in with \`codex login\` first.`);
+          return 1;
+        }
+        if (!mgr.listNames().includes(name)) mgr.create(name);
+        mgr.updateOpenAICreds(name, creds);
+        const acct = mgr.getAccount(name);
+        console.log(`✓ Imported ChatGPT login into "${name}" (${acct.subscriptionType ?? "plan unknown"}).`);
+        return 0;
+      }
+
       mgr.importCurrent(name);
       const acct = mgr.getAccount(name);
       console.log(
@@ -132,4 +182,32 @@ Pool dir: ${config.accountsDir}`);
 function usageErr(usage: string): number {
   console.error(`Usage: bun run src/index.ts ${usage}`);
   return 1;
+}
+
+/**
+ * `models` sub-commands.
+ *
+ *   models list      Show the current model-id → provider routing table.
+ *   models update     Refresh the openai entries from an authenticated
+ *                     ChatGPT-subscription account (best-effort; see models.ts).
+ */
+export async function runModelsCommand(config: Config, args: string[]): Promise<number> {
+  const [sub] = args;
+  const table = loadModelTable(config.modelsFile);
+
+  if (sub === undefined || sub === "list") {
+    for (const m of table) console.log(`${m.id.padEnd(24)} → ${m.provider}:${m.upstreamModel}`);
+    return 0;
+  }
+
+  if (sub === "update") {
+    const mgr = new AccountManager(config);
+    const updated = await updateOpenAIModels(mgr, table);
+    saveModelTable(config.modelsFile, updated);
+    console.log(`Saved ${updated.length} models to ${config.modelsFile}`);
+    return 0;
+  }
+
+  console.error(`Unknown models sub-command: ${sub}`);
+  return usageErr("models <list|update>");
 }
