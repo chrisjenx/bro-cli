@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { loadConfig } from "../config.ts";
@@ -394,6 +394,36 @@ test("pick() drops stale session affinity to a removed account instead of resurr
     // removed one via the stale affinity entry + leftover Keychain item.
     const second = mgr.pick(sessionKey);
     expect(second?.name).toBe(otherName);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("a stale in-memory manager's saveState() doesn't resurrect a removed account's usage.json entry", () => {
+  // Simulates the real architecture: a long-running pool server holds one
+  // AccountManager in memory for its whole lifetime, while `accounts remove`
+  // runs as a separate, short-lived CLI process with its own AccountManager
+  // pointed at the same pool directory.
+  const { poolDir, mgr: serverMgr } = tempPool(["work", "gone"]);
+  try {
+    serverMgr.recordSuccess("gone", { input_tokens: 1, output_tokens: 1 }, 0);
+
+    const config = loadConfig({
+      poolDir,
+      accountsDir: join(poolDir, "accounts"),
+      usageFile: join(poolDir, "usage.json"),
+    });
+    const cliMgr = new AccountManager(config);
+    cliMgr.remove("gone");
+
+    // serverMgr's in-memory usage map still thinks "gone" exists — recording
+    // usage for an unrelated account must not rewrite "gone" back into
+    // usage.json.
+    serverMgr.recordSuccess("work", { input_tokens: 1, output_tokens: 1 }, 0);
+
+    const onDisk = JSON.parse(readFileSync(join(poolDir, "usage.json"), "utf8"));
+    expect(onDisk.usage.gone).toBeUndefined();
+    expect(onDisk.usage.work).toBeDefined();
   } finally {
     rmSync(poolDir, { recursive: true, force: true });
   }
