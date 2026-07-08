@@ -153,3 +153,45 @@ describe("provider tagging", () => {
     }
   });
 });
+
+describe("provider-aware pick", () => {
+  test("pick filters by provider and keeps one affinity pin per provider", () => {
+    const { poolDir, mgr } = tempPool([]);
+    try {
+      mgr.create("claude1");
+      writeFileSync(
+        join(mgr.configDirFor("claude1"), ".credentials.json"),
+        JSON.stringify({ claudeAiOauth: { accessToken: "at" } }),
+      );
+      mgr.create("gpt1");
+      writeFileSync(
+        join(mgr.configDirFor("gpt1"), OPENAI_CREDS_FILENAME),
+        JSON.stringify({ accessToken: "at" }),
+      );
+
+      const a = mgr.pick("sess1"); // default: anthropic
+      const o = mgr.pick("sess1", undefined, "openai");
+      expect(a?.name).toBe("claude1");
+      expect(o?.name).toBe("gpt1");
+      // Pins are independent: re-picking either provider returns the same account.
+      expect(mgr.pick("sess1")?.name).toBe("claude1");
+      expect(mgr.pick("sess1", undefined, "openai")?.name).toBe("gpt1");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("pick returns null when no account of the provider exists", () => {
+    const { poolDir, mgr } = tempPool([]);
+    try {
+      mgr.create("claude1");
+      writeFileSync(
+        join(mgr.configDirFor("claude1"), ".credentials.json"),
+        JSON.stringify({ claudeAiOauth: { accessToken: "at" } }),
+      );
+      expect(mgr.pick(undefined, undefined, "openai")).toBeNull();
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+});

@@ -263,18 +263,19 @@ export class AccountManager {
    * @param exclude account names to skip (e.g. ones already tried this request
    *   during failover).
    */
-  pick(sessionKey?: string, exclude?: ReadonlySet<string>): Account | null {
-    if (sessionKey) {
-      const prior = this.sessionAffinity.get(sessionKey);
+  pick(sessionKey?: string, exclude?: ReadonlySet<string>, provider: Provider = "anthropic"): Account | null {
+    const affinityKey = sessionKey ? `${provider}:${sessionKey}` : undefined;
+    if (affinityKey) {
+      const prior = this.sessionAffinity.get(affinityKey);
       if (prior && !exclude?.has(prior)) {
         const acct = this.getAccount(prior);
-        if (acct.available) return acct;
-        this.sessionAffinity.delete(sessionKey);
+        if (acct.available && acct.provider === provider) return acct;
+        this.sessionAffinity.delete(affinityKey);
       }
     }
 
     const available = this.listAccounts().filter(
-      (a) => a.available && !exclude?.has(a.name),
+      (a) => a.available && a.provider === provider && !exclude?.has(a.name),
     );
     if (available.length === 0) return null;
 
@@ -300,13 +301,13 @@ export class AccountManager {
       this.rrCursor = (this.rrCursor + 1) % tied.length;
     }
 
-    if (sessionKey) this.sessionAffinity.set(sessionKey, best.name);
+    if (affinityKey) this.sessionAffinity.set(affinityKey, best.name);
     return best;
   }
 
   /** Pin a session to the account that actually served it (post-failover). */
-  setAffinity(sessionKey: string, accountName: string): void {
-    this.sessionAffinity.set(sessionKey, accountName);
+  setAffinity(sessionKey: string, accountName: string, provider: Provider = "anthropic"): void {
+    this.sessionAffinity.set(`${provider}:${sessionKey}`, accountName);
   }
 
   // ---- usage recording ---------------------------------------------------
