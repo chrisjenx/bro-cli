@@ -1,10 +1,11 @@
-import { test, expect } from "bun:test";
+import { test, expect, describe } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { loadConfig } from "../config.ts";
 import { AccountManager } from "./manager.ts";
 import type { RateLimitSnapshot } from "./types.ts";
+import { OPENAI_CREDS_FILENAME } from "./types.ts";
 
 function tempPool(accountNames: string[]): { poolDir: string; mgr: AccountManager } {
   const poolDir = mkdtempSync(join(tmpdir(), "cmp-manager-"));
@@ -127,4 +128,28 @@ test("an account with a spent window is available again once its reset has passe
   } finally {
     rmSync(poolDir, { recursive: true, force: true });
   }
+});
+
+describe("provider tagging", () => {
+  test("account with openai-auth.json is provider openai; default is anthropic", () => {
+    const { poolDir, mgr } = tempPool([]);
+    try {
+      mgr.create("claude1");
+      writeFileSync(
+        join(mgr.configDirFor("claude1"), ".credentials.json"),
+        JSON.stringify({ claudeAiOauth: { accessToken: "at", refreshToken: "rt" } }),
+      );
+      mgr.create("gpt1");
+      writeFileSync(
+        join(mgr.configDirFor("gpt1"), OPENAI_CREDS_FILENAME),
+        JSON.stringify({ accessToken: "at", refreshToken: "rt", accountId: "acc_1" }),
+      );
+
+      expect(mgr.getAccount("claude1").provider).toBe("anthropic");
+      expect(mgr.getAccount("gpt1").provider).toBe("openai");
+      expect(mgr.getAccount("gpt1").authenticated).toBe(true);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
 });

@@ -13,6 +13,26 @@ export interface CredentialsFile {
   [key: string]: unknown;
 }
 
+export type Provider = "anthropic" | "openai";
+
+/** Filename inside an account dir that marks it as an OpenAI account. */
+export const OPENAI_CREDS_FILENAME = "openai-auth.json";
+
+/**
+ * Normalized ChatGPT-subscription OAuth credential set (from the Codex OAuth
+ * flow). Stored as JSON in <accountDir>/openai-auth.json.
+ */
+export interface OpenAIOauthCreds {
+  accessToken?: string;
+  refreshToken?: string;
+  /** ChatGPT account id sent as the chatgpt-account-id request header. */
+  accountId?: string;
+  /** Epoch ms when accessToken expires. */
+  expiresAt?: number;
+  /** Plan name parsed from the id_token claims, for display (e.g. "plus", "pro"). */
+  planType?: string;
+}
+
 /**
  * Anthropic's own view of an account's remaining headroom, taken verbatim from
  * the `anthropic-ratelimit-unified-*` response headers that Claude subscription
@@ -80,6 +100,7 @@ export interface AccountUsage {
 export interface Account {
   name: string;
   configDir: string;
+  provider: Provider;
   authenticated: boolean;
   subscriptionType: string | null;
   rateLimitTier: string | null;

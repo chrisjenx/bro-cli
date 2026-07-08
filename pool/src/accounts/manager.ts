@@ -12,8 +12,8 @@ import { mkdirSync, existsSync, readdirSync, readFileSync, writeFileSync, rmSync
 import { join } from "path";
 import type { Config } from "../config.ts";
 import { defaultClaudeConfigDir } from "../config.ts";
-import type { Account, AccountUsage, CredentialsFile, RateLimitSnapshot } from "./types.ts";
-import { emptyUsage } from "./types.ts";
+import type { Account, AccountUsage, CredentialsFile, OpenAIOauthCreds, Provider, RateLimitSnapshot } from "./types.ts";
+import { emptyUsage, OPENAI_CREDS_FILENAME } from "./types.ts";
 import {
   keychainServiceForConfigDir,
   readKeychainCreds,
@@ -181,11 +181,32 @@ export class AccountManager {
     writeFileSync(this.credsPath(name), JSON.stringify(next, null, 2));
   }
 
+  providerFor(name: string): Provider {
+    return existsSync(join(this.configDirFor(name), OPENAI_CREDS_FILENAME)) ? "openai" : "anthropic";
+  }
+
+  private openaiCredsPath(name: string): string {
+    return join(this.configDirFor(name), OPENAI_CREDS_FILENAME);
+  }
+
+  getOpenAICreds(name: string): OpenAIOauthCreds | null {
+    try {
+      return JSON.parse(readFileSync(this.openaiCredsPath(name), "utf8")) as OpenAIOauthCreds;
+    } catch {
+      return null;
+    }
+  }
+
+  updateOpenAICreds(name: string, creds: OpenAIOauthCreds): void {
+    writeFileSync(this.openaiCredsPath(name), JSON.stringify(creds, null, 2));
+  }
+
   getAccount(name: string): Account {
-    const creds = this.readCreds(name);
-    const oauth = creds?.claudeAiOauth ?? null;
-    const authenticated = Boolean(oauth?.accessToken);
-    const tokenExpiresAt = oauth?.expiresAt ?? null;
+    const provider = this.providerFor(name);
+    const oauth = provider === "anthropic" ? (this.readCreds(name)?.claudeAiOauth ?? null) : null;
+    const openai = provider === "openai" ? this.getOpenAICreds(name) : null;
+    const authenticated = provider === "openai" ? Boolean(openai?.accessToken) : Boolean(oauth?.accessToken);
+    const tokenExpiresAt = (provider === "openai" ? openai?.expiresAt : oauth?.expiresAt) ?? null;
     const tokenExpired = tokenExpiresAt != null && tokenExpiresAt < Date.now();
 
     const usage = this.usageFor(name);
@@ -212,8 +233,9 @@ export class AccountManager {
     return {
       name,
       configDir: this.configDirFor(name),
+      provider,
       authenticated,
-      subscriptionType: oauth?.subscriptionType ?? null,
+      subscriptionType: provider === "openai" ? (openai?.planType ?? "chatgpt") : (oauth?.subscriptionType ?? null),
       rateLimitTier: oauth?.rateLimitTier ?? null,
       scopes: oauth?.scopes ?? [],
       tokenExpiresAt,
