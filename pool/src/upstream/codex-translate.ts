@@ -184,6 +184,10 @@ export class CodexToAnthropicStream {
 
   finish(): string[] {
     if (this.finished || !this.started) return [];
+    if (this.sawError) {
+      this.finished = true;
+      return [];
+    }
     this.finished = true;
     const frames = this.closeBlock();
     frames.push(frame("message_delta", {

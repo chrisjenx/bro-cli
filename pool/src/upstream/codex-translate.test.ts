@@ -99,4 +99,19 @@ describe("CodexToAnthropicStream", () => {
       usage: { input_tokens: 3, output_tokens: 1 },
     });
   });
+
+  test("mid-stream error is terminal: no message_delta/message_stop follow it", () => {
+    const s = new CodexToAnthropicStream("gpt");
+    const frames = [
+      ...s.handleEvent(ev("response.created", { response: { id: "r1" } })),
+      ...s.handleEvent(ev("response.output_item.added", { item: { type: "message" } })),
+      ...s.handleEvent(ev("response.output_text.delta", { delta: "Hel" })),
+      ...s.handleEvent(ev("response.failed", { response: { error: { code: "boom", message: "backend broke" } } })),
+      ...s.finish(),
+    ];
+    const types = frames.map((f) => parse(f).type);
+    expect(types.filter((t) => t === "error")).toHaveLength(1);
+    expect(types).not.toContain("message_stop");
+    expect(types).not.toContain("message_delta");
+  });
 });
