@@ -5,7 +5,7 @@ import { tmpdir } from "os";
 import { loadConfig } from "../config.ts";
 import { AccountManager } from "../accounts/manager.ts";
 import { OPENAI_CREDS_FILENAME } from "../accounts/types.ts";
-import { parseCodexRateLimitSnapshot, proxyCodexMessages } from "./openai-codex.ts";
+import { parseCodexRateLimitSnapshot, proxyCodexMessages, resetAtFromCodexHeaders } from "./openai-codex.ts";
 
 function tempOpenAIPool(accountNames: string[]): { poolDir: string; mgr: AccountManager } {
   const poolDir = mkdtempSync(join(tmpdir(), "cmp-codex-"));
@@ -58,6 +58,30 @@ describe("parseCodexRateLimitSnapshot", () => {
     const s = parseCodexRateLimitSnapshot(new Headers());
     expect(s.fiveHourUtilization).toBeNull();
     expect(s.unifiedStatus).toBeNull();
+  });
+});
+
+describe("resetAtFromCodexHeaders", () => {
+  test("Codex absolute reset-at takes precedence over a generic retry-after", () => {
+    const resetAt = Math.floor(Date.now() / 1000) + 3600;
+    const h = new Headers({
+      "x-codex-primary-reset-at": String(resetAt),
+      "retry-after": "30",
+    });
+    // Must use the authoritative window reset, not now+30s from retry-after.
+    expect(resetAtFromCodexHeaders(h)).toBe(resetAt * 1000);
+  });
+
+  test("falls back to retry-after when no Codex reset-at header is present", () => {
+    const h = new Headers({ "retry-after": "60" });
+    const got = resetAtFromCodexHeaders(h)!;
+    // ~60s in the future (allow a little slack for clock/exec time).
+    expect(got).toBeGreaterThanOrEqual(Date.now() + 55_000);
+    expect(got).toBeLessThanOrEqual(Date.now() + 65_000);
+  });
+
+  test("undefined when neither header is present", () => {
+    expect(resetAtFromCodexHeaders(new Headers())).toBeUndefined();
   });
 });
 

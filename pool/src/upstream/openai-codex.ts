@@ -461,16 +461,16 @@ export function parseCodexRateLimitSnapshot(headers: Headers): RateLimitSnapshot
   };
 }
 
-function resetAtFromCodexHeaders(headers: Headers): number | undefined {
-  const viaRetryAfter = retryAfterMs(headers);
-  if (viaRetryAfter !== undefined) return viaRetryAfter;
-
+export function resetAtFromCodexHeaders(headers: Headers): number | undefined {
+  // Codex's own absolute reset-at is the authoritative cooldown-until, so it
+  // takes precedence over a generic retry-after (which a gateway/CDN might
+  // inject alongside it); retry-after is only a fallback.
   const primaryResetAt = headers.get(CODEX_RATE_LIMIT_HEADERS.primaryResetAt);
   if (primaryResetAt) {
     const n = Number.parseInt(primaryResetAt, 10);
     if (Number.isFinite(n)) return n * 1000;
   }
-  return undefined;
+  return retryAfterMs(headers);
 }
 
 function noOpenAIAccountMessage(mgr: AccountManager): string {

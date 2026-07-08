@@ -137,7 +137,7 @@ export class CodexToAnthropicStream {
         return [frame("message_start", {
           type: "message_start",
           message: {
-            id: msgId(data), type: "message", role: "assistant", model: this.modelId,
+            id: this.msgId, type: "message", role: "assistant", model: this.modelId,
             content: [], stop_reason: null, stop_sequence: null,
             usage: { input_tokens: 0, output_tokens: 0 },
           },
