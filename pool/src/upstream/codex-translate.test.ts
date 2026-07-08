@@ -25,6 +25,21 @@ describe("anthropicToCodexRequest", () => {
     expect(tools[0]).toMatchObject({ type: "function", name: "read_file" });
   });
 
+  test("maps tool_choice: any -> required, tool -> function, none -> none, default -> auto", () => {
+    const base = {
+      messages: [{ role: "user", content: "hi" }],
+      tools: [{ name: "read_file", description: "reads", input_schema: { type: "object" } }],
+    };
+    expect(anthropicToCodexRequest({ ...base, tool_choice: { type: "any" } }, "m").tool_choice).toBe("required");
+    expect(anthropicToCodexRequest({ ...base, tool_choice: { type: "tool", name: "read_file" } }, "m").tool_choice).toEqual({
+      type: "function",
+      name: "read_file",
+    });
+    expect(anthropicToCodexRequest({ ...base, tool_choice: { type: "none" } }, "m").tool_choice).toBe("none");
+    expect(anthropicToCodexRequest({ ...base, tool_choice: { type: "auto" } }, "m").tool_choice).toBe("auto");
+    expect(anthropicToCodexRequest(base, "m").tool_choice).toBe("auto");
+  });
+
   test("maps tool_use/tool_result round-trip", () => {
     const out = anthropicToCodexRequest({
       messages: [

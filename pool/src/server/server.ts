@@ -29,6 +29,7 @@ import {
   streamAnthropic,
   type AnthropicRequest,
 } from "../adapters/anthropic.ts";
+import { anthropicError } from "../upstream/shared.ts";
 
 const APPEND_SYSTEM_PROMPT =
   "You are being used as an API model endpoint. Respond directly to the user's request. " +
@@ -90,7 +91,7 @@ export function startServer(config: Config): void {
         }
 
         return path === "/v1/chat/completions"
-          ? handleOpenAI(body as OpenAIChatRequest, mgr, config, req.signal)
+          ? handleOpenAI(body as OpenAIChatRequest, mgr, config, req.signal, modelTable)
           : handleAnthropic(body, req.headers, mgr, config, req.signal, modelTable);
       }
 
@@ -148,8 +149,13 @@ async function handleOpenAI(
   mgr: AccountManager,
   config: Config,
   signal: AbortSignal,
+  modelTable: ModelRoute[],
 ): Promise<Response> {
   const parsed = parseOpenAI(body);
+  const route = routeForRequest(modelTable, body);
+  const rejection = openAIEndpointModelError(route, parsed.requestedModel);
+  if (rejection) return rejection;
+
   const first = mgr.pick(parsed.sessionKey);
   if (!first) return json(noAccountError("openai", mgr), 503);
 
@@ -176,6 +182,45 @@ export function routeForRequest(table: ModelRoute[], body: unknown): ModelRoute 
   return resolveModel(table, model);
 }
 
+/**
+ * The OpenAI-compat /v1/chat/completions endpoint flattens tool structure and
+ * cannot drive the Codex backend. If the resolved route is an OpenAI/ChatGPT
+ * model, reject with a clear 400 pointing the caller at /v1/messages instead
+ * of silently misrouting the request to the Claude CLI. Returns null when the
+ * route is fine to serve on this endpoint.
+ */
+export function openAIEndpointModelError(route: ModelRoute, modelId: string): Response | null {
+  if (route.provider !== "openai") return null;
+  return json(
+    {
+      error: {
+        message:
+          `Model '${modelId}' is served by an OpenAI/ChatGPT-subscription account and is only ` +
+          "available via the Anthropic /v1/messages endpoint. Point your client at /v1/messages " +
+          "(or use a Claude model here).",
+        type: "invalid_request_error",
+        code: "model_not_supported_on_this_endpoint",
+      },
+    },
+    400,
+  );
+}
+
+/**
+ * On the `cli` backend, /v1/messages spawns the Claude CLI subprocess, which
+ * can't drive an OpenAI/ChatGPT account. Only the `oauth` backend can route to
+ * Codex (via proxyCodexMessages). Returns null when the request is fine to
+ * serve on the configured backend.
+ */
+export function nonOauthOpenAIBackendError(route: ModelRoute, backend: Config["backend"]): Response | null {
+  if (route.provider !== "openai" || backend === "oauth") return null;
+  return anthropicError(
+    400,
+    "invalid_request_error",
+    `OpenAI models require the direct (oauth) backend. Unset CLAUDE_POOL_BACKEND=cli to use '${route.id}'.`,
+  );
+}
+
 async function handleAnthropic(
   body: unknown,
   headers: Headers,
@@ -184,8 +229,11 @@ async function handleAnthropic(
   signal: AbortSignal,
   modelTable: ModelRoute[],
 ): Promise<Response> {
+  const route = routeForRequest(modelTable, body);
+  const backendErr = nonOauthOpenAIBackendError(route, config.backend);
+  if (backendErr) return backendErr;
+
   if (config.backend === "oauth") {
-    const route = routeForRequest(modelTable, body);
     if (route.provider === "openai") {
       return proxyCodexMessages(body, mgr, config, signal, route, failoverHooks(config));
     }

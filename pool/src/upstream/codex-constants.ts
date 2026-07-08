@@ -27,6 +27,12 @@ export const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
  * (server.rs:167), not a fixed path baked into this constant. */
 export const CODEX_OAUTH_REDIRECT_PORT = 1455;
 
+/** Fallback localhost callback port used when CODEX_OAUTH_REDIRECT_PORT is busy.
+ * — codex-rs/login/src/server.rs:60 (`const FALLBACK_PORT: u16 = 1457;`) and the
+ * bind-retry loop in `bind_server` (server.rs:612-661), which retries the default
+ * port for a few hundred ms then rebinds to this fallback before giving up. */
+export const CODEX_OAUTH_REDIRECT_PORT_FALLBACK = 1457;
+
 /** OAuth scopes requested during the authorize step.
  * — codex-rs/login/src/server.rs:566-570 (`"openid profile email offline_access api.connectors.read api.connectors.invoke"`)
  * CORRECTED from the brief's guess: two extra scopes (`api.connectors.read`,

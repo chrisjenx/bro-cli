@@ -95,6 +95,7 @@ function mapToolChoice(choice: unknown): unknown {
   const c = choice as Record<string, unknown> | undefined;
   if (c?.type === "any") return "required";
   if (c?.type === "tool" && typeof c.name === "string") return { type: "function", name: c.name };
+  if (c?.type === "none") return "none";
   return "auto";
 }
 

@@ -32,6 +32,16 @@ function extractProvider(args: string[]): { provider: string; positional: string
   return { provider, positional };
 }
 
+/** The only two providers the pool knows how to log in / import. */
+export function isValidProvider(provider: string): provider is "anthropic" | "openai" {
+  return provider === "anthropic" || provider === "openai";
+}
+
+function unknownProviderErr(provider: string): number {
+  console.error(`Unknown provider "${provider}". Use --provider openai (or omit for the default Claude/anthropic login).`);
+  return 1;
+}
+
 export async function runAccountsCommand(config: Config, rawArgs: string[]): Promise<number> {
   const mgr = new AccountManager(config);
   const { provider, positional } = extractProvider(rawArgs);
@@ -89,6 +99,7 @@ Pool dir: ${config.accountsDir}`);
 
     case "login": {
       if (!name) return usageErr("accounts login <name>");
+      if (!isValidProvider(provider)) return unknownProviderErr(provider);
       if (!mgr.listNames().includes(name)) mgr.create(name);
 
       if (provider === "openai") {
@@ -133,6 +144,7 @@ Pool dir: ${config.accountsDir}`);
 
     case "import": {
       if (!name) return usageErr("accounts import <name>");
+      if (!isValidProvider(provider)) return unknownProviderErr(provider);
 
       if (provider === "openai") {
         const src = join(homedir(), ".codex", "auth.json");
