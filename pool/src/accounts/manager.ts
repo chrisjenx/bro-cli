@@ -34,6 +34,14 @@ interface PersistedState {
   usage: Record<string, AccountUsage>;
 }
 
+/** Darwin Keychain access, injectable so tests can simulate leftover items. */
+export interface KeychainOps {
+  read: typeof readKeychainCreds;
+  delete: typeof deleteKeychainCreds;
+}
+
+const defaultKeychainOps: KeychainOps = { read: readKeychainCreds, delete: deleteKeychainCreds };
+
 export class AccountManager {
   private config: Config;
   private usage: Record<string, AccountUsage> = {};
@@ -41,9 +49,11 @@ export class AccountManager {
   private sessionAffinity = new Map<string, string>();
   /** Round-robin cursor for tie-breaking least-loaded selection. */
   private rrCursor = 0;
+  private keychain: KeychainOps;
 
-  constructor(config: Config) {
+  constructor(config: Config, keychain: KeychainOps = defaultKeychainOps) {
     this.config = config;
+    this.keychain = keychain;
     mkdirSync(this.config.accountsDir, { recursive: true });
     this.loadState();
   }
@@ -128,7 +138,7 @@ export class AccountManager {
     // directory — without this, readCreds()'s Keychain fallback would keep
     // reporting a removed account as authenticated forever.
     if (process.platform === "darwin") {
-      deleteKeychainCreds(keychainServiceForConfigDir(dir));
+      this.keychain.delete(keychainServiceForConfigDir(dir));
     }
     delete this.usage[name];
     this.saveState();
@@ -190,7 +200,7 @@ export class AccountManager {
     // config dir. Rotated tokens are still cached to the file by
     // updateOAuthCreds(), which then takes precedence on the next read.
     if (process.platform === "darwin") {
-      return readKeychainCreds(keychainServiceForConfigDir(this.configDirFor(name)));
+      return this.keychain.read(keychainServiceForConfigDir(this.configDirFor(name)));
     }
     return null;
   }
