@@ -230,3 +230,44 @@ test("legacy persisted snapshots (fixed 5h/7d fields) are upgraded on load", asy
     rmSync(poolDir, { recursive: true, force: true });
   }
 });
+
+test("recordRateLimitSnapshot merges by window key instead of replacing wholesale", async () => {
+  const { poolDir, mgr } = tempPool(["a"]);
+  try {
+    // A Fable request's response reports the account-wide windows plus a
+    // model-scoped Fable window that's now exhausted.
+    mgr.recordRateLimitSnapshot(
+      "a",
+      snapshot([
+        win("5h", { utilization: 0.2 }),
+        win("7d", { utilization: 0.3 }),
+        win("7d-fable", { status: "rejected", utilization: 1, reset: Date.now() + 60 * 60_000 }),
+      ]),
+    );
+
+    // A subsequent Sonnet request's response only reports the account-wide
+    // windows — Anthropic has no reason to include the Fable-scoped header on
+    // a non-Fable request. The previously-recorded exhausted Fable window must
+    // survive, not be silently dropped.
+    mgr.recordRateLimitSnapshot(
+      "a",
+      snapshot([win("5h", { utilization: 0.25 }), win("7d", { utilization: 0.35 })]),
+    );
+
+    const rl = mgr.getAccount("a").usage.rateLimitStatus;
+    expect(rl?.windows.map((w) => w.key).sort()).toEqual(["5h", "7d", "7d-fable"]);
+    const fiveHour = rl?.windows.find((w) => w.key === "5h");
+    const fable = rl?.windows.find((w) => w.key === "7d-fable");
+    // Account-wide windows pick up the fresher values from the latest response...
+    expect(fiveHour?.utilization).toBe(0.25);
+    // ...while the Fable window (absent from that response) is carried over unchanged.
+    expect(fable?.utilization).toBe(1);
+    expect(fable?.status).toBe("rejected");
+
+    // Fable routing still sees the account as exhausted for Fable specifically.
+    expect(mgr.pick(undefined, undefined, "fable")).toBeNull();
+    expect(mgr.pick(undefined, undefined, "sonnet")?.name).toBe("a");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});

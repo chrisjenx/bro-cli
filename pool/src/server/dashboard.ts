@@ -282,12 +282,14 @@ function card(a) {
   // Anthropic's unified rolling windows (subscription traffic): the account-wide
   // 5h and 7d windows plus any model-scoped ones (e.g. Fable's separate, lower
   // allowance), each with a utilization fraction in [0,1]. Show every window we
-  // have; otherwise fall back to our local "(est.)" tally.
+  // have; fall back to our local "(est.)" tally per account-wide slot that's
+  // still missing (e.g. a freshly-added account with 5h data but no 7d yet).
   const wins = (rl && Array.isArray(rl.windows) ? rl.windows : []).filter((w) => w.utilization != null);
-  const barsHtml = wins.length > 0
-    ? wins.map(windowBar).join("")
-    : '<div><div class="bar-label"><span>Requests (est.)</span><span class="num">' + fmtInt(u.windowRequests) + ' req</span></div><div class="bar"><span style="width:' + Math.min(100, (u.windowRequests / 200) * 100) + '%"></span></div></div>'
-      + '<div><div class="bar-label"><span>Tokens (est.)</span><span class="num">' + fmtInt(tok) + '</span></div><div class="bar"><span style="width:' + Math.min(100, tok / 1000000 * 100) + '%"></span></div></div>';
+  const have5h = wins.some((w) => w.key === "5h");
+  const have7d = wins.some((w) => w.key === "7d");
+  const barsHtml = wins.map(windowBar).join("")
+    + (have5h ? "" : '<div><div class="bar-label"><span>Requests (est.)</span><span class="num">' + fmtInt(u.windowRequests) + ' req</span></div><div class="bar"><span style="width:' + Math.min(100, (u.windowRequests / 200) * 100) + '%"></span></div></div>')
+    + (have7d ? "" : '<div><div class="bar-label"><span>Tokens (est.)</span><span class="num">' + fmtInt(tok) + '</span></div><div class="bar"><span style="width:' + Math.min(100, tok / 1000000 * 100) + '%"></span></div></div>');
 
   const limitStatusRow = rl && rl.unifiedStatus
     ? '<span class="k">Usage status</span><span class="v">' + esc(rl.unifiedStatus) + "</span>" : "";

@@ -10,7 +10,7 @@
 import type { Config } from "../config.ts";
 import { AccountManager } from "../accounts/manager.ts";
 import type { Account, ClaudeOauthCreds, RateLimitSnapshot, RateLimitWindow } from "../accounts/types.ts";
-import { modelFamilyOf, windowModelOf } from "../accounts/types.ts";
+import { modelFamilyOf, sortRateLimitWindows, windowModelOf } from "../accounts/types.ts";
 import type { CliUsage } from "../subprocess/types.ts";
 
 interface ProxyHooks {
@@ -595,12 +595,7 @@ function parseRateLimitSnapshot(headers: Headers): RateLimitSnapshot {
     }
   }
 
-  // Account-wide windows first, then model-scoped, stable by key.
-  const sorted = [...windows.values()].sort((a, b) => {
-    if ((a.model == null) !== (b.model == null)) return a.model == null ? -1 : 1;
-    return a.key.localeCompare(b.key);
-  });
-  return { unifiedStatus, windows: sorted, updatedAt: Date.now() };
+  return { unifiedStatus, windows: sortRateLimitWindows([...windows.values()]), updatedAt: Date.now() };
 }
 
 function resetAtFromHeaders(headers: Headers): number | undefined {

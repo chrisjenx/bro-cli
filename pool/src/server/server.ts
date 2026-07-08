@@ -12,6 +12,7 @@ import type { Config } from "../config.ts";
 import { AccountManager } from "../accounts/manager.ts";
 import { runClaude } from "../subprocess/claude.ts";
 import type { Account } from "../accounts/types.ts";
+import { modelFamilyOf } from "../accounts/types.ts";
 import { runWithFailover } from "./failover.ts";
 import { dashboardHtml } from "./dashboard.ts";
 import { proxyAnthropicMessages } from "../upstream/anthropic.ts";
@@ -156,7 +157,11 @@ async function handleOpenAI(
   signal: AbortSignal,
 ): Promise<Response> {
   const parsed = parseOpenAI(body);
-  const first = mgr.pick(parsed.sessionKey, undefined, parsed.model);
+  // parsed.model is the CLI-resolved alias ("opus"/"sonnet"/"haiku") used to spawn
+  // the subprocess; routing must key off the caller's actual requested model id
+  // (e.g. "claude-fable-5"), which resolveModel() can't represent.
+  const modelFamily = modelFamilyOf(parsed.requestedModel);
+  const first = mgr.pick(parsed.sessionKey, undefined, modelFamily);
   if (!first) return json(noAccountError("openai", mgr), 503);
 
   const events = runWithFailover(
@@ -165,7 +170,7 @@ async function handleOpenAI(
     first,
     makeEventFactory(config, parsed.prompt, parsed.model, signal),
     failoverHooks(config),
-    parsed.model,
+    modelFamily,
   );
   if (parsed.stream) {
     return sseResponse(streamOpenAI(events, parsed), first.name);
@@ -187,7 +192,10 @@ async function handleAnthropic(
 
   const legacyBody = body as AnthropicRequest;
   const parsed = parseAnthropic(legacyBody);
-  const first = mgr.pick(parsed.sessionKey, undefined, parsed.model);
+  // Same reasoning as handleOpenAI: route on the actual requested model id, not
+  // the CLI-resolved alias.
+  const modelFamily = modelFamilyOf(parsed.requestedModel);
+  const first = mgr.pick(parsed.sessionKey, undefined, modelFamily);
   if (!first) return json(noAccountError("anthropic", mgr), 503);
 
   const events = runWithFailover(
@@ -196,7 +204,7 @@ async function handleAnthropic(
     first,
     makeEventFactory(config, parsed.prompt, parsed.model, signal),
     failoverHooks(config),
-    parsed.model,
+    modelFamily,
   );
   if (parsed.stream) {
     return sseResponse(streamAnthropic(events, parsed), first.name);

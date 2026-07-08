@@ -74,6 +74,14 @@ export function windowModelOf(key: string): string | null {
   return scopes.length > 0 ? scopes.join("-").toLowerCase() : null;
 }
 
+/** Account-wide windows first, then model-scoped, stable by key. */
+export function sortRateLimitWindows(windows: RateLimitWindow[]): RateLimitWindow[] {
+  return [...windows].sort((a, b) => {
+    if ((a.model == null) !== (b.model == null)) return a.model == null ? -1 : 1;
+    return a.key.localeCompare(b.key);
+  });
+}
+
 /** Model families we route on, matched as substrings of the requested model id. */
 const MODEL_FAMILIES = ["fable", "mythos", "opus", "sonnet", "haiku"] as const;
 

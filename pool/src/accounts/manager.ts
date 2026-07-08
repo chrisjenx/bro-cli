@@ -13,7 +13,7 @@ import { join } from "path";
 import type { Config } from "../config.ts";
 import { defaultClaudeConfigDir } from "../config.ts";
 import type { Account, AccountUsage, CredentialsFile, RateLimitSnapshot, RateLimitWindow } from "./types.ts";
-import { emptyUsage, normalizeRateLimitSnapshot } from "./types.ts";
+import { emptyUsage, normalizeRateLimitSnapshot, sortRateLimitWindows } from "./types.ts";
 import {
   keychainServiceForConfigDir,
   readKeychainCreds,
@@ -335,10 +335,16 @@ export class AccountManager {
     this.saveState();
   }
 
-  /** Record Anthropic's latest rate-limit headroom snapshot for this account. */
+  /**
+   * Record Anthropic's latest rate-limit headroom snapshot for this account.
+   * Merges by window key rather than replacing wholesale: a response only
+   * carries headers for the window(s) relevant to that request (e.g. a
+   * model-scoped Fable window may only appear on Fable requests), so a window
+   * absent from the latest snapshot is presumed still in effect, not cleared.
+   */
   recordRateLimitSnapshot(name: string, snapshot: RateLimitSnapshot): void {
     const u = this.usageFor(name);
-    u.rateLimitStatus = snapshot;
+    u.rateLimitStatus = mergeRateLimitSnapshot(u.rateLimitStatus, snapshot);
     this.saveState();
   }
 
@@ -360,6 +366,28 @@ export class AccountManager {
       return 0;
     }
   }
+}
+
+/**
+ * Merges a freshly-parsed snapshot into the previously-recorded one, keyed by
+ * window key. A window carried over from `prev` but absent from `next` is
+ * kept as-is rather than dropped — the response that produced `next` simply
+ * didn't report on that window (e.g. a Sonnet request's response has no
+ * reason to include a Fable-scoped window), it doesn't mean the window no
+ * longer applies.
+ */
+function mergeRateLimitSnapshot(
+  prev: RateLimitSnapshot | null,
+  next: RateLimitSnapshot,
+): RateLimitSnapshot {
+  const windows = new Map<string, RateLimitWindow>();
+  for (const w of prev?.windows ?? []) windows.set(w.key, w);
+  for (const w of next.windows) windows.set(w.key, w); // fresh data wins per key
+  return {
+    unifiedStatus: next.unifiedStatus ?? prev?.unifiedStatus ?? null,
+    windows: sortRateLimitWindows([...windows.values()]),
+    updatedAt: next.updatedAt,
+  };
 }
 
 /**
