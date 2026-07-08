@@ -42,15 +42,25 @@ export async function loginOpenAI(mgr: AccountManager, name: string): Promise<bo
   }).toString();
 
   const code = await new Promise<string | null>((resolve) => {
+    let settled = false;
+    let settleTimer: ReturnType<typeof setTimeout> | undefined;
+    let overallTimer: ReturnType<typeof setTimeout> | undefined;
+    const settle = (value: string | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(settleTimer);
+      clearTimeout(overallTimer);
+      server.stop();
+      resolve(value);
+    };
     const server = Bun.serve({
       port: CODEX_OAUTH_REDIRECT_PORT,
       fetch(req) {
         const url = new URL(req.url);
         if (url.pathname !== "/auth/callback") return new Response("not found", { status: 404 });
         const ok = url.searchParams.get("state") === state && Boolean(url.searchParams.get("code"));
-        setTimeout(() => {
-          server.stop();
-          resolve(ok ? url.searchParams.get("code") : null);
+        settleTimer = setTimeout(() => {
+          settle(ok ? url.searchParams.get("code") : null);
         }, 50);
         return new Response(
           ok ? "Login complete — you can close this tab." : "Login failed (state mismatch).",
@@ -62,9 +72,8 @@ export async function loginOpenAI(mgr: AccountManager, name: string): Promise<bo
     Bun.spawn([process.platform === "darwin" ? "open" : "xdg-open", authUrl.toString()], {
       stderr: "ignore",
     }).exited.catch(() => {});
-    setTimeout(() => {
-      server.stop();
-      resolve(null);
+    overallTimer = setTimeout(() => {
+      settle(null);
     }, 5 * 60_000); // 5-min timeout
   });
   if (!code) {
