@@ -3,7 +3,7 @@ import { loadConfig, ensureDefaultConfig, setKey, configPermissionMode, CONFIG_P
 import { loadModels, mergeProviders, updateModels, REMOTE_URL } from './models.js';
 import { select, promptHidden } from './ui.js';
 import { launch } from './launch.js';
-import { runPool, runPoolAccounts, runPoolCommand, selfHealPoolEnv, POOL_PROVIDER } from './pool.js';
+import { runPool, runPoolAccounts, runPoolModels, runPoolCommand, selfHealPoolEnv, POOL_PROVIDER } from './pool.js';
 import { runImageGen, IMAGE_PROVIDER } from './imagegen.js';
 import { rememberSelection, lastProvider, lastModelFor } from './state.js';
 
@@ -18,8 +18,12 @@ Usage:
   bro accounts list      List pool accounts
   bro accounts login <name>
                          Add/log in a Claude account for the pool
+  bro accounts login <name> --provider openai
+                         Add/log in a ChatGPT subscription account instead
   bro accounts import <name>
                          Copy this machine's current Claude login into the pool
+  bro models list        List pool model routing entries
+  bro models update      Refresh the pool's model list (Claude + OpenAI/gpt)
   bro image              Image generation — pick an API, then a self-hosted
                          web UI opens (images save to ./.bro/image-gen)
   bro image -p <api>     Skip the image API menu (e.g. bro image -p yunwu)
@@ -85,6 +89,10 @@ const modelLabel = (m) => (m.name ? `${m.name}  ${m.id ? `\x1b[2m(${m.id})\x1b[0
 export async function main(argv) {
   if (argv[0] === 'accounts') {
     return runPoolAccounts(argv.slice(1));
+  }
+
+  if (argv[0] === 'models') {
+    return runPoolModels(argv.slice(1));
   }
 
   if (argv[0] === 'pool') {

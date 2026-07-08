@@ -112,6 +112,11 @@ export function runPoolAccounts(args = []) {
   return runPoolCli(findBun(), ['accounts', ...args]);
 }
 
+// Run a pool `models` sub-command (list/update) with inherited stdio.
+export function runPoolModels(args = []) {
+  return runPoolCli(findBun(), ['models', ...args]);
+}
+
 // --- account setup flow ----------------------------------------------------
 
 async function ensureAccount(bun) {
@@ -279,9 +284,10 @@ function printStatus(status, baseUrl) {
     const tok = fmtTokens((u.windowInputTokens || 0) + (u.windowOutputTokens || 0));
     const usage = C.dim(`${(u.windowRequests || 0)} req · ${tok} tok`);
     const tier = C.dim(a.rateLimitTier || '-');
+    const provider = C.dim(`[${a.provider || 'anthropic'}]`);
     const state = a.available ? '' : '  ' + C.amber(a.unavailableReason || 'unavailable');
     console.log(
-      `  ${dot} ${a.name.padEnd(nameW)}  ${(a.subscriptionType || '?').padEnd(planW)}  ${tier}   ${usage}${state}`
+      `  ${dot} ${a.name.padEnd(nameW)}  ${provider}  ${(a.subscriptionType || '?').padEnd(planW)}  ${tier}   ${usage}${state}`
     );
   }
   console.log('');

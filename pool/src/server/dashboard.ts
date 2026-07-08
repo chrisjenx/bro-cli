@@ -96,6 +96,8 @@ export function dashboardHtml(): string {
   .state { font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); }
   .chip.plan { margin-left: auto; font-size: 11.5px; padding: 3px 9px;
     background: var(--accent-soft); border-color: transparent; color: var(--accent); font-weight: 500; }
+  .badge { font-size: 10.5px; padding: 3px 8px; border-radius: 999px; text-transform: uppercase;
+    letter-spacing: .04em; border: 1px solid var(--border); background: var(--surface-2); color: var(--muted); }
 
   .dl { display: grid; grid-template-columns: auto 1fr; gap: 7px 16px; font-size: 13.5px; }
   .dl .k { color: var(--muted); }
@@ -290,6 +292,7 @@ function card(a) {
   return \`<div class="card \${a.available ? "" : "down"}">
     <div class="card-top">
       <span class="status"><span class="dot \${dot}"></span><span class="acct-name">\${esc(a.name)}</span></span>
+      <span class="badge">\${esc(a.provider || "anthropic")}</span>
       <span class="chip plan">\${esc(a.subscriptionType || "unknown")}</span>
     </div>
     <div class="dl">
