@@ -12,8 +12,8 @@ import { mkdirSync, existsSync, readdirSync, readFileSync, writeFileSync, rmSync
 import { join } from "path";
 import type { Config } from "../config.ts";
 import { defaultClaudeConfigDir } from "../config.ts";
-import type { Account, AccountUsage, CredentialsFile } from "./types.ts";
-import { emptyUsage } from "./types.ts";
+import type { Account, AccountUsage, CredentialsFile, RateLimitSnapshot, RateLimitWindow } from "./types.ts";
+import { emptyUsage, normalizeRateLimitSnapshot, sortRateLimitWindows } from "./types.ts";
 import {
   keychainServiceForConfigDir,
   readKeychainCreds,
@@ -46,6 +46,10 @@ export class AccountManager {
     try {
       const parsed = JSON.parse(readFileSync(this.config.usageFile, "utf8")) as PersistedState;
       this.usage = parsed.usage ?? {};
+      // Snapshots persisted by older pool versions used fixed 5h/7d fields.
+      for (const u of Object.values(this.usage)) {
+        u.rateLimitStatus = normalizeRateLimitSnapshot(u.rateLimitStatus);
+      }
     } catch {
       this.usage = {};
     }
@@ -201,6 +205,12 @@ export class AccountManager {
       available = false;
       const mins = Math.ceil((usage.rateLimitedUntil! - now) / 60000);
       reason = `rate limited — retry in ~${mins} min`;
+    } else {
+      const soft = exhaustedReason(usage.rateLimitStatus, now);
+      if (soft) {
+        available = false;
+        reason = soft;
+      }
     }
 
     return {
@@ -226,35 +236,57 @@ export class AccountManager {
 
   /**
    * Pick an account to serve a request. Honors session affinity when the chosen
-   * account is still available and not excluded; otherwise selects the
-   * least-loaded available account (fewest requests in the current window),
-   * round-robin on ties.
+   * account is still available and not excluded; otherwise prefers the account
+   * with the most real headroom left (per Anthropic's own rate-limit headers,
+   * when we've seen one), falling back to fewest requests in the current
+   * window for accounts we have no live headroom data for yet. Round-robin on
+   * ties.
    *
    * @param exclude account names to skip (e.g. ones already tried this request
    *   during failover).
+   * @param modelFamily canonical family of the requested model ("fable",
+   *   "opus", …). Model-scoped unified windows (e.g. Fable's own, lower
+   *   allowance) sideline an account for matching requests only — the account
+   *   stays in rotation for other models — and count toward headroom scoring
+   *   for matching requests.
    */
-  pick(sessionKey?: string, exclude?: ReadonlySet<string>): Account | null {
+  pick(sessionKey?: string, exclude?: ReadonlySet<string>, modelFamily?: string | null): Account | null {
+    const now = Date.now();
+    const family = modelFamily ?? null;
+    const usable = (a: Account): boolean =>
+      a.available &&
+      !exclude?.has(a.name) &&
+      modelExhaustedReason(a.usage.rateLimitStatus, family, now) == null;
+
     if (sessionKey) {
       const prior = this.sessionAffinity.get(sessionKey);
       if (prior && !exclude?.has(prior)) {
         const acct = this.getAccount(prior);
-        if (acct.available) return acct;
+        if (usable(acct)) return acct;
         this.sessionAffinity.delete(sessionKey);
       }
     }
 
-    const available = this.listAccounts().filter(
-      (a) => a.available && !exclude?.has(a.name),
-    );
+    const available = this.listAccounts().filter(usable);
     if (available.length === 0) return null;
 
     let best = available[0]!;
+    let bestHeadroom = headroomFraction(best.usage, family);
     for (const a of available) {
-      if (a.usage.windowRequests < best.usage.windowRequests) best = a;
+      const headroom = headroomFraction(a.usage, family);
+      if (
+        headroom > bestHeadroom ||
+        (headroom === bestHeadroom && a.usage.windowRequests < best.usage.windowRequests)
+      ) {
+        best = a;
+        bestHeadroom = headroom;
+      }
     }
-    // Round-robin among the accounts tied for the minimum load.
+    // Round-robin among the accounts tied for the best headroom + load.
     const minLoad = best.usage.windowRequests;
-    const tied = available.filter((a) => a.usage.windowRequests === minLoad);
+    const tied = available.filter(
+      (a) => headroomFraction(a.usage, family) === bestHeadroom && a.usage.windowRequests === minLoad,
+    );
     if (tied.length > 1) {
       best = tied[this.rrCursor % tied.length]!;
       this.rrCursor = (this.rrCursor + 1) % tied.length;
@@ -303,6 +335,19 @@ export class AccountManager {
     this.saveState();
   }
 
+  /**
+   * Record Anthropic's latest rate-limit headroom snapshot for this account.
+   * Merges by window key rather than replacing wholesale: a response only
+   * carries headers for the window(s) relevant to that request (e.g. a
+   * model-scoped Fable window may only appear on Fable requests), so a window
+   * absent from the latest snapshot is presumed still in effect, not cleared.
+   */
+  recordRateLimitSnapshot(name: string, snapshot: RateLimitSnapshot): void {
+    const u = this.usageFor(name);
+    u.rateLimitStatus = mergeRateLimitSnapshot(u.rateLimitStatus, snapshot);
+    this.saveState();
+  }
+
   clearRateLimit(name: string): void {
     const u = this.usageFor(name);
     u.rateLimitedUntil = null;
@@ -321,4 +366,99 @@ export class AccountManager {
       return 0;
     }
   }
+}
+
+/**
+ * Merges a freshly-parsed snapshot into the previously-recorded one, keyed by
+ * window key. A window carried over from `prev` but absent from `next` is
+ * kept as-is rather than dropped — the response that produced `next` simply
+ * didn't report on that window (e.g. a Sonnet request's response has no
+ * reason to include a Fable-scoped window), it doesn't mean the window no
+ * longer applies.
+ */
+function mergeRateLimitSnapshot(
+  prev: RateLimitSnapshot | null,
+  next: RateLimitSnapshot,
+): RateLimitSnapshot {
+  const windows = new Map<string, RateLimitWindow>();
+  for (const w of prev?.windows ?? []) windows.set(w.key, w);
+  for (const w of next.windows) windows.set(w.key, w); // fresh data wins per key
+  return {
+    unifiedStatus: next.unifiedStatus ?? prev?.unifiedStatus ?? null,
+    windows: sortRateLimitWindows([...windows.values()]),
+    updatedAt: next.updatedAt,
+  };
+}
+
+/**
+ * Windows that bind for a request targeting `modelFamily`: account-wide
+ * windows always do; model-scoped windows only when the request's model
+ * matches (a spent Fable window shouldn't affect Sonnet traffic).
+ */
+function bindingWindows(rl: RateLimitSnapshot | null, modelFamily: string | null): RateLimitWindow[] {
+  if (!rl?.windows) return [];
+  return rl.windows.filter((w) => w.model == null || (modelFamily != null && w.model === modelFamily));
+}
+
+/**
+ * Fraction of headroom [0, 1] left before Anthropic's own limits kick in,
+ * derived from the tightest unified rolling window's utilization among the
+ * windows that bind for this request's model (account-wide windows, plus any
+ * window scoped to the requested model family). 1 (full headroom, i.e. no
+ * penalty) when we have no live snapshot for this account yet — e.g. it just
+ * joined the pool, or it's served via the CLI-subprocess backend, which has no
+ * HTTP access to these headers.
+ */
+function headroomFraction(usage: AccountUsage, modelFamily: string | null): number {
+  const utilizations = bindingWindows(usage.rateLimitStatus, modelFamily)
+    .map((w) => w.utilization)
+    .filter((u): u is number => u != null);
+  if (utilizations.length === 0) return 1;
+  // The window closest to full (highest utilization) is the binding constraint.
+  return Math.max(0, 1 - Math.max(...utilizations));
+}
+
+/** A unified-window status that means the account can't currently serve traffic. */
+function isBlockingStatus(status: string | null): boolean {
+  if (!status) return false;
+  const s = status.toLowerCase();
+  return s === "rejected" || s === "blocked" || s === "exhausted";
+}
+
+/**
+ * True (with a human-readable reason) when Anthropic reports one of `windows`
+ * fully consumed (utilization ≥ 1) or explicitly blocked, and that window's
+ * reset hasn't passed yet — i.e. the account is going to 429 if we route to
+ * it, so sideline it proactively.
+ */
+function spentWindowReason(windows: RateLimitWindow[], now: number): string | null {
+  for (const w of windows) {
+    const spent = (w.utilization != null && w.utilization >= 1) || isBlockingStatus(w.status);
+    if (spent && w.reset != null && w.reset > now) {
+      const mins = Math.ceil((w.reset - now) / 60000);
+      return `usage limit reached (${w.key} window) — resets in ~${mins} min`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Account-wide exhaustion only — drives `Account.available`. Model-scoped
+ * windows are deliberately excluded here: an account whose Fable allowance is
+ * spent can still serve every other model, so it stays "available" and the
+ * per-request model check in pick() handles the rest.
+ */
+function exhaustedReason(rl: RateLimitSnapshot | null, now: number): string | null {
+  if (!rl) return null;
+  return spentWindowReason((rl.windows ?? []).filter((w) => w.model == null), now);
+}
+
+/** Exhaustion of a window scoped to the requested model family, if any. */
+function modelExhaustedReason(
+  rl: RateLimitSnapshot | null,
+  modelFamily: string | null,
+  now: number,
+): string | null {
+  if (!rl || modelFamily == null) return null;
+  return spentWindowReason((rl.windows ?? []).filter((w) => w.model === modelFamily), now);
 }

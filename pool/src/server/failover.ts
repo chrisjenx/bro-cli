@@ -55,6 +55,7 @@ export async function* runWithFailover(
   first: Account,
   makeEvents: EventFactory,
   hooks: FailoverHooks = {},
+  modelFamily: string | null = null,
 ): AsyncGenerator<TurnEvent> {
   const tried = new Set<string>();
   let account: Account | null = first;
@@ -81,7 +82,7 @@ export async function* runWithFailover(
 
     if (!pendingRateLimit) return; // committed stream finished (success or hard error)
 
-    const next = mgr.pick(sessionKey, tried);
+    const next = mgr.pick(sessionKey, tried, modelFamily);
     if (!next) {
       // No other account can take over — surface the rate-limit error as-is.
       yield pendingRateLimit;

@@ -9,7 +9,8 @@
 
 import type { Config } from "../config.ts";
 import { AccountManager } from "../accounts/manager.ts";
-import type { Account, ClaudeOauthCreds } from "../accounts/types.ts";
+import type { Account, ClaudeOauthCreds, RateLimitSnapshot, RateLimitWindow } from "../accounts/types.ts";
+import { modelFamilyOf, sortRateLimitWindows, windowModelOf } from "../accounts/types.ts";
 import type { CliUsage } from "../subprocess/types.ts";
 
 interface ProxyHooks {
@@ -52,7 +53,10 @@ export async function proxyAnthropicMessages(
   hooks: ProxyHooks = {},
 ): Promise<Response> {
   const sessionKey = extractSessionKey(body);
-  const first = mgr.pick(sessionKey);
+  // Model-scoped usage windows (e.g. Fable's own allowance) only bind for
+  // requests that actually target that model, so routing needs to know it.
+  const modelFamily = modelFamilyOf(stringProp(asObject(body), "model"));
+  const first = mgr.pick(sessionKey, undefined, modelFamily);
   if (!first) return anthropicError(503, "overloaded_error", noAccountMessage(mgr));
 
   const bodyText = JSON.stringify(body ?? {});
@@ -72,7 +76,7 @@ export async function proxyAnthropicMessages(
     if (attempt.kind === "terminal") return attempt.response;
 
     lastRetry = attempt.reason;
-    const next = mgr.pick(sessionKey, tried);
+    const next = mgr.pick(sessionKey, tried, modelFamily);
     if (!next) break;
     hooks.onFailover?.(account.name, next.name);
     account = next;
@@ -111,6 +115,10 @@ async function tryAccount(
       mgr.recordError(account.name, message);
       return { kind: "retry", reason: authOrNetworkReason(message) };
     }
+  }
+
+  if (hasRateLimitHeaders(upstream.response.headers)) {
+    mgr.recordRateLimitSnapshot(account.name, parseRateLimitSnapshot(upstream.response.headers));
   }
 
   const streamRequested = bodyRequestsStream(bodyText);
@@ -537,6 +545,57 @@ function isRateLimit(type: string, message: string): boolean {
     text.includes("limit reached") ||
     text.includes("too many requests")
   );
+}
+
+const UNIFIED_HEADER_PREFIX = "anthropic-ratelimit-unified-";
+
+function hasRateLimitHeaders(headers: Headers): boolean {
+  // Claude subscription (OAuth) traffic reports a unified rolling-window model.
+  for (const name of headers.keys()) {
+    if (name.startsWith(UNIFIED_HEADER_PREFIX)) return true;
+  }
+  return false;
+}
+
+/**
+ * Reads every `anthropic-ratelimit-unified-*` header — present on direct
+ * subscription (OAuth) responses. Windows are parsed generically from
+ * `...unified-<key>-{status,utilization,reset}` triples, so beyond the
+ * account-wide "5h"/"7d" windows this also captures any model-scoped windows
+ * Anthropic sends (e.g. a separate Fable allowance as "7d-fable") without a
+ * code change. Reset headers are unix seconds.
+ */
+function parseRateLimitSnapshot(headers: Headers): RateLimitSnapshot {
+  let unifiedStatus: string | null = null;
+  const windows = new Map<string, RateLimitWindow>();
+
+  for (const [name, raw] of headers) {
+    if (!name.startsWith(UNIFIED_HEADER_PREFIX)) continue;
+    const rest = name.slice(UNIFIED_HEADER_PREFIX.length);
+    if (rest === "status") {
+      unifiedStatus = raw;
+      continue;
+    }
+    const match = /^(.+)-(status|utilization|reset)$/.exec(rest);
+    if (!match) continue;
+    const key = match[1]!;
+    let w = windows.get(key);
+    if (!w) {
+      w = { key, model: windowModelOf(key), status: null, utilization: null, reset: null };
+      windows.set(key, w);
+    }
+    if (match[2] === "status") {
+      w.status = raw;
+    } else if (match[2] === "utilization") {
+      const n = Number.parseFloat(raw);
+      if (Number.isFinite(n)) w.utilization = n;
+    } else {
+      const n = Number.parseInt(raw, 10);
+      if (Number.isFinite(n)) w.reset = n * 1000;
+    }
+  }
+
+  return { unifiedStatus, windows: sortRateLimitWindows([...windows.values()]), updatedAt: Date.now() };
 }
 
 function resetAtFromHeaders(headers: Headers): number | undefined {

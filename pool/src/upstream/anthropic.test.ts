@@ -67,10 +67,10 @@ function mockFetch(handler: (url: string, init: RequestInit) => Response | Promi
   return calls;
 }
 
-function jsonResponse(body: unknown, status = 200): Response {
+function jsonResponse(body: unknown, status = 200, extraHeaders: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...extraHeaders },
   });
 }
 
@@ -233,6 +233,140 @@ test("fails over to another account on a start-of-request rate limit", async () 
     expect(failovers).toEqual(["a->b"]);
     expect(mgr.getAccount("a").available).toBe(false);
     expect(mgr.getAccount("b").usage.totalRequests).toBe(1);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("captures Anthropic's unified rate-limit headers into the account's live snapshot", async () => {
+  const { poolDir, mgr, config } = tempPool(["a"]);
+  try {
+    const resetSec = Math.floor(Date.now() / 1000) + 3600;
+    mockFetch(() =>
+      jsonResponse(
+        {
+          type: "message",
+          content: [{ type: "text", text: "ok" }],
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+        200,
+        {
+          "anthropic-ratelimit-unified-status": "allowed",
+          "anthropic-ratelimit-unified-5h-status": "allowed",
+          "anthropic-ratelimit-unified-5h-utilization": "0.06",
+          "anthropic-ratelimit-unified-5h-reset": String(resetSec),
+          "anthropic-ratelimit-unified-7d-status": "allowed",
+          "anthropic-ratelimit-unified-7d-utilization": "0.17",
+          "anthropic-ratelimit-unified-7d-reset": String(resetSec + 1000),
+        },
+      ),
+    );
+
+    await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", max_tokens: 8, messages: [{ role: "user", content: "hi" }] },
+      new Headers(),
+      mgr,
+      config,
+      new AbortController().signal,
+    );
+
+    const rl = mgr.getAccount("a").usage.rateLimitStatus;
+    expect(rl).not.toBeNull();
+    expect(rl?.unifiedStatus).toBe("allowed");
+    const fiveHour = rl?.windows.find((w) => w.key === "5h");
+    const sevenDay = rl?.windows.find((w) => w.key === "7d");
+    expect(fiveHour?.model).toBeNull();
+    expect(fiveHour?.utilization).toBeCloseTo(0.06);
+    expect(fiveHour?.reset).toBe(resetSec * 1000);
+    expect(sevenDay?.utilization).toBeCloseTo(0.17);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("sidelines an account proactively once a unified window is fully consumed", async () => {
+  const { poolDir, mgr, config } = tempPool(["a", "b"]);
+  try {
+    const resetSec = Math.floor(Date.now() / 1000) + 3600;
+    mockFetch((_, init) => {
+      const token = new Headers(init.headers).get("authorization");
+      if (token === "Bearer tok-a") {
+        return jsonResponse(
+          { type: "message", content: [], usage: { input_tokens: 1, output_tokens: 1 } },
+          200,
+          {
+            "anthropic-ratelimit-unified-status": "rejected",
+            "anthropic-ratelimit-unified-5h-status": "rejected",
+            "anthropic-ratelimit-unified-5h-utilization": "1",
+            "anthropic-ratelimit-unified-5h-reset": String(resetSec),
+          },
+        );
+      }
+      return jsonResponse({ type: "message", content: [], usage: { input_tokens: 1, output_tokens: 1 } });
+    });
+
+    await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", max_tokens: 8, messages: [{ role: "user", content: "hi" }] },
+      new Headers(),
+      mgr,
+      config,
+      new AbortController().signal,
+    );
+
+    // "a" just got its snapshot recorded (5h window spent); it should no longer be picked.
+    const picked = mgr.pick();
+    expect(picked?.name).toBe("b");
+    expect(mgr.getAccount("a").available).toBe(false);
+    expect(mgr.getAccount("a").unavailableReason).toMatch(/usage limit reached/);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("captures a model-scoped (Fable) unified window and routes Fable traffic off the account", async () => {
+  const { poolDir, mgr, config } = tempPool(["a", "b"]);
+  try {
+    const resetSec = Math.floor(Date.now() / 1000) + 3600;
+    mockFetch(() =>
+      jsonResponse(
+        { type: "message", content: [{ type: "text", text: "ok" }], usage: { input_tokens: 1, output_tokens: 1 } },
+        200,
+        {
+          "anthropic-ratelimit-unified-status": "allowed",
+          "anthropic-ratelimit-unified-5h-status": "allowed",
+          "anthropic-ratelimit-unified-5h-utilization": "0.10",
+          "anthropic-ratelimit-unified-5h-reset": String(resetSec),
+          "anthropic-ratelimit-unified-7d-status": "allowed",
+          "anthropic-ratelimit-unified-7d-utilization": "0.20",
+          "anthropic-ratelimit-unified-7d-reset": String(resetSec + 1000),
+          // Fable's own, lower allowance — a hypothetical model-scoped window.
+          "anthropic-ratelimit-unified-7d-fable-status": "rejected",
+          "anthropic-ratelimit-unified-7d-fable-utilization": "1",
+          "anthropic-ratelimit-unified-7d-fable-reset": String(resetSec + 2000),
+        },
+      ),
+    );
+
+    await proxyAnthropicMessages(
+      { model: "claude-fable-5", max_tokens: 8, messages: [{ role: "user", content: "hi" }] },
+      new Headers(),
+      mgr,
+      config,
+      new AbortController().signal,
+    );
+
+    const rl = mgr.getAccount("a").usage.rateLimitStatus;
+    const fable = rl?.windows.find((w) => w.key === "7d-fable");
+    expect(fable?.model).toBe("fable");
+    expect(fable?.utilization).toBe(1);
+    expect(fable?.reset).toBe((resetSec + 2000) * 1000);
+
+    // Fable allowance spent on "a": Fable requests route to "b", but "a" stays
+    // available for everything else.
+    expect(mgr.getAccount("a").available).toBe(true);
+    expect(mgr.pick(undefined, new Set(), "fable")?.name).toBe("b");
+    expect(mgr.pick(undefined, new Set(["b"]), "fable")).toBeNull();
+    expect(mgr.pick(undefined, new Set(["b"]), "sonnet")?.name).toBe("a");
   } finally {
     rmSync(poolDir, { recursive: true, force: true });
   }
