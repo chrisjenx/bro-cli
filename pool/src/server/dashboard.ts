@@ -387,8 +387,14 @@ async function refresh() {
       const routing = d.routing || { tiers: [], nextPick: null, activeTier: null };
       const nextAcct = routing.nextPick && routing.nextPick.account;
       const byName = Object.fromEntries(accounts.map((a) => [a.name, a]));
+      const tieredNames = new Set((routing.tiers || []).flatMap((t) => t.accounts));
+      const untiered = accounts.filter((a) => !tieredNames.has(a.name));
       const groups = routing.tiers && routing.tiers.length
-        ? routing.tiers
+        ? routing.tiers.concat(
+            untiered.length
+              ? [{ priority: null, accounts: untiered.map((a) => a.name), available: untiered.filter((a) => a.available).length }]
+              : [],
+          )
         : [{ priority: null, accounts: accounts.map((a) => a.name), available: avail }];
       grid.innerHTML = groups.map((t) => {
         const cardsHtml = t.accounts
