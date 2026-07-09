@@ -77,6 +77,22 @@ bro accounts list             # show account status and usage
 bro accounts remove work      # delete a pooled account
 ```
 
+**Add a ChatGPT subscription (Codex) account** with `--provider openai`:
+
+```sh
+bro accounts login codex1 --provider openai    # browser OAuth sign-in to ChatGPT
+bro accounts import codex1 --provider openai   # import an existing `codex login` (~/.codex/auth.json)
+```
+
+Then requests for a Codex **model id** route to those accounts. See the routing table and add/rename model strings with:
+
+```sh
+bro models list     # id → provider:model (e.g. gpt-5.2-codex → openai:gpt-5.2-codex)
+bro models update   # refresh the routing table
+```
+
+Built-in Codex ids are `gpt-5.2-codex` and `gpt-5.1-codex-max`; add your own by editing the pool's `models.json`. Full details in [`pool/README.md`](./pool/README.md#openai--codex-chatgpt-subscription-accounts).
+
 **Failover:** when the serving account's usage/rate limit runs out before any output has streamed, the pool transparently sidelines it and retries the turn on the next account — you just keep going. Set `CLAUDE_POOL_BACKEND=cli` to use the older subprocess backend. Requires Bun (`bro` finds it automatically; install from [bun.sh](https://bun.sh)). See [`pool/README.md`](./pool/README.md) for the pool's own docs, endpoints, and configuration.
 
 ## 🎨 Image Gen
