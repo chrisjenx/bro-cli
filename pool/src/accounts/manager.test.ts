@@ -565,3 +565,59 @@ test("setPriority rejects negative or non-integer priorities", () => {
     rmSync(poolDir, { recursive: true, force: true });
   }
 });
+
+test("pick() prefers a lower-priority-number tier", () => {
+  const { poolDir, mgr } = tempPool(["primary", "fallback"]);
+  try {
+    mgr.setPriority("primary", 1);
+    mgr.setPriority("fallback", 2);
+    expect(mgr.pick()?.name).toBe("primary");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("pick() descends to fallback only when every primary is unavailable", () => {
+  const { poolDir, mgr } = tempPool(["primaryA", "primaryB", "fallback"]);
+  try {
+    mgr.setPriority("primaryA", 1);
+    mgr.setPriority("primaryB", 1);
+    mgr.setPriority("fallback", 2);
+    // One primary down, one still up -> stay on tier 1.
+    mgr.markRateLimited("primaryA", Date.now() + 60 * 60_000);
+    expect(mgr.pick()?.name).toBe("primaryB");
+    // Both primaries down -> descend to fallback.
+    mgr.markRateLimited("primaryB", Date.now() + 60 * 60_000);
+    expect(mgr.pick()?.name).toBe("fallback");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("failover exclude cascades from tier 1 to tier 2", () => {
+  const { poolDir, mgr } = tempPool(["primary", "fallback"]);
+  try {
+    mgr.setPriority("primary", 1);
+    mgr.setPriority("fallback", 2);
+    // Simulate failover having already tried "primary" this request.
+    expect(mgr.pick(undefined, new Set(["primary"]))?.name).toBe("fallback");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("affinity to a fallback account is dropped once a primary recovers", () => {
+  const { poolDir, mgr } = tempPool(["primary", "fallback"]);
+  try {
+    mgr.setPriority("primary", 1);
+    mgr.setPriority("fallback", 2);
+    // Pin the session to fallback while the primary is down.
+    mgr.markRateLimited("primary", Date.now() + 60 * 60_000);
+    expect(mgr.pick("s1")?.name).toBe("fallback"); // pins s1 -> fallback
+    // Primary recovers; the pinned fallback must be abandoned for the primary.
+    mgr.clearRateLimit("primary");
+    expect(mgr.pick("s1")?.name).toBe("primary");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});

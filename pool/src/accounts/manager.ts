@@ -343,6 +343,22 @@ export class AccountManager {
 
   // ---- routing -----------------------------------------------------------
 
+  /** Serveable right now for this provider/model, honoring the failover exclude set. */
+  private usableFor(
+    a: Account,
+    provider: Provider,
+    family: string | null,
+    now: number,
+    exclude?: ReadonlySet<string>,
+  ): boolean {
+    return (
+      a.available &&
+      a.provider === provider &&
+      !exclude?.has(a.name) &&
+      modelExhaustedReason(a.usage.rateLimitStatus, family, now) == null
+    );
+  }
+
   /**
    * Pick an account to serve a request. The default strategy spends viable quota
    * with the soonest known reset first, so expiring capacity is used before
@@ -367,35 +383,41 @@ export class AccountManager {
     const now = Date.now();
     const family = modelFamily ?? null;
     const affinityKey = sessionKey ? `${provider}:${sessionKey}` : undefined;
-    // Available = right provider, not excluded, and not sidelined for this
-    // model family (Fable's model-scoped windows) nor otherwise unavailable.
-    const usable = (a: Account): boolean =>
-      a.available &&
-      a.provider === provider &&
-      !exclude?.has(a.name) &&
-      modelExhaustedReason(a.usage.rateLimitStatus, family, now) == null;
 
-    const available = this.listAccounts().filter(usable);
+    const available = this.listAccounts().filter((a) => this.usableFor(a, provider, family, now, exclude));
     if (available.length === 0) return null;
+
+    // Priority tiers: only spend the highest-priority (lowest number) tier that
+    // still has an available account; hold lower tiers in reserve until it
+    // drains. Failover re-picks with `exclude` populated, so once a tier's
+    // accounts are all excluded/unavailable the next pick descends on its own.
+    const minPriority = Math.min(...available.map((a) => a.priority));
+    const tierPool = available.filter((a) => a.priority === minPriority);
 
     let prior: Account | null = null;
     if (affinityKey) {
       const priorName = this.sessionAffinity.get(affinityKey);
       if (priorName && !exclude?.has(priorName)) {
         const acct = this.getAccount(priorName);
-        if (usable(acct)) prior = acct;
-        else this.sessionAffinity.delete(affinityKey);
+        // Honor the pin only if the account is still usable AND in the active
+        // tier — a session pinned to a fallback during a primary outage must
+        // move back to primary once primary recovers.
+        if (this.usableFor(acct, provider, family, now, exclude) && acct.priority === minPriority) {
+          prior = acct;
+        } else {
+          this.sessionAffinity.delete(affinityKey);
+        }
       }
     }
 
     if (this.config.routingStrategy === "headroom") {
       if (prior) return prior;
-      const best = this.pickByHeadroom(available, family);
+      const best = this.pickByHeadroom(tierPool, family);
       if (affinityKey) this.sessionAffinity.set(affinityKey, best.name);
       return best;
     }
 
-    const best = this.pickByExpiringQuota(available, family, now, prior?.name);
+    const best = this.pickByExpiringQuota(tierPool, family, now, prior?.name);
     if (affinityKey) this.sessionAffinity.set(affinityKey, best.name);
     return best;
   }
