@@ -23,18 +23,31 @@ export function normalizeCodexAuthJson(raw: unknown): OpenAIOauthCreds | null {
 export async function refreshOpenAIToken(
   creds: OpenAIOauthCreds,
   fetchFn: typeof fetch = fetch,
+  timeoutMs = 20_000,
 ): Promise<OpenAIOauthCreds> {
   if (!creds.refreshToken) throw new Error("OpenAI account has no refresh token; re-run accounts login");
-  const response = await fetchFn(CODEX_TOKEN_URL, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      grant_type: "refresh_token",
-      refresh_token: creds.refreshToken,
-      client_id: CODEX_CLIENT_ID,
-      scope: "openid profile email",
-    }),
-  });
+  let response: Response;
+  try {
+    response = await fetchFn(CODEX_TOKEN_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        grant_type: "refresh_token",
+        refresh_token: creds.refreshToken,
+        client_id: CODEX_CLIENT_ID,
+        scope: "openid profile email",
+      }),
+      // Unlike every other outbound call in this proxy, this one previously had
+      // no timeout at all — a stalled token endpoint hung the whole request
+      // (and every subsequent request sharing its refreshLocks promise) forever.
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (err) {
+    if ((err as Error).name === "TimeoutError" || (err as Error).name === "AbortError") {
+      throw new Error(`OpenAI token refresh timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  }
   const text = await response.text();
   if (!response.ok) throw new Error(`OpenAI token refresh failed (${response.status}): ${text.slice(0, 200)}`);
   const json = JSON.parse(text) as Record<string, unknown>;

@@ -232,15 +232,24 @@ async function refreshOAuth(
   if (!current?.refreshToken) throw new Error(`Account "${accountName}" has no OAuth refresh token`);
   if (!forceRefresh && current.accessToken && tokenFresh(current, config)) return current;
 
-  const response = await fetch(config.oauthTokenUrl, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      grant_type: "refresh_token",
-      refresh_token: current.refreshToken,
-      client_id: config.oauthClientId,
-    }),
-  });
+  let response: Response;
+  try {
+    response = await fetch(config.oauthTokenUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        grant_type: "refresh_token",
+        refresh_token: current.refreshToken,
+        client_id: config.oauthClientId,
+      }),
+      signal: AbortSignal.timeout(config.tokenRefreshTimeoutMs),
+    });
+  } catch (err) {
+    if ((err as Error).name === "TimeoutError" || (err as Error).name === "AbortError") {
+      throw new Error(`OAuth refresh for "${accountName}" timed out after ${config.tokenRefreshTimeoutMs}ms`);
+    }
+    throw err;
+  }
   const text = await response.text();
   if (!response.ok) {
     throw new Error(`OAuth refresh failed for "${accountName}" (${response.status}): ${safeErrorText(text)}`);

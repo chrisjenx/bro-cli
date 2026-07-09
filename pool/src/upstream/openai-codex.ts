@@ -36,6 +36,9 @@ type AttemptResult =
 
 const refreshLocks = new Map<string, Promise<OpenAIOauthCreds>>();
 
+/** Anthropic SSE keep-alive frame, emitted during no-content phases (e.g. reasoning). */
+const PING_FRAME = `event: ping\ndata: ${JSON.stringify({ type: "ping" })}\n\n`;
+
 export async function proxyCodexMessages(
   body: unknown,
   mgr: AccountManager,
@@ -187,7 +190,7 @@ async function tryCodexAccount(
     return { kind: "terminal", response: anthropicError(502, "api_error", message) };
   }
 
-  return streamCodexResponse(res.body, account, mgr, route, streamRequested, abortCleanup);
+  return streamCodexResponse(res.body, account, mgr, route, streamRequested, abortCleanup, config);
 }
 
 async function fetchCodex(
@@ -237,7 +240,7 @@ async function ensureFreshToken(
   const existing = refreshLocks.get(accountName);
   if (existing) return existing;
 
-  const refresh = refreshOpenAIToken(creds, fetchFn)
+  const refresh = refreshOpenAIToken(creds, fetchFn, config.tokenRefreshTimeoutMs)
     .then((refreshed) => {
       mgr.updateOpenAICreds(accountName, refreshed);
       return refreshed;
@@ -261,6 +264,7 @@ async function streamCodexResponse(
   route: ModelRoute,
   streamRequested: boolean,
   cleanup: () => void,
+  config: Config,
 ): Promise<AttemptResult> {
   const translator = new CodexToAnthropicStream(route.id);
   const reader = body.getReader();
@@ -284,6 +288,13 @@ async function streamCodexResponse(
           return;
         }
       }
+      // gpt-5.5's reasoning-summary events (and other droppable preamble)
+      // translate to no frames. Once the stream has started, emit a ping in
+      // their place so the client sees keep-alive activity rather than silence
+      // during a long reasoning phase — mirroring Anthropic's own ping events.
+      if (frames.length === 0 && translator.hasStarted && !translator.sawError) {
+        pending.push(PING_FRAME);
+      }
       if (frames.length > 0) committed = true;
       pending.push(...frames);
     });
@@ -295,14 +306,22 @@ async function streamCodexResponse(
     // unbounded buffering against a misbehaving upstream.
     let upstreamDone = false;
     let prefixBytes = 0;
-    while (!committed && !initialRateLimit && !upstreamDone && prefixBytes < 64 * 1024) {
-      const { value, done: d } = await reader.read();
-      if (d) {
-        upstreamDone = true;
-        break;
+    try {
+      while (!committed && !initialRateLimit && !upstreamDone && prefixBytes < 64 * 1024) {
+        const { value, done: d } = await reader.read();
+        if (d) {
+          upstreamDone = true;
+          break;
+        }
+        if (value) prefixBytes += value.byteLength;
+        parser.push(value);
       }
-      if (value) prefixBytes += value.byteLength;
-      parser.push(value);
+    } catch (err) {
+      await reader.cancel().catch(() => {});
+      cleanup();
+      const message = (err as Error).message;
+      mgr.recordError(account.name, message);
+      return { kind: "retry", reason: { status: 502, type: "api_error", message, rateLimited: false } };
     }
 
     if (initialRateLimit) {
@@ -312,42 +331,85 @@ async function streamCodexResponse(
       return { kind: "retry", reason: initialRateLimit };
     }
 
+    // We hit the byte cap without the translator producing a single frame. That
+    // happens when Codex's first event (response.created, which echoes the full
+    // instructions + tool schemas) is a single SSE line larger than the cap:
+    // the parser can't complete it, so no message_start was emitted and the
+    // client would see a 200 with no opening frame and hang. Synthesize the
+    // message_start envelope now so the stream always opens promptly; the real
+    // response.created becomes a no-op once it finally parses in pull().
+    if (!committed && !upstreamDone) {
+      pending.push(...translator.forceMessageStart());
+    }
+
     const prefix = pending.splice(0, pending.length);
+    // Wall-clock of the last byte sent to the client, and an independent
+    // keep-alive timer. The keep-alive must NOT be driven from pull(): Bun.serve
+    // does not re-invoke pull() while it is blocked awaiting a silent upstream
+    // read, so a pull-based ping never fires over real HTTP during a model's
+    // thinking gap or a slow oversized response.created — the client is starved
+    // and its inactivity timeout fires. An interval enqueues pings regardless of
+    // pull cadence, matching Anthropic's own periodic ping.
+    let lastSentAt = Date.now();
+    let closed = false;
+    let keepAliveTimer: ReturnType<typeof setInterval> | undefined;
+    const stopKeepAlive = () => {
+      closed = true;
+      if (keepAliveTimer) clearInterval(keepAliveTimer);
+    };
     const stream = new ReadableStream<Uint8Array>({
-      async start(controller) {
+      start(controller) {
         for (const frame of prefix) controller.enqueue(encoder.encode(frame));
+        lastSentAt = Date.now();
+        keepAliveTimer = setInterval(() => {
+          if (closed) return;
+          if (Date.now() - lastSentAt >= config.streamKeepAliveMs) {
+            try {
+              controller.enqueue(encoder.encode(PING_FRAME));
+              lastSentAt = Date.now();
+            } catch {
+              // Stream already closed/errored — stop pinging.
+              stopKeepAlive();
+            }
+          }
+        }, config.streamKeepAliveMs);
       },
       async pull(controller) {
-        if (upstreamDone) {
+        const finalize = () => {
+          upstreamDone = true;
+          stopKeepAlive();
           parser.end();
           for (const frame of translator.finish()) controller.enqueue(encoder.encode(frame));
           if (translator.sawError) mgr.recordError(account.name, translator.sawError.message);
           else mgr.recordSuccess(account.name, translator.usage, 0);
           cleanup();
           controller.close();
+        };
+        if (upstreamDone) {
+          finalize();
           return;
         }
         try {
           const { value, done: d } = await reader.read();
           if (d) {
-            upstreamDone = true;
-            parser.end();
-            for (const frame of translator.finish()) controller.enqueue(encoder.encode(frame));
-            if (translator.sawError) mgr.recordError(account.name, translator.sawError.message);
-            else mgr.recordSuccess(account.name, translator.usage, 0);
-            cleanup();
-            controller.close();
+            finalize();
             return;
           }
           parser.push(value);
-          for (const frame of pending.splice(0, pending.length)) controller.enqueue(encoder.encode(frame));
+          const frames = pending.splice(0, pending.length);
+          if (frames.length > 0) {
+            for (const frame of frames) controller.enqueue(encoder.encode(frame));
+            lastSentAt = Date.now();
+          }
         } catch (err) {
+          stopKeepAlive();
           mgr.recordError(account.name, (err as Error).message);
           cleanup();
           controller.error(err);
         }
       },
       async cancel(reason) {
+        stopKeepAlive();
         cleanup();
         await reader.cancel(reason).catch(() => {});
       },

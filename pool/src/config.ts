@@ -31,6 +31,8 @@ export interface Config {
   oauthClientId: string;
   /** Refresh access tokens this long before their recorded expiry. */
   tokenRefreshSkewMs: number;
+  /** Timeout for the OAuth token-refresh call itself (Claude + OpenAI), in ms. */
+  tokenRefreshTimeoutMs: number;
   /** HTTP host to bind. */
   host: string;
   /** HTTP port to bind. */
@@ -40,12 +42,23 @@ export interface Config {
   /** Per-request upstream/subprocess timeout in milliseconds. */
   requestTimeoutMs: number;
   /**
+   * Emit an SSE `ping` keep-alive when a streaming upstream goes idle this long
+   * without sending bytes. Reasoning models (e.g. gpt-5.5 via Codex) can think
+   * silently for seconds; without keep-alives the client's inactivity timeout
+   * fires and it aborts. Mirrors Anthropic's own periodic ping.
+   */
+  streamKeepAliveMs: number;
+  /**
    * Length of the rolling usage window in milliseconds. Claude Max plans reset
    * usage roughly every 5 hours; we mirror that window for display/routing.
    */
   usageWindowMs: number;
   /** How long to sideline an account after it reports a rate limit, in ms. */
   rateLimitCooldownMs: number;
+  /** Account routing policy: spend soon-expiring viable quota by default. */
+  routingStrategy: "expiring" | "headroom";
+  /** Minimum remaining headroom required for a rate-limit window to be preferred. */
+  routingMinHeadroom: number;
   /** Log a line when a request fails over from one account to another. */
   logFailover: boolean;
 }
@@ -55,6 +68,26 @@ function intEnv(name: string, fallback: number): number {
   if (!raw) return fallback;
   const n = Number.parseInt(raw, 10);
   return Number.isFinite(n) ? n : fallback;
+}
+
+/** Like intEnv, but floors the result so a misconfigured 0/negative value can't produce a runaway timer or a timeout that fails instantly. */
+function positiveIntEnv(name: string, fallback: number, min: number): number {
+  return Math.max(min, intEnv(name, fallback));
+}
+
+function floatEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const n = Number.parseFloat(raw);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function clamp(n: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, n));
+}
+
+function routingStrategyEnv(): "expiring" | "headroom" {
+  return process.env.ROUTING_STRATEGY?.toLowerCase() === "headroom" ? "headroom" : "expiring";
 }
 
 function backendEnv(): "oauth" | "cli" {
@@ -79,12 +112,16 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
     oauthTokenUrl: process.env.CLAUDE_OAUTH_TOKEN_URL || "https://platform.claude.com/v1/oauth/token",
     oauthClientId: process.env.CLAUDE_OAUTH_CLIENT_ID || "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
     tokenRefreshSkewMs: intEnv("TOKEN_REFRESH_SKEW_MS", 5 * 60 * 1000),
+    tokenRefreshTimeoutMs: positiveIntEnv("TOKEN_REFRESH_TIMEOUT_MS", 20 * 1000, 1000),
     host: process.env.HOST || "127.0.0.1",
     port: intEnv("PORT", 3456),
     proxyApiKey: process.env.PROXY_API_KEY || "",
     requestTimeoutMs: intEnv("REQUEST_TIMEOUT_MS", 15 * 60 * 1000),
+    streamKeepAliveMs: positiveIntEnv("STREAM_KEEPALIVE_MS", 1000, 100),
     usageWindowMs: intEnv("USAGE_WINDOW_MS", 5 * 60 * 60 * 1000),
     rateLimitCooldownMs: intEnv("RATE_LIMIT_COOLDOWN_MS", 60 * 60 * 1000),
+    routingStrategy: routingStrategyEnv(),
+    routingMinHeadroom: clamp(floatEnv("ROUTING_MIN_HEADROOM", 0.1), 0, 1),
     logFailover: process.env.LOG_FAILOVER !== "0",
     ...overrides,
   };

@@ -2,7 +2,7 @@ import { test, expect, describe } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import { loadConfig } from "../config.ts";
+import { loadConfig, type Config } from "../config.ts";
 import { AccountManager, type KeychainOps } from "./manager.ts";
 import type { RateLimitSnapshot, RateLimitWindow } from "./types.ts";
 import { OPENAI_CREDS_FILENAME } from "./types.ts";
@@ -10,6 +10,7 @@ import { OPENAI_CREDS_FILENAME } from "./types.ts";
 function tempPool(
   accountNames: string[],
   keychain?: KeychainOps,
+  overrides: Partial<Config> = {},
 ): { poolDir: string; mgr: AccountManager } {
   const poolDir = mkdtempSync(join(tmpdir(), "cmp-manager-"));
   const accountsDir = join(poolDir, "accounts");
@@ -29,7 +30,7 @@ function tempPool(
       }),
     );
   }
-  const config = loadConfig({ poolDir, accountsDir, usageFile: join(poolDir, "usage.json") });
+  const config = loadConfig({ poolDir, accountsDir, usageFile: join(poolDir, "usage.json"), ...overrides });
   return { poolDir, mgr: keychain ? new AccountManager(config, keychain) : new AccountManager(config) };
 }
 
@@ -62,8 +63,8 @@ test("pick() prefers the account with more real headroom over pure round-robin",
   }
 });
 
-test("accounts with no snapshot yet are treated as full headroom (no penalty)", async () => {
-  const { poolDir, mgr } = tempPool(["no-data", "known-partial"]);
+test("accounts with no snapshot yet are treated as full headroom in headroom strategy", async () => {
+  const { poolDir, mgr } = tempPool(["no-data", "known-partial"], undefined, { routingStrategy: "headroom" });
   try {
     mgr.recordRateLimitSnapshot(
       "known-partial",
@@ -74,6 +75,109 @@ test("accounts with no snapshot yet are treated as full headroom (no penalty)", 
     expect(picked?.name).toBe("no-data");
   } finally {
     rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("pick() prefers soonest-resetting quota when accounts have enough headroom", async () => {
+  const { poolDir, mgr } = tempPool(["soon", "later"]);
+  try {
+    const now = Date.now();
+    mgr.recordRateLimitSnapshot("soon", snapshot([win("5h", { utilization: 0.5, reset: now + 30 * 60_000 })]));
+    mgr.recordRateLimitSnapshot("later", snapshot([win("5h", { utilization: 0.1, reset: now + 5 * 60 * 60_000 })]));
+
+    expect(mgr.pick()?.name).toBe("soon");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("pick() skips soonest-resetting quota when it is below minimum headroom", async () => {
+  const { poolDir, mgr } = tempPool(["soon-low", "later-ok"]);
+  try {
+    const now = Date.now();
+    mgr.recordRateLimitSnapshot("soon-low", snapshot([win("5h", { utilization: 0.95, reset: now + 10 * 60_000 })]));
+    mgr.recordRateLimitSnapshot("later-ok", snapshot([win("5h", { utilization: 0.3, reset: now + 5 * 60 * 60_000 })]));
+
+    expect(mgr.pick()?.name).toBe("later-ok");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("model-family reset timing only applies to matching model requests", async () => {
+  const { poolDir, mgr } = tempPool(["fable-soon", "fable-later"]);
+  try {
+    const now = Date.now();
+    mgr.recordRateLimitSnapshot(
+      "fable-soon",
+      snapshot([
+        win("5h", { utilization: 0.2, reset: now + 5 * 60 * 60_000 }),
+        win("7d-fable", { utilization: 0.5, reset: now + 30 * 60_000 }),
+      ]),
+    );
+    mgr.recordRateLimitSnapshot(
+      "fable-later",
+      snapshot([
+        win("5h", { utilization: 0.1, reset: now + 60 * 60_000 }),
+        win("7d-fable", { utilization: 0.1, reset: now + 5 * 60 * 60_000 }),
+      ]),
+    );
+
+    expect(mgr.pick(undefined, undefined, "anthropic", "fable")?.name).toBe("fable-soon");
+    expect(mgr.pick(undefined, undefined, "anthropic", "sonnet")?.name).toBe("fable-later");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("session affinity yields to better soon-expiring quota", async () => {
+  const { poolDir, mgr } = tempPool(["soon", "later"]);
+  try {
+    const now = Date.now();
+    mgr.setAffinity("session-1", "later");
+    mgr.recordRateLimitSnapshot("soon", snapshot([win("5h", { utilization: 0.5, reset: now + 30 * 60_000 })]));
+    mgr.recordRateLimitSnapshot("later", snapshot([win("5h", { utilization: 0.1, reset: now + 5 * 60 * 60_000 })]));
+
+    expect(mgr.pick("session-1")?.name).toBe("soon");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("session affinity wins among tied expiring-quota candidates", async () => {
+  const { poolDir, mgr } = tempPool(["a", "b"]);
+  try {
+    const now = Date.now();
+    mgr.setAffinity("session-1", "b");
+    mgr.recordRateLimitSnapshot("a", snapshot([win("5h", { utilization: 0.2, reset: now + 60 * 60_000 })]));
+    mgr.recordRateLimitSnapshot("b", snapshot([win("5h", { utilization: 0.2, reset: now + 60 * 60_000 })]));
+
+    expect(mgr.pick("session-1")?.name).toBe("b");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("known soon-expiring quota beats unknown reset data, but unknown accounts remain eligible", async () => {
+  const withKnown = tempPool(["known-soon", "unknown"]);
+  try {
+    const now = Date.now();
+    withKnown.mgr.recordRateLimitSnapshot(
+      "known-soon",
+      snapshot([win("5h", { utilization: 0.5, reset: now + 30 * 60_000 })]),
+    );
+
+    expect(withKnown.mgr.pick()?.name).toBe("known-soon");
+  } finally {
+    rmSync(withKnown.poolDir, { recursive: true, force: true });
+  }
+
+  const allUnknown = tempPool(["busy", "idle"]);
+  try {
+    allUnknown.mgr.recordSuccess("busy", { input_tokens: 1, output_tokens: 1 }, 0);
+    expect(allUnknown.mgr.pick()?.name).toBe("idle");
+  } finally {
+    rmSync(allUnknown.poolDir, { recursive: true, force: true });
   }
 });
 

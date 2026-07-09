@@ -199,6 +199,43 @@ test("refreshes an expired access token and persists rotated credentials", async
   }
 });
 
+test("token refresh call times out instead of hanging forever on a stalled OAuth endpoint", async () => {
+  const { poolDir, mgr, config } = tempPool(["a"]);
+  try {
+    const credsPath = join(poolDir, "accounts", "a", ".credentials.json");
+    const creds = JSON.parse(readFileSync(credsPath, "utf8")) as Record<string, any>;
+    creds.claudeAiOauth.expiresAt = Date.now() - 1_000;
+    writeFileSync(credsPath, JSON.stringify(creds, null, 2));
+
+    globalThis.fetch = ((input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url === "https://oauth.test/token") {
+        // Simulate a stalled token endpoint: never resolves on its own, only
+        // rejects when the caller's AbortSignal.timeout() actually fires.
+        return new Promise<Response>((_, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("The operation timed out.", "TimeoutError"));
+          });
+        });
+      }
+      return Promise.resolve(jsonResponse({ type: "message", usage: {}, content: [] }));
+    }) as typeof fetch;
+
+    const response = await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", max_tokens: 1, messages: [{ role: "user", content: "hi" }] },
+      new Headers(),
+      mgr,
+      { ...config, tokenRefreshTimeoutMs: 30 },
+      new AbortController().signal,
+    );
+
+    const text = await response.text();
+    expect(text).toContain("timed out");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
 test("fails over to another account on a start-of-request rate limit", async () => {
   const { poolDir, mgr, config } = tempPool(["a", "b"]);
   try {

@@ -4,8 +4,8 @@
  * Each account is a directory under <poolDir>/accounts/<name>/ with its own
  * Claude Code OAuth credentials. The manager reads each account's credentials
  * for status, tracks rolling usage, sidelines rate-limited accounts, and picks
- * which account should serve a given request (sticky by session, else
- * least-loaded).
+ * which account should serve a given request, preferring soon-expiring viable
+ * quota when upstream rate-limit reset data is available.
  */
 
 import { mkdirSync, existsSync, readdirSync, readFileSync, writeFileSync, rmSync, copyFileSync, statSync } from "fs";
@@ -309,12 +309,11 @@ export class AccountManager {
   // ---- routing -----------------------------------------------------------
 
   /**
-   * Pick an account to serve a request. Honors session affinity when the chosen
-   * account is still available and not excluded; otherwise prefers the account
-   * with the most real headroom left (per Anthropic's own rate-limit headers,
-   * when we've seen one), falling back to fewest requests in the current
-   * window for accounts we have no live headroom data for yet. Round-robin on
-   * ties.
+   * Pick an account to serve a request. The default strategy spends viable quota
+   * with the soonest known reset first, so expiring capacity is used before
+   * longer-lived capacity. Session affinity is kept as a tiebreaker rather than
+   * an absolute pin; the optional headroom strategy preserves the old sticky,
+   * most-headroom-first behavior.
    *
    * @param exclude account names to skip (e.g. ones already tried this request
    *   during failover).
@@ -341,18 +340,32 @@ export class AccountManager {
       !exclude?.has(a.name) &&
       modelExhaustedReason(a.usage.rateLimitStatus, family, now) == null;
 
-    if (affinityKey) {
-      const prior = this.sessionAffinity.get(affinityKey);
-      if (prior && !exclude?.has(prior)) {
-        const acct = this.getAccount(prior);
-        if (usable(acct)) return acct;
-        this.sessionAffinity.delete(affinityKey);
-      }
-    }
-
     const available = this.listAccounts().filter(usable);
     if (available.length === 0) return null;
 
+    let prior: Account | null = null;
+    if (affinityKey) {
+      const priorName = this.sessionAffinity.get(affinityKey);
+      if (priorName && !exclude?.has(priorName)) {
+        const acct = this.getAccount(priorName);
+        if (usable(acct)) prior = acct;
+        else this.sessionAffinity.delete(affinityKey);
+      }
+    }
+
+    if (this.config.routingStrategy === "headroom") {
+      if (prior) return prior;
+      const best = this.pickByHeadroom(available, family);
+      if (affinityKey) this.sessionAffinity.set(affinityKey, best.name);
+      return best;
+    }
+
+    const best = this.pickByExpiringQuota(available, family, now, prior?.name);
+    if (affinityKey) this.sessionAffinity.set(affinityKey, best.name);
+    return best;
+  }
+
+  private pickByHeadroom(available: Account[], family: string | null): Account {
     let best = available[0]!;
     let bestHeadroom = headroomFraction(best.usage, family);
     for (const a of available) {
@@ -365,17 +378,42 @@ export class AccountManager {
         bestHeadroom = headroom;
       }
     }
-    // Round-robin among the accounts tied for the best headroom + load.
+
     const minLoad = best.usage.windowRequests;
     const tied = available.filter(
       (a) => headroomFraction(a.usage, family) === bestHeadroom && a.usage.windowRequests === minLoad,
     );
-    if (tied.length > 1) {
-      best = tied[this.rrCursor % tied.length]!;
-      this.rrCursor = (this.rrCursor + 1) % tied.length;
+    return this.pickRoundRobin(tied);
+  }
+
+  private pickByExpiringQuota(
+    available: Account[],
+    family: string | null,
+    now: number,
+    affinityName?: string,
+  ): Account {
+    const candidates = available.map((account) => ({
+      account,
+      minHeadroom: candidateMinHeadroom(account.usage, family),
+      earliestReset: candidateEarliestReset(account.usage, family, now),
+      viable: candidateMinHeadroom(account.usage, family) >= this.config.routingMinHeadroom,
+    }));
+    const viable = candidates.filter((c) => c.viable);
+    const pool = viable.length > 0 ? viable : candidates;
+
+    let best = pool[0]!;
+    for (const c of pool.slice(1)) {
+      if (compareExpiringCandidates(c, best, affinityName) < 0) best = c;
     }
 
-    if (affinityKey) this.sessionAffinity.set(affinityKey, best.name);
+    const tied = pool.filter((c) => compareExpiringCandidates(c, best, affinityName) === 0).map((c) => c.account);
+    return this.pickRoundRobin(tied);
+  }
+
+  private pickRoundRobin(tied: Account[]): Account {
+    if (tied.length <= 1) return tied[0]!;
+    const best = tied[this.rrCursor % tied.length]!;
+    this.rrCursor = (this.rrCursor + 1) % tied.length;
     return best;
   }
 
@@ -483,6 +521,13 @@ function bindingWindows(rl: RateLimitSnapshot | null, modelFamily: string | null
   return rl.windows.filter((w) => w.model == null || (modelFamily != null && w.model === modelFamily));
 }
 
+interface ExpiringCandidate {
+  account: Account;
+  minHeadroom: number;
+  earliestReset: number | null;
+  viable: boolean;
+}
+
 /**
  * Fraction of headroom [0, 1] left before Anthropic's own limits kick in,
  * derived from the tightest unified rolling window's utilization among the
@@ -493,12 +538,44 @@ function bindingWindows(rl: RateLimitSnapshot | null, modelFamily: string | null
  * HTTP access to these headers.
  */
 function headroomFraction(usage: AccountUsage, modelFamily: string | null): number {
+  return candidateMinHeadroom(usage, modelFamily);
+}
+
+function candidateMinHeadroom(usage: AccountUsage, modelFamily: string | null): number {
   const utilizations = bindingWindows(usage.rateLimitStatus, modelFamily)
     .map((w) => w.utilization)
     .filter((u): u is number => u != null);
   if (utilizations.length === 0) return 1;
   // The window closest to full (highest utilization) is the binding constraint.
   return Math.max(0, 1 - Math.max(...utilizations));
+}
+
+function candidateEarliestReset(usage: AccountUsage, modelFamily: string | null, now: number): number | null {
+  const resets = bindingWindows(usage.rateLimitStatus, modelFamily)
+    .filter((w) => w.reset != null && w.reset > now && (w.utilization == null || w.utilization < 1))
+    .map((w) => w.reset!);
+  return resets.length > 0 ? Math.min(...resets) : null;
+}
+
+function compareNullableReset(a: number | null, b: number | null): number {
+  if (a != null && b != null) return a - b;
+  if (a != null) return -1;
+  if (b != null) return 1;
+  return 0;
+}
+
+function compareExpiringCandidates(a: ExpiringCandidate, b: ExpiringCandidate, affinityName?: string): number {
+  const reset = compareNullableReset(a.earliestReset, b.earliestReset);
+  if (reset !== 0) return reset;
+  if (a.minHeadroom !== b.minHeadroom) return b.minHeadroom - a.minHeadroom;
+  if (a.account.usage.windowRequests !== b.account.usage.windowRequests) {
+    return a.account.usage.windowRequests - b.account.usage.windowRequests;
+  }
+  if (affinityName) {
+    if (a.account.name === affinityName && b.account.name !== affinityName) return -1;
+    if (b.account.name === affinityName && a.account.name !== affinityName) return 1;
+  }
+  return 0;
 }
 
 /** A unified-window status that means the account can't currently serve traffic. */

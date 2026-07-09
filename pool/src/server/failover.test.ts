@@ -75,6 +75,24 @@ test("fails over to the next account when the first is exhausted", async () => {
   }
 });
 
+test("failover exclusion wins over session affinity", async () => {
+  const { poolDir, mgr } = tempPool(["a-exhausted", "b-ok"]);
+  try {
+    mgr.setAffinity("session-1", "a-exhausted");
+    const factory: EventFactory = (a) => (a.name === "a-exhausted" ? exhausted() : ok("EXCLUDED_OK"));
+    const first = mgr.pick("session-1")!;
+    expect(first.name).toBe("a-exhausted");
+
+    const events = await collect(runWithFailover(mgr, "session-1", first, factory));
+
+    const text = events.filter((e) => e.kind === "text").map((e) => (e as any).text).join("");
+    expect(text).toBe("EXCLUDED_OK");
+    expect(mgr.getAccount("b-ok").usage.totalRequests).toBe(1);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
 test("surfaces the rate-limit error when every account is exhausted", async () => {
   const { poolDir, mgr } = tempPool(["a-exhausted", "b-exhausted"]);
   try {

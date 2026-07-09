@@ -120,6 +120,11 @@ export class CodexToAnthropicStream {
 
   constructor(private modelId: string) {}
 
+  /** True once the message_start envelope has been emitted (real or forced). */
+  get hasStarted(): boolean {
+    return this.started;
+  }
+
   handleEvent(event: { event: string; data: string }): string[] {
     let data: Record<string, unknown>;
     try {
@@ -131,17 +136,7 @@ export class CodexToAnthropicStream {
     switch (type) {
       case "response.created":
         if (this.started) return [];
-        this.started = true;
-        this.msgId = msgId(data);
-        this.model = this.modelId;
-        return [frame("message_start", {
-          type: "message_start",
-          message: {
-            id: this.msgId, type: "message", role: "assistant", model: this.modelId,
-            content: [], stop_reason: null, stop_sequence: null,
-            usage: { input_tokens: 0, output_tokens: 0 },
-          },
-        })];
+        return this.emitMessageStart(msgId(data));
       case "response.output_item.added": {
         const item = (data.item ?? {}) as Record<string, unknown>;
         if (item.type === "message") return [this.openBlock({ type: "text", text: "" })];
@@ -196,6 +191,35 @@ export class CodexToAnthropicStream {
       default:
         return [];
     }
+  }
+
+  /**
+   * Emit the `message_start` envelope without waiting for Codex's
+   * `response.created` event. Codex echoes the request `instructions` (the full
+   * system prompt + tool schemas) inside `response.created`, so that single SSE
+   * `data:` line can exceed the proxy's prefix-commit cap — leaving the parser
+   * unable to complete the first event and the client with no opening frame.
+   * The streaming proxy calls this when it commits at the cap so the client
+   * always gets a prompt envelope; the `started` guard makes the eventual real
+   * `response.created` a no-op. Returns [] if the stream already started.
+   */
+  forceMessageStart(): string[] {
+    if (this.started) return [];
+    return this.emitMessageStart(`msg_${Date.now().toString(36)}`);
+  }
+
+  private emitMessageStart(id: string): string[] {
+    this.started = true;
+    this.msgId = id;
+    this.model = this.modelId;
+    return [frame("message_start", {
+      type: "message_start",
+      message: {
+        id: this.msgId, type: "message", role: "assistant", model: this.modelId,
+        content: [], stop_reason: null, stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+    })];
   }
 
   finish(): string[] {

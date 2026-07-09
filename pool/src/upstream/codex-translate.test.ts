@@ -133,6 +133,33 @@ describe("CodexToAnthropicStream", () => {
     });
   });
 
+  test("forceMessageStart emits an envelope, and the later response.created is a no-op", () => {
+    const s = new CodexToAnthropicStream("gpt");
+    const forced = s.forceMessageStart();
+    expect(forced.map(parse).map((d) => d.type)).toEqual(["message_start"]);
+    expect(parse(forced[0]!).message).toMatchObject({ type: "message", role: "assistant", model: "gpt" });
+
+    // The real response.created must not emit a second message_start once forced.
+    expect(s.handleEvent(ev("response.created", { response: { id: "r1" } }))).toEqual([]);
+
+    // Content still flows normally after a forced start.
+    const rest = [
+      ...s.handleEvent(ev("response.output_item.added", { item: { type: "message" } })),
+      ...s.handleEvent(ev("response.output_text.delta", { delta: "Hi" })),
+      ...s.handleEvent(ev("response.output_item.done", { item: { type: "message" } })),
+      ...s.finish(),
+    ];
+    expect(rest.map(parse).map((d) => d.type)).toEqual([
+      "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop",
+    ]);
+  });
+
+  test("forceMessageStart is a no-op once the stream has already started", () => {
+    const s = new CodexToAnthropicStream("gpt");
+    s.handleEvent(ev("response.created", { response: { id: "r1" } }));
+    expect(s.forceMessageStart()).toEqual([]);
+  });
+
   test("mid-stream error is terminal: no message_delta/message_stop follow it", () => {
     const s = new CodexToAnthropicStream("gpt");
     const frames = [

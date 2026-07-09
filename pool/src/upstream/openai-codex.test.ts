@@ -165,6 +165,208 @@ describe("proxyCodexMessages", () => {
     }
   });
 
+  test("streaming: a first event larger than the commit cap still yields message_start before it completes", async () => {
+    // Codex's `response.created` echoes the request `instructions` (the full
+    // Claude Code system prompt + tool schemas), so its single SSE `data:` line
+    // is >64 KiB. The prefix-drain loop caps at 64 KiB and can't complete that
+    // first line, so `handleEvent` never fires and `message_start` is never
+    // emitted — the client sees a 200 with no opening frame and hangs. The pool
+    // must synthesize a `message_start` when it commits at the cap so the client
+    // always gets a prompt stream start, even if the oversized first event has
+    // not finished arriving yet.
+    const huge = "x".repeat(80 * 1024);
+    const firstEventPrefix =
+      `event: response.created\ndata: {"type":"response.created","response":{"id":"r1","instructions":"${huge}`;
+
+    // Upstream body: emit the (incomplete) oversized first event, then stall —
+    // mirroring a client that never sees the event terminate promptly.
+    const upstream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(firstEventPrefix));
+        // Intentionally do not close or complete the event.
+      },
+    });
+
+    const { poolDir, mgr } = tempOpenAIPool(["gpt1"]);
+    try {
+      const config = loadConfig({ poolDir, accountsDir: join(poolDir, "accounts"), usageFile: join(poolDir, "usage.json") });
+      const fakeFetch = (async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) =>
+        new Response(upstream, { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch;
+
+      const res = await proxyCodexMessages(
+        { model: "gpt", messages: [{ role: "user", content: "hi" }], stream: true },
+        mgr,
+        config,
+        new AbortController().signal,
+        { id: "gpt", provider: "openai", upstreamModel: "gpt-5.2-codex" },
+        {},
+        fakeFetch,
+      );
+      expect(res.status).toBe(200);
+      expect(res.body).not.toBeNull();
+
+      // The very first frame the client reads must be a message_start, WITHOUT
+      // waiting for the oversized first event to finish (it never does here).
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      const firstFrame = await Promise.race([
+        reader.read().then(({ value }) => decoder.decode(value)),
+        new Promise<string>((_, reject) =>
+          setTimeout(() => reject(new Error("client received no message_start before the first event completed")), 3_000),
+        ),
+      ]);
+      await reader.cancel().catch(() => {});
+      expect(firstFrame).toContain("message_start");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("streaming: an SSE line that never terminates and exceeds the parser's hard cap fails the attempt cleanly", async () => {
+    // A first event so large it blows past the SseParser's own hard buffer cap
+    // (not just the 64 KiB commit-cap that triggers forceMessageStart) must
+    // fail the attempt with a clean error instead of buffering forever or
+    // throwing an uncaught exception out of the request handler.
+    const huge = "x".repeat(9 * 1024 * 1024);
+    const firstEventPrefix =
+      `event: response.created\ndata: {"type":"response.created","response":{"id":"r1","instructions":"${huge}`;
+
+    const upstream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(firstEventPrefix));
+      },
+    });
+
+    const { poolDir, mgr } = tempOpenAIPool(["gpt1"]);
+    try {
+      const config = loadConfig({ poolDir, accountsDir: join(poolDir, "accounts"), usageFile: join(poolDir, "usage.json") });
+      const fakeFetch = (async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) =>
+        new Response(upstream, { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch;
+
+      const res = await proxyCodexMessages(
+        { model: "gpt", messages: [{ role: "user", content: "hi" }], stream: true },
+        mgr,
+        config,
+        new AbortController().signal,
+        { id: "gpt", provider: "openai", upstreamModel: "gpt-5.2-codex" },
+        {},
+        fakeFetch,
+      );
+
+      expect(res.status).toBe(502);
+      const text = await res.text();
+      expect(text).toContain("exceeded");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("streaming: a no-content reasoning phase emits ping keep-alives so the client stream stays alive", async () => {
+    // gpt-5.5 is a reasoning model: after message_start it can stream a long
+    // run of reasoning-summary events that translate to zero Anthropic frames.
+    // Anthropic keeps such gaps alive with `ping` events (see anthropic.ts's
+    // passthrough); without them Claude Code sees silence and aborts on its
+    // inactivity timeout. The proxy must emit a ping whenever a read yields no
+    // translated content, so the client always sees the stream is alive.
+    const reasoningEvents: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      reasoningEvents.push(`data: {"type":"response.reasoning_summary_text.delta","delta":"thinking ${i}"}`, "");
+    }
+    const reasoningSse = [
+      'data: {"type":"response.created","response":{"id":"r1"}}',
+      "",
+      ...reasoningEvents,
+      'data: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":1}}}',
+      "",
+      "",
+    ].join("\n");
+
+    const { poolDir, mgr } = tempOpenAIPool(["gpt1"]);
+    try {
+      const config = loadConfig({ poolDir, accountsDir: join(poolDir, "accounts"), usageFile: join(poolDir, "usage.json") });
+      const fakeFetch = (async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) =>
+        new Response(reasoningSse, { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch;
+
+      const res = await proxyCodexMessages(
+        { model: "gpt", messages: [{ role: "user", content: "hi" }], stream: true },
+        mgr,
+        config,
+        new AbortController().signal,
+        { id: "gpt", provider: "openai", upstreamModel: "gpt-5.2-codex" },
+        {},
+        fakeFetch,
+      );
+      expect(res.status).toBe(200);
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      let full = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        full += decoder.decode(value);
+      }
+      // The stream must open, stay alive through the reasoning gap, and close.
+      expect(full).toContain("message_start");
+      expect(full).toContain("event: ping");
+      expect(full).toContain("message_stop");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("streaming: a silent upstream gap emits timer-based ping keep-alives", async () => {
+    // A reasoning model can go fully silent (no bytes at all) while it thinks,
+    // after response.created but before any content. Event-driven pings can't
+    // fire during true silence, so the proxy must emit ping keep-alives on a
+    // timer (config.streamKeepAliveMs) or the client's inactivity timeout fires.
+    const enc = new TextEncoder();
+    const upstream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        controller.enqueue(enc.encode('event: response.created\ndata: {"type":"response.created","response":{"id":"r1"}}\n\n'));
+        // Silent gap — no bytes for ~300ms while the model "thinks".
+        await new Promise((r) => setTimeout(r, 300));
+        controller.enqueue(enc.encode('data: {"type":"response.output_item.added","item":{"type":"message"}}\n\n'));
+        controller.enqueue(enc.encode('data: {"type":"response.output_text.delta","delta":"hi"}\n\n'));
+        controller.enqueue(enc.encode('data: {"type":"response.output_item.done","item":{"type":"message"}}\n\n'));
+        controller.enqueue(enc.encode('data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1}}}\n\n'));
+        controller.close();
+      },
+    });
+
+    const { poolDir, mgr } = tempOpenAIPool(["gpt1"]);
+    try {
+      // 50ms keep-alive → the ~300ms silent gap should produce several pings.
+      const config = loadConfig({ poolDir, accountsDir: join(poolDir, "accounts"), usageFile: join(poolDir, "usage.json"), streamKeepAliveMs: 50 });
+      const fakeFetch = (async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) =>
+        new Response(upstream, { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch;
+
+      const res = await proxyCodexMessages(
+        { model: "gpt", messages: [{ role: "user", content: "hi" }], stream: true },
+        mgr,
+        config,
+        new AbortController().signal,
+        { id: "gpt", provider: "openai", upstreamModel: "gpt-5.2-codex" },
+        {},
+        fakeFetch,
+      );
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      let full = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        full += decoder.decode(value);
+      }
+      const pingCount = (full.match(/event: ping/g) ?? []).length;
+      // The 300ms silent gap at a 50ms interval must yield multiple keep-alives.
+      expect(pingCount).toBeGreaterThanOrEqual(2);
+      expect(full).toContain("hi");
+      expect(full).toContain("message_stop");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
   test("streaming: large non-content preamble before the first content frame doesn't buffer unbounded", async () => {
     // A misbehaving/slow upstream can trickle droppable events (e.g. dropped
     // reasoning items) for a long time before ever emitting content. The

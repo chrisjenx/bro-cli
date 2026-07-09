@@ -9,13 +9,25 @@ export interface SseEvent {
   data: string;
 }
 
+/**
+ * Hard ceiling on a single buffered (not-yet-newline-terminated) SSE line.
+ * Codex's `response.created` alone can legitimately run past the caller's
+ * 64 KiB "give up and commit" threshold (it echoes the full instructions +
+ * tool schemas), so this must stay well above that — it exists only to bound
+ * memory against a misbehaving/malicious upstream that never sends a newline.
+ */
+const DEFAULT_MAX_BUFFER_CHARS = 8 * 1024 * 1024;
+
 export class SseParser {
   private decoder = new TextDecoder();
   private buffer = "";
   private eventName = "";
   private data: string[] = [];
 
-  constructor(private onEvent: (event: SseEvent) => void) {}
+  constructor(
+    private onEvent: (event: SseEvent) => void,
+    private maxBufferChars = DEFAULT_MAX_BUFFER_CHARS,
+  ) {}
 
   push(chunk: Uint8Array): void {
     this.pushText(this.decoder.decode(chunk, { stream: true }));
@@ -30,10 +42,13 @@ export class SseParser {
     this.buffer += text;
     while (true) {
       const i = this.buffer.indexOf("\n");
-      if (i < 0) return;
+      if (i < 0) break;
       const raw = this.buffer.slice(0, i);
       this.buffer = this.buffer.slice(i + 1);
       this.line(raw.endsWith("\r") ? raw.slice(0, -1) : raw);
+    }
+    if (this.buffer.length > this.maxBufferChars) {
+      throw new Error(`SSE line exceeded ${this.maxBufferChars} bytes without a terminator`);
     }
   }
 
