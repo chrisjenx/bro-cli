@@ -189,6 +189,8 @@ export interface Account {
   subscriptionType: string | null;
   rateLimitTier: string | null;
   scopes: string[];
+  /** Routing priority; lower = preferred. Default 100 (see DEFAULT_PRIORITY). */
+  priority: number;
   tokenExpiresAt: number | null;
   tokenExpired: boolean;
   usage: AccountUsage;

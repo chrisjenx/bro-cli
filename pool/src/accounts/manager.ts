@@ -30,6 +30,9 @@ import {
 } from "./keychain.ts";
 import type { CliUsage } from "../subprocess/types.ts";
 
+/** Priority assigned to any account without a routing.json. Lower = preferred. */
+export const DEFAULT_PRIORITY = 100;
+
 interface PersistedState {
   usage: Record<string, AccountUsage>;
 }
@@ -142,6 +145,37 @@ export class AccountManager {
 
   private credsPath(name: string): string {
     return join(this.configDirFor(name), ".credentials.json");
+  }
+
+  private routingPath(name: string): string {
+    return join(this.configDirFor(name), "routing.json");
+  }
+
+  /**
+   * Routing priority for an account; lower = preferred. Read fresh from
+   * accounts/<name>/routing.json on every call (no cache) so a CLI edit in a
+   * separate process is seen by the running server on its next request.
+   * Returns DEFAULT_PRIORITY when the file is missing, unreadable, or holds a
+   * non-integer/negative value — routing must never throw on this.
+   */
+  priorityFor(name: string): number {
+    try {
+      const parsed = JSON.parse(readFileSync(this.routingPath(name), "utf8")) as { priority?: unknown };
+      const p = parsed.priority;
+      return typeof p === "number" && Number.isInteger(p) && p >= 0 ? p : DEFAULT_PRIORITY;
+    } catch {
+      return DEFAULT_PRIORITY;
+    }
+  }
+
+  setPriority(name: string, priority: number): void {
+    if (!Number.isInteger(priority) || priority < 0) {
+      throw new Error(`Priority must be a non-negative integer, got ${priority}`);
+    }
+    if (!existsSync(this.configDirFor(name))) {
+      throw new Error(`Account "${name}" does not exist`);
+    }
+    writeFileSync(this.routingPath(name), JSON.stringify({ priority }, null, 2));
   }
 
   create(name: string): void {
@@ -294,6 +328,7 @@ export class AccountManager {
       subscriptionType: provider === "openai" ? (openai?.planType ?? "chatgpt") : (oauth?.subscriptionType ?? null),
       rateLimitTier: oauth?.rateLimitTier ?? null,
       scopes: oauth?.scopes ?? [],
+      priority: this.priorityFor(name),
       tokenExpiresAt,
       tokenExpired,
       usage,

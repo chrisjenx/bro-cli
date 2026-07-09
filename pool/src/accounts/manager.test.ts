@@ -532,3 +532,36 @@ test("a stale in-memory manager's saveState() doesn't resurrect a removed accoun
     rmSync(poolDir, { recursive: true, force: true });
   }
 });
+
+test("priorityFor defaults to 100 and setPriority round-trips", () => {
+  const { poolDir, mgr } = tempPool(["a"]);
+  try {
+    expect(mgr.priorityFor("a")).toBe(100);
+    expect(mgr.getAccount("a").priority).toBe(100);
+    mgr.setPriority("a", 1);
+    expect(mgr.priorityFor("a")).toBe(1);
+    expect(mgr.getAccount("a").priority).toBe(1);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("priorityFor returns 100 for a malformed routing.json", () => {
+  const { poolDir, mgr } = tempPool(["a"]);
+  try {
+    writeFileSync(join(mgr.configDirFor("a"), "routing.json"), "{ not json");
+    expect(mgr.priorityFor("a")).toBe(100);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("setPriority rejects negative or non-integer priorities", () => {
+  const { poolDir, mgr } = tempPool(["a"]);
+  try {
+    expect(() => mgr.setPriority("a", -1)).toThrow();
+    expect(() => mgr.setPriority("a", 1.5)).toThrow();
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
