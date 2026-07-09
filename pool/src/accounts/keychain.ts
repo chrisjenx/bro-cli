@@ -62,3 +62,20 @@ export function readKeychainCredsForConfigDir(configDir: string): CredentialsFil
     readKeychainCreds(DEFAULT_KEYCHAIN_SERVICE)
   );
 }
+
+/**
+ * Delete a Claude Code credentials item from the macOS login Keychain, if
+ * present. Best-effort: a missing item or denied access is not an error —
+ * callers use this to make `accounts remove` actually sever an account
+ * instead of leaving a Keychain item that `readKeychainCreds` would keep
+ * resurrecting.
+ */
+export function deleteKeychainCreds(service: string): void {
+  try {
+    execFileSync("security", ["delete-generic-password", "-s", service], {
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+  } catch {
+    // Item not found, or access denied — nothing to clean up.
+  }
+}

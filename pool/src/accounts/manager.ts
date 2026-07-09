@@ -23,6 +23,7 @@ import type {
 } from "./types.ts";
 import { emptyUsage, OPENAI_CREDS_FILENAME, normalizeRateLimitSnapshot, sortRateLimitWindows } from "./types.ts";
 import {
+  deleteKeychainCreds,
   keychainServiceForConfigDir,
   readKeychainCreds,
   readKeychainCredsForConfigDir,
@@ -33,6 +34,14 @@ interface PersistedState {
   usage: Record<string, AccountUsage>;
 }
 
+/** Darwin Keychain access, injectable so tests can simulate leftover items. */
+export interface KeychainOps {
+  read: typeof readKeychainCreds;
+  delete: typeof deleteKeychainCreds;
+}
+
+const defaultKeychainOps: KeychainOps = { read: readKeychainCreds, delete: deleteKeychainCreds };
+
 export class AccountManager {
   private config: Config;
   private usage: Record<string, AccountUsage> = {};
@@ -40,9 +49,11 @@ export class AccountManager {
   private sessionAffinity = new Map<string, string>();
   /** Round-robin cursor for tie-breaking least-loaded selection. */
   private rrCursor = 0;
+  private keychain: KeychainOps;
 
-  constructor(config: Config) {
+  constructor(config: Config, keychain: KeychainOps = defaultKeychainOps) {
     this.config = config;
+    this.keychain = keychain;
     mkdirSync(this.config.accountsDir, { recursive: true });
     this.loadState();
   }
@@ -53,7 +64,7 @@ export class AccountManager {
     if (!existsSync(this.config.usageFile)) return;
     try {
       const parsed = JSON.parse(readFileSync(this.config.usageFile, "utf8")) as PersistedState;
-      this.usage = parsed.usage ?? {};
+      this.usage = this.pruneToLiveAccounts(parsed.usage ?? {});
       // Snapshots persisted by older pool versions used fixed 5h/7d fields.
       for (const u of Object.values(this.usage)) {
         u.rateLimitStatus = normalizeRateLimitSnapshot(u.rateLimitStatus);
@@ -64,12 +75,33 @@ export class AccountManager {
   }
 
   private saveState(): void {
+    this.usage = this.pruneToLiveAccounts(this.usage);
     const state: PersistedState = { usage: this.usage };
     try {
       writeFileSync(this.config.usageFile, JSON.stringify(state, null, 2));
     } catch {
       // Non-fatal: usage stats are best-effort.
     }
+  }
+
+  /**
+   * Drop usage entries for accounts no longer in the pool. A long-running
+   * server process holds this map in memory for its whole lifetime and never
+   * learns about an `accounts remove` that ran in a separate CLI process —
+   * without this, the next saveState() call (triggered by recording usage
+   * for any *other* account) would blindly rewrite usage.json with the
+   * server's stale in-memory snapshot, resurrecting the removed account's
+   * entry. Scoping usage validity to `listNames()` (the on-disk source of
+   * truth) makes every write self-healing regardless of which process's
+   * stale copy triggered it.
+   */
+  private pruneToLiveAccounts(usage: Record<string, AccountUsage>): Record<string, AccountUsage> {
+    const live = new Set(this.listNames());
+    const pruned: Record<string, AccountUsage> = {};
+    for (const [name, u] of Object.entries(usage)) {
+      if (live.has(name)) pruned[name] = u;
+    }
+    return pruned;
   }
 
   private usageFor(name: string): AccountUsage {
@@ -123,7 +155,14 @@ export class AccountManager {
     const dir = this.configDirFor(name);
     if (!existsSync(dir)) throw new Error(`Account "${name}" does not exist`);
     rmSync(dir, { recursive: true, force: true });
-    delete this.usage[name];
+    // macOS keeps this account's login in the Keychain, independent of the
+    // directory — without this, readCreds()'s Keychain fallback would keep
+    // reporting a removed account as authenticated forever.
+    if (process.platform === "darwin") {
+      this.keychain.delete(keychainServiceForConfigDir(dir));
+    }
+    // saveState()'s pruneToLiveAccounts() drops this account's usage entry
+    // now that its directory is gone — no need to delete it here too.
     this.saveState();
   }
 
@@ -164,6 +203,11 @@ export class AccountManager {
   // ---- status ------------------------------------------------------------
 
   private readCreds(name: string): CredentialsFile | null {
+    // An account that's been removed has no directory. Without this check the
+    // Keychain fallback below would keep resolving credentials for it forever
+    // (macOS never deletes that item on its own), letting a removed account
+    // silently keep serving traffic via stale session affinity in pick().
+    if (!existsSync(this.configDirFor(name))) return null;
     const p = this.credsPath(name);
     if (existsSync(p)) {
       try {
@@ -178,7 +222,7 @@ export class AccountManager {
     // config dir. Rotated tokens are still cached to the file by
     // updateOAuthCreds(), which then takes precedence on the next read.
     if (process.platform === "darwin") {
-      return readKeychainCreds(keychainServiceForConfigDir(this.configDirFor(name)));
+      return this.keychain.read(keychainServiceForConfigDir(this.configDirFor(name)));
     }
     return null;
   }

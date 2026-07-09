@@ -1,13 +1,16 @@
 import { test, expect, describe } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { loadConfig } from "../config.ts";
-import { AccountManager } from "./manager.ts";
+import { AccountManager, type KeychainOps } from "./manager.ts";
 import type { RateLimitSnapshot, RateLimitWindow } from "./types.ts";
 import { OPENAI_CREDS_FILENAME } from "./types.ts";
 
-function tempPool(accountNames: string[]): { poolDir: string; mgr: AccountManager } {
+function tempPool(
+  accountNames: string[],
+  keychain?: KeychainOps,
+): { poolDir: string; mgr: AccountManager } {
   const poolDir = mkdtempSync(join(tmpdir(), "cmp-manager-"));
   const accountsDir = join(poolDir, "accounts");
   for (const name of accountNames) {
@@ -27,7 +30,7 @@ function tempPool(accountNames: string[]): { poolDir: string; mgr: AccountManage
     );
   }
   const config = loadConfig({ poolDir, accountsDir, usageFile: join(poolDir, "usage.json") });
-  return { poolDir, mgr: new AccountManager(config) };
+  return { poolDir, mgr: keychain ? new AccountManager(config, keychain) : new AccountManager(config) };
 }
 
 function win(key: string, overrides: Partial<RateLimitWindow> = {}): RateLimitWindow {
@@ -334,6 +337,93 @@ test("recordRateLimitSnapshot merges by window key instead of replacing wholesal
     // Fable routing still sees the account as exhausted for Fable specifically.
     expect(mgr.pick(undefined, undefined, "anthropic", "fable")).toBeNull();
     expect(mgr.pick(undefined, undefined, "anthropic", "sonnet")?.name).toBe("a");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+// A macOS Keychain never forgets a login on its own — `remove()` only deletes
+// the account's directory. This fake simulates a leftover Keychain item that
+// would still resolve for a removed account's hashed service name, the way
+// the real `security` CLI would, to prove readCreds() no longer trusts it.
+function stubKeychainStillRemembersEverything(): KeychainOps {
+  return {
+    read: () => ({
+      claudeAiOauth: {
+        accessToken: "leftover-keychain-token",
+        refreshToken: "r",
+        expiresAt: Date.now() + 3_600_000,
+      },
+    }),
+    delete: () => {},
+  };
+}
+
+test("remove() severs the account even if its macOS Keychain item is never deleted", () => {
+  const keychain = stubKeychainStillRemembersEverything();
+  const { poolDir, mgr } = tempPool(["gone"], keychain);
+  try {
+    expect(mgr.getAccount("gone").authenticated).toBe(true);
+    mgr.remove("gone");
+
+    // The account's directory is gone, but the stubbed Keychain would still
+    // hand back a valid-looking credential for it if readCreds() asked.
+    const acct = mgr.getAccount("gone");
+    expect(acct.authenticated).toBe(false);
+    expect(acct.available).toBe(false);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("pick() drops stale session affinity to a removed account instead of resurrecting it via Keychain", () => {
+  const keychain = stubKeychainStillRemembersEverything();
+  const { poolDir, mgr } = tempPool(["work", "personal"], keychain);
+  try {
+    const sessionKey = "session-1";
+    // Sticky-pin the session to whichever account pick() lands on first.
+    const first = mgr.pick(sessionKey);
+    expect(first).not.toBeNull();
+    const removedName = first!.name;
+    const otherName = removedName === "work" ? "personal" : "work";
+
+    mgr.remove(removedName);
+
+    // Same session key, after its pinned account was removed out from under
+    // it: must fail over to the remaining account, not keep routing to the
+    // removed one via the stale affinity entry + leftover Keychain item.
+    const second = mgr.pick(sessionKey);
+    expect(second?.name).toBe(otherName);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("a stale in-memory manager's saveState() doesn't resurrect a removed account's usage.json entry", () => {
+  // Simulates the real architecture: a long-running pool server holds one
+  // AccountManager in memory for its whole lifetime, while `accounts remove`
+  // runs as a separate, short-lived CLI process with its own AccountManager
+  // pointed at the same pool directory.
+  const { poolDir, mgr: serverMgr } = tempPool(["work", "gone"]);
+  try {
+    serverMgr.recordSuccess("gone", { input_tokens: 1, output_tokens: 1 }, 0);
+
+    const config = loadConfig({
+      poolDir,
+      accountsDir: join(poolDir, "accounts"),
+      usageFile: join(poolDir, "usage.json"),
+    });
+    const cliMgr = new AccountManager(config);
+    cliMgr.remove("gone");
+
+    // serverMgr's in-memory usage map still thinks "gone" exists — recording
+    // usage for an unrelated account must not rewrite "gone" back into
+    // usage.json.
+    serverMgr.recordSuccess("work", { input_tokens: 1, output_tokens: 1 }, 0);
+
+    const onDisk = JSON.parse(readFileSync(join(poolDir, "usage.json"), "utf8"));
+    expect(onDisk.usage.gone).toBeUndefined();
+    expect(onDisk.usage.work).toBeDefined();
   } finally {
     rmSync(poolDir, { recursive: true, force: true });
   }
