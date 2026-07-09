@@ -102,3 +102,39 @@ test("card() shows both real bars and no estimates once 5h and 7d are both known
   expect(html).toContain("7d window");
   expect(html).not.toContain("(est.)");
 });
+
+function loadFns(): { card: (a: unknown, isNext?: boolean) => string; tierLabel: (p: number) => string } {
+  const html = dashboardHtml();
+  const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+  if (!script) throw new Error("dashboard <script> block not found");
+  const stubbed = script
+    .replace(/^refresh\(\);$/m, "")
+    .replace(/^setInterval\(refresh, 4000\);$/m, "");
+  const factory = new Function(
+    "document",
+    "localStorage",
+    "matchMedia",
+    `${stubbed}\nreturn { card, tierLabel };`,
+  );
+  const noopEl = { addEventListener() {}, setAttribute() {}, getAttribute() { return null; }, textContent: "", style: {} };
+  const doc = {
+    getElementById: () => noopEl,
+    querySelectorAll: () => [],
+    documentElement: noopEl,
+  };
+  return factory(doc, { getItem: () => null, setItem() {} }, () => ({ matches: false })) as any;
+}
+
+test("tierLabel names the first two bands and numbers the rest", () => {
+  const { tierLabel } = loadFns();
+  expect(tierLabel(1)).toBe("Priority 1 — Primary");
+  expect(tierLabel(2)).toBe("Priority 2 — Fallback");
+  expect(tierLabel(3)).toBe("Priority 3");
+});
+
+test("card() marks the next-pick account and shows its priority", () => {
+  const { card } = loadFns();
+  const html = card({ ...baseAccount(), priority: 1 }, true);
+  expect(html).toContain("next");
+  expect(html.toLowerCase()).toContain("priority");
+});

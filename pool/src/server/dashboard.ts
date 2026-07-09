@@ -154,6 +154,25 @@ export function dashboardHtml(): string {
   footer { color: var(--muted); font-size: 12.5px; text-align: center; padding: 30px 20px 36px; }
   footer code { font-family: var(--mono); background: var(--surface); border: 1px solid var(--border);
     padding: 2px 7px; border-radius: 5px; color: var(--muted); margin: 0 2px; }
+
+  .tier { margin-bottom: 26px; }
+  .tier-head { display: flex; align-items: baseline; gap: 10px; font-family: var(--serif);
+    font-weight: 500; font-size: 16px; margin: 0 0 12px; letter-spacing: -0.01em; }
+  .tier-head.dim { opacity: .5; }
+  .tier-meta { font-size: 12px; color: var(--muted); font-family: var(--sans); }
+  .tier-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 18px; }
+  .badge.next { background: var(--accent-soft); color: var(--accent); border-color: transparent; font-weight: 600; }
+  .routing-panel { display: none; background: var(--surface); border: 1px solid var(--border);
+    border-left: 3px solid var(--accent); border-radius: 12px; padding: 12px 16px; margin-bottom: 20px;
+    font-size: 13.5px; color: var(--text); box-shadow: var(--shadow); }
+  .routing-panel .muted { color: var(--muted); }
+  .tier-edit { margin-top: 14px; padding-top: 13px; border-top: 1px solid var(--border);
+    display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); }
+  .tier-edit input { width: 60px; font: inherit; padding: 4px 6px; border: 1px solid var(--border);
+    border-radius: 6px; background: var(--surface-2); color: var(--text); }
+  .tier-edit button { background: var(--surface); color: var(--muted); border: 1px solid var(--border);
+    border-radius: 7px; padding: 4px 10px; font-size: 11.5px; cursor: pointer; }
+  .tier-edit button:hover { color: var(--text); border-color: var(--border-strong); }
 </style>
 </head>
 <body>
@@ -175,6 +194,7 @@ export function dashboardHtml(): string {
   </div>
 </header>
 <main>
+  <div class="routing-panel" id="routing-panel"></div>
   <div class="banner" id="banner"></div>
   <div class="grid" id="grid"></div>
 
@@ -260,6 +280,12 @@ function ago(ts) {
 }
 function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
 
+function tierLabel(priority) {
+  if (priority === 1) return "Priority 1 — Primary";
+  if (priority === 2) return "Priority 2 — Fallback";
+  return "Priority " + priority;
+}
+
 // "5h" -> "5h window"; "7d-fable" (model "fable") -> "Fable · 7d window".
 function windowLabel(w) {
   const dur = w.key.split(/[-_]/).filter((t) => /^\\d/.test(t)).join(" ") || w.key;
@@ -274,10 +300,11 @@ function windowBar(w) {
     + '</span></div><div class="bar"><span style="width:' + pct + '%"></span></div></div>';
 }
 
-function card(a) {
+function card(a, isNext) {
   const dot = a.available ? "ok" : (a.authenticated ? "warn" : "err");
   const state = a.available ? "Ready" : (a.authenticated ? "Sidelined" : "Logged out");
   const u = a.usage;
+  const pr = a.priority == null ? 100 : a.priority;
   const rl = u.rateLimitStatus;
   const tok = u.windowInputTokens + u.windowOutputTokens;
 
@@ -304,11 +331,13 @@ function card(a) {
     <div class="card-top">
       <span class="status"><span class="dot \${dot}"></span><span class="acct-name">\${esc(a.name)}</span></span>
       <span class="badge">\${esc(a.provider || "anthropic")}</span>
+      \${isNext ? '<span class="badge next">next</span>' : ""}
       <span class="chip plan">\${esc(a.subscriptionType || "unknown")}</span>
     </div>
     <div class="dl">
       <span class="k">Status</span><span class="v">\${state}</span>
       <span class="k">Rate tier</span><span class="v">\${esc(a.rateLimitTier || "–")}</span>
+      <span class="k">Priority</span><span class="v">\${pr}</span>
       <span class="k">Token</span><span class="v">\${a.tokenExpired ? "auto-refreshing" : "valid · " + timeUntil(a.tokenExpiresAt)}</span>
       <span class="k">Cost (window)</span><span class="v">\${fmtUsd(u.windowCostUsd)}</span>
       <span class="k">Total requests</span><span class="v">\${fmtInt(u.totalRequests)}</span>
@@ -318,6 +347,10 @@ function card(a) {
     </div>
     <div class="bars">\${barsHtml}</div>
     \${note}
+    <div class="tier-edit">Priority
+      <input type="number" min="0" value="\${pr}" data-acct="\${esc(a.name)}" />
+      <button data-set-priority="\${esc(a.name)}">Set</button>
+    </div>
   </div>\`;
 }
 
@@ -351,7 +384,35 @@ async function refresh() {
       banner.style.display = "none";
     } else {
       onboard.style.display = "none";
-      grid.innerHTML = accounts.map(card).join("");
+      const routing = d.routing || { tiers: [], nextPick: null, activeTier: null };
+      const nextAcct = routing.nextPick && routing.nextPick.account;
+      const byName = Object.fromEntries(accounts.map((a) => [a.name, a]));
+      const groups = routing.tiers && routing.tiers.length
+        ? routing.tiers
+        : [{ priority: null, accounts: accounts.map((a) => a.name), available: avail }];
+      grid.innerHTML = groups.map((t) => {
+        const cardsHtml = t.accounts
+          .map((n) => byName[n])
+          .filter(Boolean)
+          .map((a) => card(a, a.name === nextAcct))
+          .join("");
+        const head = t.priority == null
+          ? ""
+          : '<div class="tier-head' + (t.available === 0 ? " dim" : "") + '">' + esc(tierLabel(t.priority))
+            + ' <span class="tier-meta">' + t.available + " available"
+            + (t.priority === routing.activeTier ? " · active" : "") + "</span></div>";
+        return '<section class="tier">' + head + '<div class="tier-grid">' + cardsHtml + "</div></section>";
+      }).join("");
+
+      const panel = document.getElementById("routing-panel");
+      if (routing.nextPick) {
+        panel.innerHTML = "Next request → <b>" + esc(routing.nextPick.account)
+          + '</b> <span class="muted">(' + esc(routing.nextPick.reason) + ")</span>";
+        panel.style.display = "block";
+      } else {
+        panel.style.display = "none";
+      }
+
       if (avail === 0) {
         const anyAuthed = accounts.some((a) => a.authenticated);
         banner.innerHTML = anyAuthed
@@ -367,6 +428,23 @@ async function refresh() {
     document.getElementById("p-available").innerHTML = "available <b>" + avail + "</b>";
     document.getElementById("p-window").innerHTML = "window <b>" + Math.round((d.usageWindowMs || 0) / 3600000) + "h</b>";
     document.getElementById("p-updated").textContent = "updated " + new Date().toLocaleTimeString();
+
+    document.querySelectorAll("[data-set-priority]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const name = btn.getAttribute("data-set-priority");
+        const input = document.querySelector('input[data-acct="' + (window.CSS ? CSS.escape(name) : name) + '"]');
+        const priority = parseInt(input.value, 10);
+        if (!Number.isInteger(priority) || priority < 0) return;
+        try {
+          await fetch("/api/routing", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ account: name, priority }),
+          });
+          refresh();
+        } catch (e) { /* transient; next poll will reconcile */ }
+      });
+    });
   } catch (e) {
     document.getElementById("p-updated").textContent = "offline";
   }
