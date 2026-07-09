@@ -62,9 +62,20 @@ export function startServer(config: Config): void {
       if (req.method === "GET" && path === "/api/status") {
         return json({
           accounts: mgr.listAccounts(),
+          routing: mgr.routingSnapshot(),
           usageWindowMs: config.usageWindowMs,
           now: Date.now(),
         });
+      }
+      if (path === "/api/routing") {
+        if (req.method !== "POST") return json({ error: "method not allowed" }, 405);
+        let body: unknown;
+        try {
+          body = await req.json();
+        } catch {
+          return json({ error: { message: "Invalid JSON body" } }, 400);
+        }
+        return handleRoutingUpdate(mgr, body);
       }
       if (req.method === "GET" && (path === "/v1/models" || path === "/models")) {
         return json({
@@ -300,6 +311,25 @@ function failoverHooks(config: Config) {
 }
 
 // ---- helpers -------------------------------------------------------------
+
+/**
+ * Apply a dashboard priority edit. Validates the account exists and the
+ * priority is a non-negative integer, then persists it. Unauthenticated by
+ * design, matching the rest of the dashboard/status routes.
+ */
+export function handleRoutingUpdate(mgr: AccountManager, body: unknown): Response {
+  const b = (body ?? {}) as { account?: unknown; priority?: unknown };
+  const account = typeof b.account === "string" ? b.account : "";
+  const { priority } = b;
+  if (!account || !mgr.listNames().includes(account)) {
+    return json({ error: { message: `Unknown account: ${account || "(missing)"}` } }, 400);
+  }
+  if (typeof priority !== "number" || !Number.isInteger(priority) || priority < 0) {
+    return json({ error: { message: "priority must be a non-negative integer" } }, 400);
+  }
+  mgr.setPriority(account, priority);
+  return json({ ok: true, account, priority });
+}
 
 function checkAuth(req: Request, config: Config): Response | null {
   if (!config.proxyApiKey) return null;
