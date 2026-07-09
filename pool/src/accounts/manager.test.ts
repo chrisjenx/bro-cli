@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "fs"
 import { join } from "path";
 import { tmpdir } from "os";
 import { loadConfig, type Config } from "../config.ts";
-import { AccountManager, type KeychainOps } from "./manager.ts";
+import { AccountManager, formatNextPickReason, type KeychainOps } from "./manager.ts";
 import type { RateLimitSnapshot, RateLimitWindow } from "./types.ts";
 import { OPENAI_CREDS_FILENAME } from "./types.ts";
 
@@ -617,6 +617,56 @@ test("affinity to a fallback account is dropped once a primary recovers", () => 
     // Primary recovers; the pinned fallback must be abandoned for the primary.
     mgr.clearRateLimit("primary");
     expect(mgr.pick("s1")?.name).toBe("primary");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("formatNextPickReason describes tier, reset, and headroom", () => {
+  const now = 1_000_000;
+  expect(formatNextPickReason(1, now + 41 * 60_000, 0.62, now)).toBe(
+    "tier 1 · soonest reset in 41m · 62% headroom",
+  );
+  expect(formatNextPickReason(2, null, 1, now)).toBe("tier 2 · no reset data · 100% headroom");
+});
+
+test("routingSnapshot groups tiers and picks the active (lowest-number) tier", () => {
+  const { poolDir, mgr } = tempPool(["primary", "fallback"]);
+  try {
+    mgr.setPriority("primary", 1);
+    mgr.setPriority("fallback", 2);
+    const snap = mgr.routingSnapshot();
+    expect(snap.tiers.map((t) => t.priority)).toEqual([1, 2]);
+    expect(snap.activeTier).toBe(1);
+    expect(snap.nextPick?.account).toBe("primary");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("routingSnapshot descends to the next tier when the active tier is unavailable", () => {
+  const { poolDir, mgr } = tempPool(["primary", "fallback"]);
+  try {
+    mgr.setPriority("primary", 1);
+    mgr.setPriority("fallback", 2);
+    mgr.markRateLimited("primary", Date.now() + 60 * 60_000);
+    const snap = mgr.routingSnapshot();
+    expect(snap.activeTier).toBe(2);
+    expect(snap.nextPick?.account).toBe("fallback");
+    expect(snap.tiers.find((t) => t.priority === 1)?.available).toBe(0);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("routingSnapshot is read-only: it does not advance the round-robin cursor", () => {
+  const { poolDir, mgr } = tempPool(["a", "b"]);
+  try {
+    // Both accounts tie (no snapshot, 0 requests) -> pick() round-robins a,b,a,b...
+    const p1 = mgr.pick()?.name;
+    mgr.routingSnapshot(); // must NOT consume a round-robin step
+    const p2 = mgr.pick()?.name;
+    expect(p1).not.toBe(p2);
   } finally {
     rmSync(poolDir, { recursive: true, force: true });
   }

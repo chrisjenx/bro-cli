@@ -33,6 +33,28 @@ import type { CliUsage } from "../subprocess/types.ts";
 /** Priority assigned to any account without a routing.json. Lower = preferred. */
 export const DEFAULT_PRIORITY = 100;
 
+/** Read-only view of the current routing decision, for the dashboard/status. */
+export interface RoutingSnapshot {
+  activeTier: number | null;
+  nextPick: { account: string; reason: string } | null;
+  tiers: { priority: number; accounts: string[]; available: number }[];
+}
+
+/** Human-readable one-liner explaining why an account would be picked next. */
+export function formatNextPickReason(
+  tier: number,
+  earliestReset: number | null,
+  headroom: number,
+  now: number,
+): string {
+  const pct = Math.round(headroom * 100);
+  const resetPart =
+    earliestReset != null && earliestReset > now
+      ? `soonest reset in ${Math.ceil((earliestReset - now) / 60000)}m`
+      : "no reset data";
+  return `tier ${tier} · ${resetPart} · ${pct}% headroom`;
+}
+
 interface PersistedState {
   usage: Record<string, AccountUsage>;
 }
@@ -472,6 +494,78 @@ export class AccountManager {
     const best = tied[this.rrCursor % tied.length]!;
     this.rrCursor = (this.rrCursor + 1) % tied.length;
     return best;
+  }
+
+  /**
+   * Non-mutating "who would be picked next" for the dashboard. Mirrors pick()'s
+   * ranking but never advances the round-robin cursor or touches affinity, so
+   * polling /api/status has zero effect on real routing. Ties are broken
+   * deterministically (comparator order) rather than round-robin.
+   */
+  private previewBest(tierPool: Account[], family: string | null, now: number): Account {
+    if (this.config.routingStrategy === "headroom") {
+      let best = tierPool[0]!;
+      let bestH = headroomFraction(best.usage, family);
+      for (const a of tierPool.slice(1)) {
+        const h = headroomFraction(a.usage, family);
+        if (h > bestH || (h === bestH && a.usage.windowRequests < best.usage.windowRequests)) {
+          best = a;
+          bestH = h;
+        }
+      }
+      return best;
+    }
+    const candidates = tierPool.map((account) => ({
+      account,
+      minHeadroom: candidateMinHeadroom(account.usage, family),
+      earliestReset: candidateEarliestReset(account.usage, family, now),
+      viable: candidateMinHeadroom(account.usage, family) >= this.config.routingMinHeadroom,
+    }));
+    const viable = candidates.filter((c) => c.viable);
+    const pool = viable.length > 0 ? viable : candidates;
+    let best = pool[0]!;
+    for (const c of pool.slice(1)) if (compareExpiringCandidates(c, best) < 0) best = c;
+    return best.account;
+  }
+
+  /**
+   * Current routing decision for one provider: every tier (grouped by priority,
+   * with an available count), the active tier, and the account that would serve
+   * the next non-sticky request with a human-readable reason. The decision is
+   * model-agnostic (family = null): it describes general routing, not a specific
+   * model's windows.
+   */
+  routingSnapshot(provider: Provider = "anthropic", now: number = Date.now()): RoutingSnapshot {
+    const family: string | null = null;
+    const accounts = this.listAccounts().filter((a) => a.provider === provider);
+
+    const byPriority = new Map<number, Account[]>();
+    for (const a of accounts) {
+      const list = byPriority.get(a.priority) ?? [];
+      list.push(a);
+      byPriority.set(a.priority, list);
+    }
+    const tiers = [...byPriority.entries()]
+      .sort((x, y) => x[0] - y[0])
+      .map(([priority, accts]) => ({
+        priority,
+        accounts: accts.map((a) => a.name),
+        available: accts.filter((a) => this.usableFor(a, provider, family, now)).length,
+      }));
+
+    const available = accounts.filter((a) => this.usableFor(a, provider, family, now));
+    if (available.length === 0) return { activeTier: null, nextPick: null, tiers };
+
+    const minPriority = Math.min(...available.map((a) => a.priority));
+    const tierPool = available.filter((a) => a.priority === minPriority);
+    const best = this.previewBest(tierPool, family, now);
+    const reason = formatNextPickReason(
+      minPriority,
+      candidateEarliestReset(best.usage, family, now),
+      candidateMinHeadroom(best.usage, family),
+      now,
+    );
+    return { activeTier: minPriority, nextPick: { account: best.name, reason }, tiers };
   }
 
   /** Pin a session to the account that actually served it (post-failover). */
