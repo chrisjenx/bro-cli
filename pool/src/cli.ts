@@ -37,6 +37,13 @@ export function isValidProvider(provider: string): provider is "anthropic" | "op
   return provider === "anthropic" || provider === "openai";
 }
 
+/** Parse the priority argument for `accounts tier`. Returns null if invalid. */
+export function parsePriorityArg(raw: string | undefined): number | null {
+  if (raw == null) return null;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 0 ? n : null;
+}
+
 function unknownProviderErr(provider: string): number {
   console.error(`Unknown provider "${provider}". Use --provider openai (or omit for the default Claude/anthropic login).`);
   return 1;
@@ -74,7 +81,7 @@ Pool dir: ${config.accountsDir}`);
       console.log(`Pool dir: ${config.accountsDir}\n`);
       for (const a of accounts) {
         const state = a.available ? "READY" : a.authenticated ? "SIDELINED" : "LOGGED OUT";
-        console.log(`● ${a.name}  [${a.provider}] [${state}]`);
+        console.log(`● ${a.name}  [${a.provider}] [${state}]  priority ${a.priority}`);
         console.log(`    plan:      ${a.subscriptionType ?? "unknown"}   tier: ${a.rateLimitTier ?? "-"}`);
         console.log(
           `    token:     ${a.tokenExpired ? "expired (auto-refreshes on use)" : "valid until " + fmtWhen(a.tokenExpiresAt)}`,
@@ -185,9 +192,30 @@ Pool dir: ${config.accountsDir}`);
       return 0;
     }
 
+    case "tier": {
+      if (!name) return usageErr("accounts tier <name> [priority]");
+      if (!mgr.listNames().includes(name)) {
+        console.error(`Account "${name}" does not exist.`);
+        return 1;
+      }
+      const rawPriority = positional[2];
+      if (rawPriority === undefined) {
+        console.log(`${name}: priority ${mgr.priorityFor(name)}`);
+        return 0;
+      }
+      const priority = parsePriorityArg(rawPriority);
+      if (priority === null) {
+        console.error(`Priority must be a non-negative integer, got "${rawPriority}".`);
+        return 1;
+      }
+      mgr.setPriority(name, priority);
+      console.log(`Set "${name}" priority to ${priority}.`);
+      return 0;
+    }
+
     default:
       console.error(`Unknown accounts sub-command: ${sub}`);
-      return usageErr("accounts <list|login|import|add|remove> [name]");
+      return usageErr("accounts <list|login|import|add|remove|tier> [name]");
   }
 }
 
