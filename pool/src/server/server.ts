@@ -9,7 +9,7 @@
  */
 
 import type { Config } from "../config.ts";
-import { AccountManager } from "../accounts/manager.ts";
+import { AccountManager, isValidPriority } from "../accounts/manager.ts";
 import { loadModelTable, resolveModel, type ModelRoute } from "../models.ts";
 import { runClaude } from "../subprocess/claude.ts";
 import type { Account } from "../accounts/types.ts";
@@ -324,7 +324,7 @@ export function handleRoutingUpdate(mgr: AccountManager, body: unknown): Respons
   if (!account || !mgr.listNames().includes(account)) {
     return json({ error: { message: `Unknown account: ${account || "(missing)"}` } }, 400);
   }
-  if (typeof priority !== "number" || !Number.isInteger(priority) || priority < 0) {
+  if (!isValidPriority(priority)) {
     return json({ error: { message: "priority must be a non-negative integer" } }, 400);
   }
   mgr.setPriority(account, priority);

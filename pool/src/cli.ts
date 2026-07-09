@@ -14,7 +14,7 @@ import { homedir } from "os";
 import { join } from "path";
 import { readFileSync } from "fs";
 import type { Config } from "./config.ts";
-import { AccountManager } from "./accounts/manager.ts";
+import { AccountManager, isValidPriority } from "./accounts/manager.ts";
 import { loginOpenAI } from "./accounts/openai-login.ts";
 import { normalizeCodexAuthJson } from "./accounts/openai-oauth.ts";
 import { loadModelTable, saveModelTable, updateOpenAIModels } from "./models.ts";
@@ -37,11 +37,16 @@ export function isValidProvider(provider: string): provider is "anthropic" | "op
   return provider === "anthropic" || provider === "openai";
 }
 
-/** Parse the priority argument for `accounts tier`. Returns null if invalid. */
+/**
+ * Parse the priority argument for `accounts tier`. Returns null for anything
+ * that isn't a bare non-negative integer string. The `/^\d+$/` guard rejects
+ * empty/whitespace input (which `Number("")` would otherwise coerce to 0),
+ * negatives, and decimals before the shared value check.
+ */
 export function parsePriorityArg(raw: string | undefined): number | null {
-  if (raw == null) return null;
+  if (raw == null || !/^\d+$/.test(raw.trim())) return null;
   const n = Number(raw);
-  return Number.isInteger(n) && n >= 0 ? n : null;
+  return isValidPriority(n) ? n : null;
 }
 
 function unknownProviderErr(provider: string): number {

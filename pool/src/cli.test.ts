@@ -28,6 +28,9 @@ test("parsePriorityArg accepts non-negative integers, rejects the rest", () => {
   expect(parsePriorityArg("1.5")).toBeNull();
   expect(parsePriorityArg("abc")).toBeNull();
   expect(parsePriorityArg(undefined)).toBeNull();
+  // Empty/whitespace must not coerce to 0 (Number("") === 0).
+  expect(parsePriorityArg("")).toBeNull();
+  expect(parsePriorityArg("  ")).toBeNull();
 });
 
 test("accounts tier <name> <priority> writes routing.json", async () => {

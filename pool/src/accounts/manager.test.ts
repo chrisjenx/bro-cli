@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, utimesSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { loadConfig, type Config } from "../config.ts";
@@ -541,6 +541,23 @@ test("priorityFor defaults to 100 and setPriority round-trips", () => {
     mgr.setPriority("a", 1);
     expect(mgr.priorityFor("a")).toBe(1);
     expect(mgr.getAccount("a").priority).toBe(1);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("priorityFor picks up an out-of-band routing.json change via mtime (cache invalidation)", () => {
+  const { poolDir, mgr } = tempPool(["a"]);
+  try {
+    mgr.setPriority("a", 1);
+    expect(mgr.priorityFor("a")).toBe(1); // populates the mtime cache
+    // Simulate a different process rewriting routing.json, then force a newer
+    // mtime so the change is unambiguously visible regardless of fs resolution.
+    const p = join(mgr.configDirFor("a"), "routing.json");
+    writeFileSync(p, JSON.stringify({ priority: 5 }));
+    const future = new Date(Date.now() + 10_000);
+    utimesSync(p, future, future);
+    expect(mgr.priorityFor("a")).toBe(5);
   } finally {
     rmSync(poolDir, { recursive: true, force: true });
   }

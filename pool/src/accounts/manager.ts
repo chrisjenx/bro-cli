@@ -33,6 +33,15 @@ import type { CliUsage } from "../subprocess/types.ts";
 /** Priority assigned to any account without a routing.json. Lower = preferred. */
 export const DEFAULT_PRIORITY = 100;
 
+/**
+ * The single source of truth for a valid priority value: a non-negative integer.
+ * Shared by setPriority, the CLI, and the /api/routing handler so the rule can
+ * only change in one place.
+ */
+export function isValidPriority(n: unknown): n is number {
+  return typeof n === "number" && Number.isInteger(n) && n >= 0;
+}
+
 /** Read-only view of the current routing decision, for the dashboard/status. */
 export interface RoutingSnapshot {
   activeTier: number | null;
@@ -75,6 +84,8 @@ export class AccountManager {
   /** Round-robin cursor for tie-breaking least-loaded selection. */
   private rrCursor = 0;
   private keychain: KeychainOps;
+  /** Per-account priority cache, keyed to routing.json's mtime (see priorityFor). */
+  private priorityCache = new Map<string, { mtimeMs: number; priority: number }>();
 
   constructor(config: Config, keychain: KeychainOps = defaultKeychainOps) {
     this.config = config;
@@ -174,30 +185,47 @@ export class AccountManager {
   }
 
   /**
-   * Routing priority for an account; lower = preferred. Read fresh from
-   * accounts/<name>/routing.json on every call (no cache) so a CLI edit in a
-   * separate process is seen by the running server on its next request.
-   * Returns DEFAULT_PRIORITY when the file is missing, unreadable, or holds a
-   * non-integer/negative value — routing must never throw on this.
+   * Routing priority for an account; lower = preferred. Cached per account and
+   * invalidated by routing.json's mtime: a CLI edit in a separate process is
+   * still seen by the running server (the file's mtime changes on write), but
+   * the common unchanged case costs a single stat() instead of a read+parse on
+   * every request. Returns DEFAULT_PRIORITY when the file is missing, unreadable,
+   * or holds a non-integer/negative value — routing must never throw on this.
    */
   priorityFor(name: string): number {
+    const path = this.routingPath(name);
+    let mtimeMs: number;
     try {
-      const parsed = JSON.parse(readFileSync(this.routingPath(name), "utf8")) as { priority?: unknown };
-      const p = parsed.priority;
-      return typeof p === "number" && Number.isInteger(p) && p >= 0 ? p : DEFAULT_PRIORITY;
+      mtimeMs = statSync(path).mtimeMs;
     } catch {
+      // No routing.json yet (or unreadable) — default, and drop any stale cache.
+      this.priorityCache.delete(name);
       return DEFAULT_PRIORITY;
     }
+    const cached = this.priorityCache.get(name);
+    if (cached && cached.mtimeMs === mtimeMs) return cached.priority;
+    let priority = DEFAULT_PRIORITY;
+    try {
+      const parsed = JSON.parse(readFileSync(path, "utf8")) as { priority?: unknown };
+      if (isValidPriority(parsed.priority)) priority = parsed.priority;
+    } catch {
+      priority = DEFAULT_PRIORITY;
+    }
+    this.priorityCache.set(name, { mtimeMs, priority });
+    return priority;
   }
 
   setPriority(name: string, priority: number): void {
-    if (!Number.isInteger(priority) || priority < 0) {
+    if (!isValidPriority(priority)) {
       throw new Error(`Priority must be a non-negative integer, got ${priority}`);
     }
     if (!existsSync(this.configDirFor(name))) {
       throw new Error(`Account "${name}" does not exist`);
     }
     writeFileSync(this.routingPath(name), JSON.stringify({ priority }, null, 2));
+    // Drop the cache so the next read re-parses even if the mtime is unchanged
+    // (two writes within one filesystem mtime tick would otherwise look stale).
+    this.priorityCache.delete(name);
   }
 
   create(name: string): void {
@@ -445,9 +473,28 @@ export class AccountManager {
   }
 
   private pickByHeadroom(available: Account[], family: string | null): Account {
-    let best = available[0]!;
+    return this.pickRoundRobin(this.rankHeadroom(available, family));
+  }
+
+  private pickByExpiringQuota(
+    available: Account[],
+    family: string | null,
+    now: number,
+    affinityName?: string,
+  ): Account {
+    return this.pickRoundRobin(this.rankExpiring(available, family, now, affinityName));
+  }
+
+  /**
+   * The tied set of headroom-strategy winners (most headroom, then fewest
+   * requests), in pool order. Pure ranking — no round-robin, no mutation — so
+   * both pick() (via pickRoundRobin) and the read-only preview can share it and
+   * never drift apart.
+   */
+  private rankHeadroom(pool: Account[], family: string | null): Account[] {
+    let best = pool[0]!;
     let bestHeadroom = headroomFraction(best.usage, family);
-    for (const a of available) {
+    for (const a of pool) {
       const headroom = headroomFraction(a.usage, family);
       if (
         headroom > bestHeadroom ||
@@ -457,36 +504,32 @@ export class AccountManager {
         bestHeadroom = headroom;
       }
     }
-
     const minLoad = best.usage.windowRequests;
-    const tied = available.filter(
+    return pool.filter(
       (a) => headroomFraction(a.usage, family) === bestHeadroom && a.usage.windowRequests === minLoad,
     );
-    return this.pickRoundRobin(tied);
   }
 
-  private pickByExpiringQuota(
-    available: Account[],
-    family: string | null,
-    now: number,
-    affinityName?: string,
-  ): Account {
-    const candidates = available.map((account) => ({
+  /**
+   * The tied set of expiring-quota winners (soonest viable reset), in pool order.
+   * Pure ranking — see rankHeadroom.
+   */
+  private rankExpiring(pool: Account[], family: string | null, now: number, affinityName?: string): Account[] {
+    const candidates = pool.map((account) => ({
       account,
       minHeadroom: candidateMinHeadroom(account.usage, family),
       earliestReset: candidateEarliestReset(account.usage, family, now),
       viable: candidateMinHeadroom(account.usage, family) >= this.config.routingMinHeadroom,
     }));
     const viable = candidates.filter((c) => c.viable);
-    const pool = viable.length > 0 ? viable : candidates;
+    const chosen = viable.length > 0 ? viable : candidates;
 
-    let best = pool[0]!;
-    for (const c of pool.slice(1)) {
+    let best = chosen[0]!;
+    for (const c of chosen.slice(1)) {
       if (compareExpiringCandidates(c, best, affinityName) < 0) best = c;
     }
 
-    const tied = pool.filter((c) => compareExpiringCandidates(c, best, affinityName) === 0).map((c) => c.account);
-    return this.pickRoundRobin(tied);
+    return chosen.filter((c) => compareExpiringCandidates(c, best, affinityName) === 0).map((c) => c.account);
   }
 
   private pickRoundRobin(tied: Account[]): Account {
@@ -497,35 +540,18 @@ export class AccountManager {
   }
 
   /**
-   * Non-mutating "who would be picked next" for the dashboard. Mirrors pick()'s
-   * ranking but never advances the round-robin cursor or touches affinity, so
-   * polling /api/status has zero effect on real routing. Ties are broken
-   * deterministically (comparator order) rather than round-robin.
+   * Non-mutating "who would be picked next" for the dashboard. Shares the exact
+   * ranking pick() uses (rankHeadroom/rankExpiring) but never advances the
+   * round-robin cursor or touches affinity, so polling /api/status has zero
+   * effect on real routing. Ties are broken deterministically (first in pool
+   * order) rather than round-robin, so the two can't silently diverge.
    */
   private previewBest(tierPool: Account[], family: string | null, now: number): Account {
-    if (this.config.routingStrategy === "headroom") {
-      let best = tierPool[0]!;
-      let bestH = headroomFraction(best.usage, family);
-      for (const a of tierPool.slice(1)) {
-        const h = headroomFraction(a.usage, family);
-        if (h > bestH || (h === bestH && a.usage.windowRequests < best.usage.windowRequests)) {
-          best = a;
-          bestH = h;
-        }
-      }
-      return best;
-    }
-    const candidates = tierPool.map((account) => ({
-      account,
-      minHeadroom: candidateMinHeadroom(account.usage, family),
-      earliestReset: candidateEarliestReset(account.usage, family, now),
-      viable: candidateMinHeadroom(account.usage, family) >= this.config.routingMinHeadroom,
-    }));
-    const viable = candidates.filter((c) => c.viable);
-    const pool = viable.length > 0 ? viable : candidates;
-    let best = pool[0]!;
-    for (const c of pool.slice(1)) if (compareExpiringCandidates(c, best) < 0) best = c;
-    return best.account;
+    const tied =
+      this.config.routingStrategy === "headroom"
+        ? this.rankHeadroom(tierPool, family)
+        : this.rankExpiring(tierPool, family, now);
+    return tied[0]!;
   }
 
   /**
