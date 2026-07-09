@@ -15,7 +15,7 @@ const openai = (id: string): ModelRoute => ({ id, provider: "openai", upstreamMo
 export const DEFAULT_MODEL_TABLE: ModelRoute[] = [
   claude("opus"), claude("sonnet"), claude("haiku"), claude("fable"),
   claude("claude-opus-4-8"), claude("claude-sonnet-5"), claude("claude-haiku-4-5"), claude("claude-fable-5"),
-  openai("gpt-5.2-codex"), openai("gpt-5.1-codex-max"),
+  openai("gpt-5.5"), openai("gpt-5.4"), openai("gpt-5.4-mini"),
 ];
 
 export function loadModelTable(modelsFile: string): ModelRoute[] {

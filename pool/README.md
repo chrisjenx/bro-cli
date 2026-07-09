@@ -102,14 +102,15 @@ bro models list
 # fable                → anthropic:fable
 # claude-opus-4-8      → anthropic:claude-opus-4-8
 # claude-fable-5       → anthropic:claude-fable-5
-# gpt-5.2-codex        → openai:gpt-5.2-codex
-# gpt-5.1-codex-max    → openai:gpt-5.1-codex-max
+# gpt-5.5              → openai:gpt-5.5
+# gpt-5.4              → openai:gpt-5.4
+# gpt-5.4-mini         → openai:gpt-5.4-mini
 ```
 
-- **Left column = the `"model"` string you put in your request.** Send `gpt-5.2-codex` (or any id in the table) to route to a Codex account; send `sonnet`/`opus`/`fable`/etc. for Claude.
-- Built-in Codex ids ship in the default table: **`gpt-5.2-codex`** and **`gpt-5.1-codex-max`**. Claude ids include the aliases `opus`/`sonnet`/`haiku`/`fable` and the full `claude-opus-4-8` / `claude-sonnet-5` / `claude-haiku-4-5` / `claude-fable-5`.
+- **Left column = the `"model"` string you put in your request.** Send `gpt-5.5` (or any id in the table) to route to a Codex account; send `sonnet`/`opus`/`fable`/etc. for Claude.
+- Built-in Codex ids ship in the default table: **`gpt-5.5`**, **`gpt-5.4`**, and **`gpt-5.4-mini`** (OpenAI's current Codex CLI defaults; the older `-codex`-suffixed ids like `gpt-5.2-codex`/`gpt-5.1-codex-max` were dropped from the ChatGPT-sign-in picker OpenAI's side in April 2026 and no longer work over this pool's OAuth login — don't reuse them). Claude ids include the aliases `opus`/`sonnet`/`haiku`/`fable` and the full `claude-opus-4-8` / `claude-sonnet-5` / `claude-haiku-4-5` / `claude-fable-5`.
 - **Fable has its own scoped usage window** — routing sidelines an account for Fable requests only once *its* Fable-specific window is spent, even if the account has plenty of headroom left on everything else (see [Routing & usage](#routing--usage) below). This is matched by family (any model id containing `fable`, `opus`, `sonnet`, or `haiku`), not by the table entry, so it applies even to a custom `claude-fable-*` id you add yourself.
-- An unknown model id falls back to routing verbatim to Anthropic, so a Codex model **must** be present in the table (as an `openai` entry) to reach a Codex account. New OpenAI ids (e.g. a future `gpt-5.6-codex`) aren't picked up automatically — Codex has no model-list endpoint (see below) — so add them to `models.json` yourself once you know the exact id string.
+- An unknown model id falls back to routing verbatim to Anthropic, so a Codex model **must** be present in the table (as an `openai` entry) to reach a Codex account. OpenAI ships new Codex model ids often — a "GPT-5.6" generation (`sol`/`terra`/`luna` tiers) is in limited trusted-partner preview as of mid-2026 — and they aren't picked up automatically, since Codex has no model-list endpoint (see below); add new ones to `models.json` yourself once you know the exact id string.
 
 ### Adding / changing model ids
 
@@ -118,7 +119,7 @@ Codex has no documented model-list endpoint, so `bro models update` can't auto-d
 ```json
 {
   "models": [
-    { "id": "gpt-5.2-codex", "provider": "openai", "upstreamModel": "gpt-5.2-codex" }
+    { "id": "gpt-5.5", "provider": "openai", "upstreamModel": "gpt-5.5" }
   ]
 }
 ```
