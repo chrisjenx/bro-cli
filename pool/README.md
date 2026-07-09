@@ -69,6 +69,63 @@ direct form is `bun run src/index.ts accounts <command> [name]`.
 
 `accounts list` shows plan type, rate-limit tier, token validity, and rolling usage per account.
 
+### OpenAI / Codex (ChatGPT subscription) accounts
+
+The pool can also route to a **ChatGPT subscription** (Codex) alongside Claude plans. Add one with the same `accounts` commands plus `--provider openai`:
+
+```bash
+# Browser OAuth login for a new ChatGPT-subscription account
+bro accounts login codex1 --provider openai
+# → opens a browser to sign in to ChatGPT; token is stored in the pool
+
+# Or import a login you already did with the Codex CLI (`codex login`)
+bro accounts import codex1 --provider openai
+# → reads ~/.codex/auth.json and copies its credentials into the pool
+```
+
+Notes:
+- `login --provider openai` uses ChatGPT subscription OAuth (not an API key).
+- `import --provider openai` requires an existing `codex login` — it reads `~/.codex/auth.json`. Run `codex login` first if it reports no login found.
+- Omit `--provider` (or pass `--provider anthropic`) for the default Claude login.
+- Standalone form: `bun run src/index.ts accounts login <name> --provider openai`.
+
+Once added, OpenAI accounts appear in `bro accounts list` and on the dashboard with a provider badge, and requests for OpenAI models route to them (see below).
+
+## Model strings
+
+The pool maps each **model id** you send to an upstream `provider:model`. See the current routing table with:
+
+```bash
+bro models list
+# opus                 → anthropic:opus
+# sonnet               → anthropic:sonnet
+# fable                → anthropic:fable
+# claude-opus-4-8      → anthropic:claude-opus-4-8
+# claude-fable-5       → anthropic:claude-fable-5
+# gpt-5.5              → openai:gpt-5.5
+# gpt-5.4              → openai:gpt-5.4
+# gpt-5.4-mini         → openai:gpt-5.4-mini
+```
+
+- **Left column = the `"model"` string you put in your request.** Send `gpt-5.5` (or any id in the table) to route to a Codex account; send `sonnet`/`opus`/`fable`/etc. for Claude.
+- Built-in Codex ids ship in the default table: **`gpt-5.5`**, **`gpt-5.4`**, and **`gpt-5.4-mini`** (OpenAI's current Codex CLI defaults; the older `-codex`-suffixed ids like `gpt-5.2-codex`/`gpt-5.1-codex-max` were dropped from the ChatGPT-sign-in picker OpenAI's side in April 2026 and no longer work over this pool's OAuth login — don't reuse them). Claude ids include the aliases `opus`/`sonnet`/`haiku`/`fable` and the full `claude-opus-4-8` / `claude-sonnet-5` / `claude-haiku-4-5` / `claude-fable-5`.
+- **Fable has its own scoped usage window** — routing sidelines an account for Fable requests only once *its* Fable-specific window is spent, even if the account has plenty of headroom left on everything else (see [Routing & usage](#routing--usage) below). This is matched by family (any model id containing `fable`, `opus`, `sonnet`, or `haiku`), not by the table entry, so it applies even to a custom `claude-fable-*` id you add yourself.
+- An unknown model id falls back to routing verbatim to Anthropic, so a Codex model **must** be present in the table (as an `openai` entry) to reach a Codex account. OpenAI ships new Codex model ids often — a "GPT-5.6" generation (`sol`/`terra`/`luna` tiers) is in limited trusted-partner preview as of mid-2026 — and they aren't picked up automatically, since Codex has no model-list endpoint (see below); add new ones to `models.json` yourself once you know the exact id string.
+
+### Adding / changing model ids
+
+Codex has no documented model-list endpoint, so `bro models update` can't auto-discover Codex model names — it only refreshes what's there and leaves your OpenAI entries untouched. To add or rename a Codex model, edit the pool's `models.json` (at `<poolDir>/models.json`, e.g. `~/.claude-max-pool/models.json`) and add an entry:
+
+```json
+{
+  "models": [
+    { "id": "gpt-5.5", "provider": "openai", "upstreamModel": "gpt-5.5" }
+  ]
+}
+```
+
+`id` is what you send to the pool; `upstreamModel` is what the pool sends to OpenAI/Codex (usually identical). Entries in `models.json` are merged over the built-in defaults, so you only list ids you're adding or overriding. Run `bro models list` again to confirm.
+
 ## Run the server
 
 ```bash
