@@ -186,12 +186,14 @@ export function dashboardHtml(): string {
   .tier-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 18px; }
   .badge.next { background: var(--accent-soft); color: var(--accent); border-color: transparent; font-weight: 600; }
   .routing-panel { display: none; background: var(--surface); border: 1px solid var(--border);
-    border-left: 3px solid var(--accent); border-radius: 12px; padding: 12px 16px; margin-bottom: 20px;
-    font-size: 13.5px; color: var(--text); box-shadow: var(--shadow); }
+    border-left: 3px solid var(--accent); border-radius: 12px; padding: 14px 18px; margin-bottom: 20px;
+    font-size: 13.5px; color: var(--text); box-shadow: var(--shadow);
+    gap: 28px; align-items: flex-start; flex-wrap: wrap; }
   .routing-panel .muted { color: var(--muted); }
-  .routing-panel .summary { font-size: 12px; margin: 2px 0 8px; }
+  .routing-panel .pick b { font-family: var(--serif); font-size: 16px; font-weight: 600; }
+  .routing-panel .summary { font-size: 12px; margin-top: 2px; }
   .routing-panel .why { list-style: none; margin: 0; padding: 0; display: grid; gap: 3px; }
-  .routing-panel .why .fact { display: grid; grid-template-columns: 92px 1fr; gap: 10px; font-size: 12.5px; }
+  .routing-panel .why .fact { display: grid; grid-template-columns: 110px 1fr; gap: 10px; font-size: 12.5px; }
   .routing-panel .why .fk { color: var(--muted); }
   .routing-panel .why .fact.decisive .fv { color: var(--accent); font-weight: 600; }
   .tier-edit { margin-top: 14px; padding-top: 13px; border-top: 1px solid var(--border);
@@ -316,8 +318,8 @@ function routingPanelHtml(routing) {
       + '<span class="fk">' + esc(f.label) + "</span>"
       + '<span class="fv">' + esc(f.detail) + (f.decisive ? " ◀" : "") + "</span></li>"
   ).join("");
-  return "Next request &rarr; <b>" + esc(routing.nextPick.account) + "</b>"
-    + '<div class="summary muted" title="' + esc(r.summary) + '">' + esc(r.summary) + "</div>"
+  return '<div class="pick">Next request &rarr; <b>' + esc(routing.nextPick.account) + "</b>"
+    + '<div class="summary muted" title="' + esc(r.summary) + '">' + esc(r.summary) + "</div></div>"
     + '<ul class="why">' + items + "</ul>";
 }
 
@@ -496,7 +498,7 @@ async function refresh() {
       const panelHtml = routingPanelHtml(routing);
       if (panelHtml) {
         panel.innerHTML = panelHtml;
-        panel.style.display = "block";
+        panel.style.display = "flex";
       } else {
         panel.style.display = "none";
       }

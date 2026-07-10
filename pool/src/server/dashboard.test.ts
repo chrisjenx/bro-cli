@@ -202,6 +202,15 @@ test("routingPanelHtml is empty when there is no next pick", () => {
   expect(routingPanelHtml(null)).toBe("");
 });
 
+test("routingPanelHtml wraps the pick and factors as flex siblings", () => {
+  const routingPanelHtml = loadRoutingPanel();
+  const html = routingPanelHtml({
+    nextPick: { account: "a", reason: { summary: "s", factors: [{ label: "Tier", detail: "100", decisive: true }] } },
+  });
+  expect(html).toContain('<div class="pick">');
+  expect(html).toContain('<ul class="why">');
+});
+
 test("outer #grid container is not itself a CSS grid (tier sections span full width)", () => {
   const html = dashboardHtml();
   // The tiling bug: `.grid` as display:grid squeezes each <section class="tier">
