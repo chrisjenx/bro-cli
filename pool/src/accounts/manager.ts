@@ -635,7 +635,9 @@ export class AccountManager {
 
   markRateLimited(name: string, resetAt?: number): void {
     const u = this.usageFor(name);
-    u.rateLimitedUntil = resetAt ?? Date.now() + this.config.rateLimitCooldownMs;
+    const now = Date.now();
+    u.rateLimitedUntil =
+      resetAt ?? blockingWindowReset(u.rateLimitStatus, now) ?? now + this.config.rateLimitCooldownMs;
     u.lastError = "rate limited by Anthropic";
     // Drop affinity so sessions reroute away from this account.
     for (const [k, v] of this.sessionAffinity) if (v === name) this.sessionAffinity.delete(k);
@@ -916,6 +918,22 @@ function isBlockingStatus(status: string | null): boolean {
   if (!status) return false;
   const s = status.toLowerCase();
   return s === "rejected" || s === "blocked" || s === "exhausted";
+}
+
+/**
+ * Soonest future reset among windows Anthropic currently reports as blocking
+ * (fully consumed or explicitly rejected). Used as markRateLimited's fallback
+ * when the 429 carried no explicit reset — the snapshot recorded moments
+ * earlier on the same request already knows the real reset. null when no
+ * blocking window has a future reset.
+ */
+function blockingWindowReset(rl: RateLimitSnapshot | null, now: number): number | null {
+  if (!rl?.windows) return null;
+  const resets = rl.windows
+    .filter((w) => (w.utilization != null && w.utilization >= 1) || isBlockingStatus(w.status))
+    .filter((w) => w.reset != null && w.reset > now)
+    .map((w) => w.reset!);
+  return resets.length > 0 ? Math.min(...resets) : null;
 }
 
 /**

@@ -972,3 +972,38 @@ test("routingSnapshot reason (headroom): headroom AND requests tied → tie-brea
     rmSync(poolDir, { recursive: true, force: true });
   }
 });
+
+test("markRateLimited uses the unified blocking-window reset when no explicit resetAt", () => {
+  const { poolDir, mgr } = tempPool(["acct"]);
+  try {
+    const now = Date.now();
+    const realReset = now + 6 * 60 * 60_000; // 6h out — well past the 1h cooldown.
+    // Snapshot recorded first on the request path shows a blocking 5h window.
+    mgr.recordRateLimitSnapshot("acct", snapshot([win("5h", { status: "rejected", utilization: 1, reset: realReset })]));
+
+    mgr.markRateLimited("acct"); // no explicit resetAt (e.g. 429 without retry-after)
+
+    const until = mgr.getAccount("acct").usage.rateLimitedUntil;
+    expect(until).toBe(realReset);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("markRateLimited falls back to the synthetic cooldown when no future blocking reset exists", () => {
+  const { poolDir, mgr } = tempPool(["acct"]);
+  try {
+    const now = Date.now();
+    // Blocking window whose reset already elapsed -> not a usable fallback.
+    mgr.recordRateLimitSnapshot("acct", snapshot([win("5h", { status: "rejected", utilization: 1, reset: now - 1000 })]));
+
+    mgr.markRateLimited("acct");
+
+    const until = mgr.getAccount("acct").usage.rateLimitedUntil ?? 0;
+    // Default rateLimitCooldownMs is 1h; allow scheduling slack.
+    expect(until).toBeGreaterThan(now + 55 * 60_000);
+    expect(until).toBeLessThan(now + 65 * 60_000);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
