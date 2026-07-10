@@ -82,7 +82,8 @@ export function dashboardHtml(): string {
   .icon-btn:hover { color: var(--text); border-color: var(--border-strong); }
 
   main { padding: 32px 28px 8px; max-width: 1120px; margin: 0 auto; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 18px; }
+  /* Block container for full-width tier sections; .tier-grid tiles the cards. */
+  .grid { display: block; }
 
   .card { background: var(--surface); border: 1px solid var(--border); border-radius: 16px;
     padding: 20px 22px; box-shadow: var(--shadow); transition: box-shadow .18s, transform .18s, border-color .18s; }

@@ -197,3 +197,13 @@ test("routingPanelHtml is empty when there is no next pick", () => {
   expect(routingPanelHtml({ nextPick: null })).toBe("");
   expect(routingPanelHtml(null)).toBe("");
 });
+
+test("outer #grid container is not itself a CSS grid (tier sections span full width)", () => {
+  const html = dashboardHtml();
+  // The tiling bug: `.grid` as display:grid squeezes each <section class="tier">
+  // into one ~330px column. The outer container must be a plain block.
+  const gridRule = html.match(/\.grid \{[^}]*\}/)?.[0] ?? "";
+  expect(gridRule).not.toContain("display: grid");
+  // Card tiling is owned by .tier-grid.
+  expect(html).toMatch(/\.tier-grid \{ display: grid; grid-template-columns: repeat\(auto-fill, minmax\(3\d0px, 1fr\)\)/);
+});
