@@ -63,8 +63,8 @@ export interface Config {
    * the user reads/thinks; 30 min covers that without pinning abandoned ones.
    */
   sessionIdleMs: number;
-  /** Account routing policy: spend soon-expiring viable quota by default. */
-  routingStrategy: "expiring" | "headroom";
+  /** Account routing policy: blended weighted score by default. */
+  routingStrategy: "weighted" | "expiring" | "headroom";
   /**
    * Minimum remaining headroom for an account to stay eligible in the `expiring`
    * strategy, measured over the gate set — the tightest binding window except the
@@ -99,8 +99,10 @@ function clamp(n: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, n));
 }
 
-function routingStrategyEnv(): "expiring" | "headroom" {
-  return process.env.ROUTING_STRATEGY?.toLowerCase() === "headroom" ? "headroom" : "expiring";
+function routingStrategyEnv(): "weighted" | "expiring" | "headroom" {
+  const raw = process.env.ROUTING_STRATEGY?.toLowerCase();
+  if (raw === "headroom" || raw === "expiring") return raw;
+  return "weighted";
 }
 
 function backendEnv(): "oauth" | "cli" {

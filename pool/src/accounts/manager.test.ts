@@ -35,6 +35,7 @@ function tempPool(
     accountsDir,
     usageFile: join(poolDir, "usage.json"),
     sessionsFile: join(poolDir, "sessions.json"),
+    routingStrategy: "expiring",
     ...overrides,
   });
   return { poolDir, mgr: keychain ? new AccountManager(config, keychain) : new AccountManager(config) };
@@ -1190,6 +1191,143 @@ describe("session ledger integration", () => {
       // Round-robin would alternate without a pin; repeated picks must not.
       expect(mgr.pick("sess")?.name).toBe(first.name);
       expect(mgr.pick("sess")?.name).toBe(first.name);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+});
+
+function weightedPool(names: string[]) {
+  return tempPool(names, undefined, { routingStrategy: "weighted" });
+}
+
+describe("weighted strategy", () => {
+  test("urgency dominates when weight, load, and headroom are equal (soonest 7d reset wins)", () => {
+    const { poolDir, mgr } = weightedPool(["soon", "later"]);
+    try {
+      const now = Date.now();
+      mgr.recordRateLimitSnapshot("soon", snapshot([
+        win("5h", { utilization: 0.2, reset: now + 3600_000 }),
+        win("7d", { utilization: 0.2, reset: now + 1 * 86_400_000 }),
+      ]));
+      mgr.recordRateLimitSnapshot("later", snapshot([
+        win("5h", { utilization: 0.2, reset: now + 3600_000 }),
+        win("7d", { utilization: 0.2, reset: now + 6 * 86_400_000 }),
+      ]));
+      expect(mgr.pick()?.name).toBe("soon");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("load flips the winner: a crowded soonest-expiring sub loses to the next one", () => {
+    const { poolDir, mgr } = weightedPool(["soon-busy", "later-idle"]);
+    try {
+      const now = Date.now();
+      mgr.recordRateLimitSnapshot("soon-busy", snapshot([
+        win("5h", { utilization: 0.2, reset: now + 3600_000 }),
+        win("7d", { utilization: 0.2, reset: now + 1 * 86_400_000 }),
+      ]));
+      mgr.recordRateLimitSnapshot("later-idle", snapshot([
+        win("5h", { utilization: 0.2, reset: now + 3600_000 }),
+        win("7d", { utilization: 0.2, reset: now + 6 * 86_400_000 }),
+      ]));
+      // soon-busy: urgency 1.0 but 2 sessions -> load 0.5 -> 0.5
+      // later-idle: urgency 0.8, 0 sessions -> 0.8 -> wins
+      mgr.setAffinity("s1", "soon-busy");
+      mgr.setAffinity("s2", "soon-busy");
+      expect(mgr.pick("new-session")?.name).toBe("later-idle");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("manual weight biases selection between otherwise-equal accounts", () => {
+    const { poolDir, mgr } = weightedPool(["plain", "boosted"]);
+    try {
+      const now = Date.now();
+      const same = () => snapshot([
+        win("5h", { utilization: 0.2, reset: now + 3600_000 }),
+        win("7d", { utilization: 0.2, reset: now + 3 * 86_400_000 }),
+      ]);
+      mgr.recordRateLimitSnapshot("plain", same());
+      mgr.recordRateLimitSnapshot("boosted", same());
+      mgr.setWeight("boosted", 2);
+      expect(mgr.pick()?.name).toBe("boosted");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("5h headroom collapse drops an account below a later-expiring alternative", () => {
+    const { poolDir, mgr } = weightedPool(["soon-full", "later-fresh"]);
+    try {
+      const now = Date.now();
+      mgr.recordRateLimitSnapshot("soon-full", snapshot([
+        win("5h", { utilization: 0.9, reset: now + 3600_000 }),
+        win("7d", { utilization: 0.2, reset: now + 1 * 86_400_000 }),
+      ]));
+      mgr.recordRateLimitSnapshot("later-fresh", snapshot([
+        win("5h", { utilization: 0.1, reset: now + 3600_000 }),
+        win("7d", { utilization: 0.2, reset: now + 6 * 86_400_000 }),
+      ]));
+      // soon-full: 1.0 urgency × 0.1 headroom = 0.1; later-fresh: 0.8 × 0.9 = 0.72
+      expect(mgr.pick()?.name).toBe("later-fresh");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("accounts below routingMinHeadroom fall to a fallback pool, not a hard exclusion", () => {
+    const { poolDir, mgr } = weightedPool(["nearly-out", "also-out"]);
+    try {
+      const now = Date.now();
+      mgr.recordRateLimitSnapshot("nearly-out", snapshot([
+        win("5h", { utilization: 0.95, reset: now + 3600_000 }),
+        win("7d", { utilization: 0.2, reset: now + 86_400_000 }),
+      ]));
+      mgr.recordRateLimitSnapshot("also-out", snapshot([
+        win("5h", { utilization: 0.99, reset: now + 3600_000 }),
+        win("7d", { utilization: 0.2, reset: now + 2 * 86_400_000 }),
+      ]));
+      // Nobody is viable; best-effort still serves the higher score.
+      expect(mgr.pick()?.name).toBe("nearly-out");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("priority tiers still gate hard: a heavy weight cannot pull a lower tier forward", () => {
+    const { poolDir, mgr } = weightedPool(["tier1", "tier2-heavy"]);
+    try {
+      mgr.setPriority("tier1", 1);
+      mgr.setPriority("tier2-heavy", 2);
+      mgr.setWeight("tier2-heavy", 10);
+      expect(mgr.pick()?.name).toBe("tier1");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("routingSnapshot exposes the per-candidate factor breakdown", () => {
+    const { poolDir, mgr } = weightedPool(["a", "b"]);
+    try {
+      mgr.setWeight("a", 2);
+      mgr.setAffinity("s1", "b");
+      const snap = mgr.routingSnapshot();
+      expect(snap.nextPick).not.toBe(null);
+      const cands = snap.candidates!;
+      expect(cands.length).toBe(2);
+      const a = cands.find((c) => c.account === "a")!;
+      const b = cands.find((c) => c.account === "b")!;
+      expect(a.weight).toBe(2);
+      expect(b.loadFactor).toBeCloseTo(1 / 1.5, 5);
+      for (const c of cands) {
+        expect(c.score).toBeCloseTo(c.weight * c.urgency * c.loadFactor * c.headroom, 8);
+      }
+      // Factors render into the reason list for the dashboard panel.
+      const labels = snap.nextPick!.reason.factors.map((f) => f.label);
+      expect(labels).toContain("Score");
     } finally {
       rmSync(poolDir, { recursive: true, force: true });
     }

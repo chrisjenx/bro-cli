@@ -4,8 +4,9 @@
  * Each account is a directory under <poolDir>/accounts/<name>/ with its own
  * Claude Code OAuth credentials. The manager reads each account's credentials
  * for status, tracks rolling usage, sidelines rate-limited accounts, and picks
- * which account should serve a given request, preferring soon-expiring viable
- * quota when upstream rate-limit reset data is available.
+ * which account should serve a given request, blending manual weight, expiry
+ * urgency, active-session load, and headroom into one placement score by
+ * default (see the `weighted` routing strategy).
  */
 
 import { mkdirSync, existsSync, readdirSync, readFileSync, writeFileSync, rmSync, copyFileSync, statSync } from "fs";
@@ -76,6 +77,8 @@ export interface RoutingSnapshot {
   activeTier: number | null;
   nextPick: { account: string; reason: NextPickReason } | null;
   tiers: { priority: number; accounts: string[]; available: number }[];
+  /** Per-candidate factor breakdown; present only for the weighted strategy. */
+  candidates?: ({ account: string } & WeightedFactors)[];
 }
 
 interface PersistedState {
@@ -455,9 +458,11 @@ export class AccountManager {
   /**
    * Pick an account to serve a request. A session with a live pin always stays
    * on its account (see the hard-pin block below); otherwise the default
-   * strategy spends viable quota with the soonest known reset first, so
-   * expiring capacity is used before longer-lived capacity, and the optional
-   * headroom strategy prefers the most-headroom account.
+   * `weighted` strategy scores each candidate on manual weight, expiry
+   * urgency, active-session load, and headroom (see scoreWeighted), the
+   * optional `expiring` strategy spends viable quota with the soonest known
+   * reset first, and the optional `headroom` strategy prefers the
+   * most-headroom account.
    *
    * @param exclude account names to skip (e.g. ones already tried this request
    *   during failover).
@@ -504,7 +509,9 @@ export class AccountManager {
     const best =
       this.config.routingStrategy === "headroom"
         ? this.pickByHeadroom(tierPool, family, now)
-        : this.pickByExpiringQuota(tierPool, family, now);
+        : this.config.routingStrategy === "expiring"
+          ? this.pickByExpiringQuota(tierPool, family, now)
+          : this.pickByWeighted(tierPool, family, now);
     if (sessionKey) this.sessions.touch(provider, sessionKey, best.name, now);
     return best;
   }
@@ -570,6 +577,57 @@ export class AccountManager {
     return sorted.filter((c) => compareExpiringCandidates(c, best) === 0).map((c) => c.account);
   }
 
+  /**
+   * Weighted placement score for every tier-pool candidate:
+   *   score = weight × urgency × loadFactor × headroom5h
+   * urgency is rank-based over 7d expiry (soonest first, nulls first to keep
+   * probing unknown accounts), loadFactor decays with live pinned sessions,
+   * headroom is the same 5h gate the expiring strategy uses. Pure — no
+   * round-robin, no mutation — shared by pick() and routingSnapshot().
+   */
+  private scoreWeighted(pool: Account[], family: string | null, now: number): WeightedCandidate[] {
+    const resets = pool.map((a) => candidateExpiryReset(a.usage, family, now));
+    const distinct: (number | null)[] = [];
+    for (const r of resets) {
+      if (!distinct.some((d) => compareNullableReset(d, r) === 0)) distinct.push(r);
+    }
+    distinct.sort(compareNullableReset);
+    const rankOf = (r: number | null) => distinct.findIndex((d) => compareNullableReset(d, r) === 0);
+
+    return pool.map((account, i) => {
+      const expiryReset = resets[i]!;
+      const urgency = 1 / (1 + rankOf(expiryReset) * URGENCY_DECAY);
+      const headroom = candidateGateHeadroom(account.usage, family, now);
+      const loadFactor = 1 / (1 + this.sessions.activeCount(account.name, now) * LOAD_SLOPE);
+      const weight = this.weightFor(account.name);
+      return {
+        account,
+        expiryReset,
+        weight,
+        urgency,
+        loadFactor,
+        headroom,
+        score: weight * urgency * loadFactor * headroom,
+        viable: headroom >= this.config.routingMinHeadroom,
+      };
+    });
+  }
+
+  /** Weighted candidates best-first: viable subset when any is viable, sorted by score. */
+  private sortWeightedCandidates(pool: Account[], family: string | null, now: number): WeightedCandidate[] {
+    const candidates = this.scoreWeighted(pool, family, now);
+    const viable = candidates.filter((c) => c.viable);
+    const chosen = viable.length > 0 ? viable : candidates;
+    return [...chosen].sort((a, b) => b.score - a.score);
+  }
+
+  private pickByWeighted(pool: Account[], family: string | null, now: number): Account {
+    const sorted = this.sortWeightedCandidates(pool, family, now);
+    const best = sorted[0]!;
+    const tied = sorted.filter((c) => c.score === best.score).map((c) => c.account);
+    return this.pickRoundRobin(tied);
+  }
+
   private pickRoundRobin(tied: Account[]): Account {
     if (tied.length <= 1) return tied[0]!;
     const best = tied[this.rrCursor % tied.length]!;
@@ -611,6 +669,7 @@ export class AccountManager {
 
     let best: Account;
     let reason: NextPickReason;
+    let candidates: RoutingSnapshot["candidates"];
     if (this.config.routingStrategy === "headroom") {
       // Same winner as pickByHeadroom (max headroom, then fewest requests); a
       // deterministic sort standing in for rankHeadroom + first-in-pool-order.
@@ -619,12 +678,24 @@ export class AccountManager {
         .sort((x, y) => y.headroom - x.headroom || x.account.usage.windowRequests - y.account.usage.windowRequests);
       best = ranked[0]!.account;
       reason = buildHeadroomReason(minPriority, reserveTiers, tierPool.length, ranked);
-    } else {
+    } else if (this.config.routingStrategy === "expiring") {
       const ranked = this.sortExpiringCandidates(tierPool, family, now);
       best = ranked[0]!.account;
       reason = buildExpiringReason(minPriority, reserveTiers, this.config.routingMinHeadroom, ranked, now, tierPool.length);
+    } else {
+      const ranked = this.sortWeightedCandidates(tierPool, family, now);
+      best = ranked[0]!.account;
+      reason = buildWeightedReason(minPriority, reserveTiers, ranked, now, tierPool.length);
+      candidates = this.scoreWeighted(tierPool, family, now).map((c) => ({
+        account: c.account.name,
+        weight: c.weight,
+        urgency: c.urgency,
+        loadFactor: c.loadFactor,
+        headroom: c.headroom,
+        score: c.score,
+      }));
     }
-    return { activeTier: minPriority, nextPick: { account: best.name, reason }, tiers };
+    return { activeTier: minPriority, nextPick: { account: best.name, reason }, tiers, candidates };
   }
 
   /** Pin a session to the account that actually served it (post-failover). */
@@ -809,6 +880,47 @@ function buildExpiringReason(
   return { summary, factors: [tierFactor(activeTier, pool, reserveTiers), gateFactor, expiryFactor, tiebreakFactor] };
 }
 
+/** Build the structured reason for the weighted strategy from ranked candidates. */
+function buildWeightedReason(
+  activeTier: number,
+  reserveTiers: number[],
+  ranked: WeightedCandidate[],
+  now: number,
+  poolSize: number,
+): NextPickReason {
+  const chosen = ranked[0]!;
+  const runnerUp = ranked[1] ?? null;
+  const f = (n: number) => n.toFixed(2);
+
+  const expiryDetail =
+    chosen.expiryReset != null
+      ? `7d resets in ${formatEta(chosen.expiryReset - now)}`
+      : "no 7d reset data — probing";
+  const expiryFactor: NextPickFactor = {
+    label: "7d expiry",
+    detail: `${expiryDetail} · urgency ${f(chosen.urgency)}`,
+    decisive: false,
+  };
+  const scoreDecisive = runnerUp != null && chosen.score !== runnerUp.score;
+  const scoreFactor: NextPickFactor = {
+    label: "Score",
+    detail:
+      `${f(chosen.weight)}w × ${f(chosen.urgency)}u × ${f(chosen.loadFactor)}l × ${f(chosen.headroom)}h = ${f(chosen.score)}` +
+      (runnerUp ? ` (next: ${runnerUp.account.name} ${f(runnerUp.score)})` : ""),
+    decisive: scoreDecisive,
+  };
+  const tiebreakFactor: NextPickFactor = {
+    label: "Tie-break",
+    detail: runnerUp && !scoreDecisive ? "round-robin among tied scores" : "not needed",
+    decisive: runnerUp != null && !scoreDecisive,
+  };
+  const summary = `tier ${activeTier} · score ${f(chosen.score)} · ${expiryDetail}`;
+  return {
+    summary,
+    factors: [tierFactor(activeTier, poolSize, reserveTiers), expiryFactor, scoreFactor, tiebreakFactor],
+  };
+}
+
 /** Build a compact structured reason for the headroom strategy. */
 function buildHeadroomReason(
   activeTier: number,
@@ -853,6 +965,26 @@ function bindingWindows(
   return rl.windows
     .filter((w) => w.model == null || (modelFamily != null && w.model === modelFamily))
     .filter((w) => w.reset == null || w.reset > now);
+}
+
+/** Rank-decay for the 7d-expiry urgency term: soonest 1.0, next 0.8, 0.67, … */
+const URGENCY_DECAY = 0.25;
+/** Active-session decay for the load term: 0 sessions 1.0, 1 → 0.67, 2 → 0.5. */
+const LOAD_SLOPE = 0.5;
+
+/** Factor breakdown behind one weighted-strategy candidate's score. */
+export interface WeightedFactors {
+  weight: number;
+  urgency: number;
+  loadFactor: number;
+  headroom: number;
+  score: number;
+}
+
+interface WeightedCandidate extends WeightedFactors {
+  account: Account;
+  expiryReset: number | null;
+  viable: boolean;
 }
 
 interface ExpiringCandidate {
