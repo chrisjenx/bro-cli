@@ -565,9 +565,7 @@ export class AccountManager {
         viable: gateHeadroom >= this.config.routingMinHeadroom,
       };
     });
-    const viable = candidates.filter((c) => c.viable);
-    const chosen = viable.length > 0 ? viable : candidates;
-    return [...chosen].sort(compareExpiringCandidates);
+    return [...viableFirst(candidates)].sort(compareExpiringCandidates);
   }
 
   /** The tied set of expiring winners (see sortExpiringCandidates), in ranked order. */
@@ -587,16 +585,14 @@ export class AccountManager {
    */
   private scoreWeighted(pool: Account[], family: string | null, now: number): WeightedCandidate[] {
     const resets = pool.map((a) => candidateExpiryReset(a.usage, family, now));
-    const distinct: (number | null)[] = [];
-    for (const r of resets) {
-      if (!distinct.some((d) => compareNullableReset(d, r) === 0)) distinct.push(r);
-    }
-    distinct.sort(compareNullableReset);
-    const rankOf = (r: number | null) => distinct.findIndex((d) => compareNullableReset(d, r) === 0);
+    // Rank distinct reset values (nulls collapse to one, equal timestamps share
+    // a rank); a Map gives O(1) rank lookup instead of a linear scan per account.
+    const distinct = [...new Set(resets)].sort(compareNullableReset);
+    const rankByReset = new Map(distinct.map((r, i) => [r, i] as const));
 
     return pool.map((account, i) => {
       const expiryReset = resets[i]!;
-      const urgency = 1 / (1 + rankOf(expiryReset) * URGENCY_DECAY);
+      const urgency = 1 / (1 + rankByReset.get(expiryReset)! * URGENCY_DECAY);
       const headroom = candidateGateHeadroom(account.usage, family, now);
       const loadFactor = 1 / (1 + this.sessions.activeCount(account.name, now) * LOAD_SLOPE);
       const weight = this.weightFor(account.name);
@@ -613,12 +609,14 @@ export class AccountManager {
     });
   }
 
+  /** Rank already-scored candidates best-first: viable subset when any is viable. */
+  private rankWeighted(scored: WeightedCandidate[]): WeightedCandidate[] {
+    return [...viableFirst(scored)].sort((a, b) => b.score - a.score);
+  }
+
   /** Weighted candidates best-first: viable subset when any is viable, sorted by score. */
   private sortWeightedCandidates(pool: Account[], family: string | null, now: number): WeightedCandidate[] {
-    const candidates = this.scoreWeighted(pool, family, now);
-    const viable = candidates.filter((c) => c.viable);
-    const chosen = viable.length > 0 ? viable : candidates;
-    return [...chosen].sort((a, b) => b.score - a.score);
+    return this.rankWeighted(this.scoreWeighted(pool, family, now));
   }
 
   private pickByWeighted(pool: Account[], family: string | null, now: number): Account {
@@ -683,10 +681,11 @@ export class AccountManager {
       best = ranked[0]!.account;
       reason = buildExpiringReason(minPriority, reserveTiers, this.config.routingMinHeadroom, ranked, now, tierPool.length);
     } else {
-      const ranked = this.sortWeightedCandidates(tierPool, family, now);
+      const scored = this.scoreWeighted(tierPool, family, now);
+      const ranked = this.rankWeighted(scored);
       best = ranked[0]!.account;
       reason = buildWeightedReason(minPriority, reserveTiers, ranked, now, tierPool.length);
-      candidates = this.scoreWeighted(tierPool, family, now).map((c) => ({
+      candidates = scored.map((c) => ({
         account: c.account.name,
         weight: c.weight,
         urgency: c.urgency,
@@ -992,6 +991,16 @@ interface ExpiringCandidate {
   gateHeadroom: number;
   expiryReset: number | null;
   viable: boolean;
+}
+
+/**
+ * Prefer candidates that clear the headroom gate; fall back to the whole pool
+ * only when none are viable (best-effort, so a request is never stranded).
+ * Shared by the expiring and weighted strategies.
+ */
+function viableFirst<T extends { viable: boolean }>(candidates: T[]): T[] {
+  const viable = candidates.filter((c) => c.viable);
+  return viable.length > 0 ? viable : candidates;
 }
 
 /**
