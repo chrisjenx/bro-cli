@@ -119,7 +119,7 @@ export function dashboardHtml(): string {
 
   /* Summary table: one glance row per account above the detail cards */
   .summary-tbl { background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
-    overflow: hidden; box-shadow: var(--shadow); margin-bottom: 26px; }
+    overflow-x: auto; box-shadow: var(--shadow); margin-bottom: 26px; }
   .summary-tbl table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
   .summary-tbl th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
     color: var(--muted); font-weight: 600; padding: 10px 14px; border-bottom: 1px solid var(--border);
@@ -310,6 +310,12 @@ function ago(ts) {
   const h = Math.floor(m / 60); return h + "h ago";
 }
 function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+// Shared account-derived values, used by both the summary row and the detail
+// card so the two representations can never drift apart.
+function dotState(a) { return a.available ? "ok" : (a.authenticated ? "warn" : "err"); }
+function priorityOf(a) { return a.priority == null ? 100 : a.priority; }
+// Utilization fraction [0,1] -> clamped percent [0,100]; 0 when unknown.
+function pct(w) { return w && w.utilization != null ? Math.min(100, Math.max(0, w.utilization * 100)) : 0; }
 function routingPanelHtml(routing) {
   if (!routing || !routing.nextPick) return "";
   const r = routing.nextPick.reason || { summary: "", factors: [] };
@@ -337,30 +343,30 @@ function windowLabel(w) {
 }
 
 function windowBar(w) {
-  const pct = w.utilization != null ? Math.min(100, Math.max(0, w.utilization * 100)) : 0;
+  const p = pct(w);
   const stale = w.reset != null && w.reset <= Date.now();
   const resetText = stale ? "rolled over — awaiting refresh" : "resets " + timeUntil(w.reset);
   return '<div><div class="bar-label"><span>' + esc(windowLabel(w)) + ' · used</span><span class="num">'
-    + pct.toFixed(0) + "% · " + resetText
-    + '</span></div><div class="bar"><span style="width:' + pct + '%"></span></div></div>';
+    + p.toFixed(0) + "% · " + resetText
+    + '</span></div><div class="bar"><span style="width:' + p + '%"></span></div></div>';
 }
 
 // Compact glance row: status dot, name (+next tag), plan, account-wide 5h/7d
 // mini-bars, priority, recency. Model-scoped windows stay on the detail card.
 function summaryRowHtml(a, isNext) {
-  const dot = a.available ? "ok" : (a.authenticated ? "warn" : "err");
+  const dot = dotState(a);
   const rl = a.usage.rateLimitStatus;
   const wins = (rl && Array.isArray(rl.windows) ? rl.windows : [])
     .filter((w) => w.utilization != null && !w.model);
   const winCell = (key) => {
     const w = wins.find((x) => x.key === key);
-    const pct = w ? Math.min(100, Math.max(0, w.utilization * 100)) : 0;
-    const label = w ? pct.toFixed(0) + "%" : "–";
-    return '<td><div class="mini"><div class="bar"><span style="width:' + pct
+    const p = pct(w);
+    const label = w ? p.toFixed(0) + "%" : "–";
+    return '<td><div class="mini"><div class="bar"><span style="width:' + p
       + '%"></span></div><span class="pct">' + label + "</span></div></td>";
   };
-  const pr = a.priority == null ? 100 : a.priority;
-  return '<tr class="acct" data-scroll="' + esc(a.name) + '">'
+  const pr = priorityOf(a);
+  return '<tr class="acct" data-scroll="' + esc(a.name) + '" role="button" tabindex="0">'
     + '<td class="c-dot"><span class="dot ' + dot + '"></span></td>'
     + '<td><span class="acct-name">' + esc(a.name) + "</span>"
     + (isNext ? ' <span class="badge next">next</span>' : "")
@@ -380,10 +386,10 @@ function summaryTableHtml(accounts, nextAcct) {
 }
 
 function card(a, isNext) {
-  const dot = a.available ? "ok" : (a.authenticated ? "warn" : "err");
+  const dot = dotState(a);
   const state = a.available ? "Ready" : (a.authenticated ? "Sidelined" : "Logged out");
   const u = a.usage;
-  const pr = a.priority == null ? 100 : a.priority;
+  const pr = priorityOf(a);
   const rl = u.rateLimitStatus;
   const tok = u.windowInputTokens + u.windowOutputTokens;
 
@@ -537,13 +543,18 @@ async function refresh() {
     });
 
     document.querySelectorAll("[data-scroll]").forEach((row) => {
-      row.addEventListener("click", () => {
+      const scrollToCard = () => {
         const el = document.getElementById("card-" + row.getAttribute("data-scroll"));
         if (!el) return;
         el.scrollIntoView({ behavior: "smooth", block: "center" });
         el.classList.remove("flash");
         void el.offsetWidth; // restart animation on repeat clicks
         el.classList.add("flash");
+      };
+      row.addEventListener("click", scrollToCard);
+      // Keyboard parity for the role="button" row (Enter / Space activate).
+      row.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); scrollToCard(); }
       });
     });
   } catch (e) {

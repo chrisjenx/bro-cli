@@ -267,8 +267,15 @@ test("summaryTableHtml renders one row per account with dot, next tag, windows, 
   // Only the routed account carries the next tag.
   const alphaRow = html.slice(html.indexOf("alpha"), html.indexOf("beta"));
   expect(alphaRow).toContain("next");
-  // beta has no live windows -> em-dash placeholders, and "never" for last used.
+  // beta has no live windows -> en-dash placeholders, and "never" for last used.
   expect(html).toContain("never");
+});
+
+test("summaryTableHtml rows are keyboard-focusable buttons (a11y)", () => {
+  const { summaryTableHtml } = loadFns();
+  const html = summaryTableHtml([baseAccount({ name: "alpha" })], null);
+  expect(html).toContain('role="button"');
+  expect(html).toContain('tabindex="0"');
 });
 
 test("summaryTableHtml is empty for an empty pool", () => {
