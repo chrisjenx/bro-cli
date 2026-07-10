@@ -9,7 +9,7 @@
  */
 
 import type { Config } from "../config.ts";
-import { AccountManager, isValidPriority } from "../accounts/manager.ts";
+import { AccountManager, isValidPriority, isValidWeight } from "../accounts/manager.ts";
 import { loadModelTable, resolveModel, type ModelRoute } from "../models.ts";
 import { runClaude } from "../subprocess/claude.ts";
 import type { Account } from "../accounts/types.ts";
@@ -316,22 +316,29 @@ function failoverHooks(config: Config) {
 // ---- helpers -------------------------------------------------------------
 
 /**
- * Apply a dashboard priority edit. Validates the account exists and the
- * priority is a non-negative integer, then persists it. Unauthenticated by
- * design, matching the rest of the dashboard/status routes.
+ * Apply a dashboard routing edit (priority and/or weight). Validates the
+ * account exists and each provided field independently, then persists them.
+ * Unauthenticated by design, matching the rest of the dashboard/status routes.
  */
 export function handleRoutingUpdate(mgr: AccountManager, body: unknown): Response {
-  const b = (body ?? {}) as { account?: unknown; priority?: unknown };
+  const b = (body ?? {}) as { account?: unknown; priority?: unknown; weight?: unknown };
   const account = typeof b.account === "string" ? b.account : "";
-  const { priority } = b;
+  const { priority, weight } = b;
   if (!account || !mgr.listNames().includes(account)) {
     return json({ error: { message: `Unknown account: ${account || "(missing)"}` } }, 400);
   }
-  if (!isValidPriority(priority)) {
+  if (priority === undefined && weight === undefined) {
+    return json({ error: { message: "provide priority and/or weight" } }, 400);
+  }
+  if (priority !== undefined && !isValidPriority(priority)) {
     return json({ error: { message: "priority must be a non-negative integer" } }, 400);
   }
-  mgr.setPriority(account, priority);
-  return json({ ok: true, account, priority });
+  if (weight !== undefined && !isValidWeight(weight)) {
+    return json({ error: { message: "weight must be a number between 0.1 and 10" } }, 400);
+  }
+  if (priority !== undefined) mgr.setPriority(account, priority);
+  if (weight !== undefined) mgr.setWeight(account, weight);
+  return json({ ok: true, account, priority: mgr.priorityFor(account), weight: mgr.weightFor(account) });
 }
 
 function checkAuth(req: Request, config: Config): Response | null {

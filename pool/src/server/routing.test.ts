@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { routeForRequest, openAIEndpointModelError, nonOauthOpenAIBackendError } from "./server.ts";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
+import { routeForRequest, openAIEndpointModelError, nonOauthOpenAIBackendError, handleRoutingUpdate } from "./server.ts";
 import { DEFAULT_MODEL_TABLE } from "../models.ts";
+import { loadConfig } from "../config.ts";
+import { AccountManager } from "../accounts/manager.ts";
 
 describe("routeForRequest", () => {
   test("claude and unknown models route anthropic; gpt models route openai", () => {
@@ -60,4 +65,62 @@ describe("nonOauthOpenAIBackendError", () => {
     expect(body.error.message).toContain("gpt-5.5");
     expect(body.error.message).toContain("oauth");
   });
+});
+
+// ---- handleRoutingUpdate tests (weight + priority) ----
+
+function tempMgr(names: string[]): { poolDir: string; mgr: AccountManager } {
+  const poolDir = mkdtempSync(join(tmpdir(), "cmp-routing-api-"));
+  const accountsDir = join(poolDir, "accounts");
+  for (const name of names) {
+    mkdirSync(join(accountsDir, name), { recursive: true });
+    writeFileSync(
+      join(accountsDir, name, ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "t", expiresAt: Date.now() + 3_600_000 } }),
+    );
+  }
+  const config = loadConfig({
+    poolDir, accountsDir,
+    usageFile: join(poolDir, "usage.json"),
+    sessionsFile: join(poolDir, "sessions.json"),
+  });
+  return { poolDir, mgr: new AccountManager(config) };
+}
+
+test("handleRoutingUpdate sets weight and echoes both persisted values", async () => {
+  const { poolDir, mgr } = tempMgr(["a"]);
+  try {
+    const res = handleRoutingUpdate(mgr, { account: "a", weight: 2.5 });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toEqual({ ok: true, account: "a", priority: 100, weight: 2.5 });
+    expect(mgr.weightFor("a")).toBe(2.5);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("handleRoutingUpdate sets priority and weight together", async () => {
+  const { poolDir, mgr } = tempMgr(["a"]);
+  try {
+    const res = handleRoutingUpdate(mgr, { account: "a", priority: 2, weight: 0.5 });
+    expect(res.status).toBe(200);
+    expect(mgr.priorityFor("a")).toBe(2);
+    expect(mgr.weightFor("a")).toBe(0.5);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("handleRoutingUpdate rejects out-of-range weight and missing fields", () => {
+  const { poolDir, mgr } = tempMgr(["a"]);
+  try {
+    expect(handleRoutingUpdate(mgr, { account: "a", weight: 99 }).status).toBe(400);
+    expect(handleRoutingUpdate(mgr, { account: "a", weight: "2" }).status).toBe(400);
+    expect(handleRoutingUpdate(mgr, { account: "a" }).status).toBe(400);
+    expect(handleRoutingUpdate(mgr, { account: "nope", weight: 1 }).status).toBe(400);
+    expect(mgr.weightFor("a")).toBe(1); // nothing persisted
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
 });
