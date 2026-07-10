@@ -207,3 +207,21 @@ test("outer #grid container is not itself a CSS grid (tier sections span full wi
   // Card tiling is owned by .tier-grid.
   expect(html).toMatch(/\.tier-grid \{ display: grid; grid-template-columns: repeat\(auto-fill, minmax\(3\d0px, 1fr\)\)/);
 });
+
+test("card() gives the next pick an accent class and every card a scroll-target id", () => {
+  const { card } = loadFns();
+  const next = card({ ...baseAccount(), name: "pick-me" }, true);
+  expect(next).toContain('id="card-pick-me"');
+  expect(next).toMatch(/class="card[^"]*\bnext\b/);
+  const other = card(baseAccount(), false);
+  expect(other).not.toMatch(/class="card[^"]*\bnext\b/);
+});
+
+test("card() merges request count and recency into one row", () => {
+  const { card } = loadFns();
+  const html = card(baseAccount(), false);
+  expect(html).toContain("Requests</span>");
+  expect(html).toContain("10 · ");           // totalRequests · ago(lastUsedAt)
+  expect(html).not.toContain("Total requests");
+  expect(html).not.toContain("Last used");
+});

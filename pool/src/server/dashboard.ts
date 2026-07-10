@@ -85,11 +85,14 @@ export function dashboardHtml(): string {
   /* Block container for full-width tier sections; .tier-grid tiles the cards. */
   .grid { display: block; }
 
-  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 16px;
-    padding: 20px 22px; box-shadow: var(--shadow); transition: box-shadow .18s, transform .18s, border-color .18s; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+    padding: 16px 18px; box-shadow: var(--shadow); transition: box-shadow .18s, transform .18s, border-color .18s; }
   .card:hover { box-shadow: var(--shadow-hover); transform: translateY(-1px); }
   .card.down { background: var(--surface-2); }
-  .card-top { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
+  .card.next { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent), var(--shadow); }
+  .card.flash { animation: flash 1.6s ease; }
+  @keyframes flash { 0% { background: var(--accent-soft); } 100% { background: var(--surface); } }
+  .card-top { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
   .status { display: inline-flex; align-items: center; gap: 8px; }
   .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
   .dot.ok { background: var(--ready); } .dot.warn { background: var(--warn); } .dot.err { background: var(--err); }
@@ -100,11 +103,11 @@ export function dashboardHtml(): string {
   .badge { font-size: 10.5px; padding: 3px 8px; border-radius: 999px; text-transform: uppercase;
     letter-spacing: .04em; border: 1px solid var(--border); background: var(--surface-2); color: var(--muted); }
 
-  .dl { display: grid; grid-template-columns: auto 1fr; gap: 7px 16px; font-size: 13.5px; }
+  .dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 16px; font-size: 13px; }
   .dl .k { color: var(--muted); }
   .dl .v { text-align: right; font-variant-numeric: tabular-nums; color: var(--text); }
 
-  .bars { margin-top: 16px; display: grid; gap: 11px; }
+  .bars { margin-top: 12px; display: grid; gap: 8px; }
   .bar-label { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
   .bar-label .num { font-variant-numeric: tabular-nums; color: var(--text); }
   .bar { height: 5px; background: var(--track); border-radius: 999px; overflow: hidden; }
@@ -347,7 +350,7 @@ function card(a, isNext) {
     : (u.lastError ? '<div class="note">Last error: ' + esc(u.lastError) + "</div>" : "");
   const cooldownRow = (u.rateLimitedUntil && u.rateLimitedUntil > Date.now())
     ? '<span class="k">Cooldown</span><span class="v">' + timeUntil(u.rateLimitedUntil) + "</span>" : "";
-  return \`<div class="card \${a.available ? "" : "down"}">
+  return \`<div class="card \${a.available ? "" : "down"}\${isNext ? " next" : ""}" id="card-\${esc(a.name)}">
     <div class="card-top">
       <span class="status"><span class="dot \${dot}"></span><span class="acct-name">\${esc(a.name)}</span></span>
       <span class="badge">\${esc(a.provider || "anthropic")}</span>
@@ -360,8 +363,7 @@ function card(a, isNext) {
       <span class="k">Priority</span><span class="v">\${pr}</span>
       <span class="k">Token</span><span class="v">\${a.tokenExpired ? "auto-refreshing" : "valid · " + timeUntil(a.tokenExpiresAt)}</span>
       <span class="k">Cost (window)</span><span class="v">\${fmtUsd(u.windowCostUsd)}</span>
-      <span class="k">Total requests</span><span class="v">\${fmtInt(u.totalRequests)}</span>
-      <span class="k">Last used</span><span class="v">\${ago(u.lastUsedAt)}</span>
+      <span class="k">Requests</span><span class="v">\${fmtInt(u.totalRequests)} · \${ago(u.lastUsedAt)}</span>
       \${limitStatusRow}
       \${cooldownRow}
     </div>
