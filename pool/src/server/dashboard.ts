@@ -316,6 +316,37 @@ function dotState(a) { return a.available ? "ok" : (a.authenticated ? "warn" : "
 function priorityOf(a) { return a.priority == null ? 100 : a.priority; }
 // Utilization fraction [0,1] -> clamped percent [0,100]; 0 when unknown.
 function pct(w) { return w && w.utilization != null ? Math.min(100, Math.max(0, w.utilization * 100)) : 0; }
+// Duration of a window from its key ("5h", "7d", "7d-fable" -> ms); null if
+// the key carries no recognisable duration token.
+function windowDurationMs(key) {
+  const token = String(key).split(/[-_]/).find((t) => /^\\d/.test(t));
+  const m = token && /^(\\d+)(mo|min|hrs|hr|days|day|wk|[hdwm])$/i.exec(token);
+  if (!m) return null;
+  const n = parseInt(m[1], 10), MIN = 60000, H = 60 * MIN, D = 24 * H;
+  switch (m[2].toLowerCase()) {
+    case "min": case "m": return n * MIN;
+    case "h": case "hr": case "hrs": return n * H;
+    case "d": case "day": case "days": return n * D;
+    case "w": case "wk": return n * 7 * D;
+    case "mo": return n * 30 * D;
+    default: return null;
+  }
+}
+// A window whose reset time has passed has definitely rolled over on the sub's
+// side, so the last counters we saw are stale. Assume the reset rather than
+// freezing an old number: show it fresh (0% used) with the reset projected to
+// the next boundary. The next request/poll reconciles with real numbers if the
+// sub reports different ones. Applies uniformly to 5h, 7d, and model windows.
+function rollOver(w) {
+  if (!w || w.reset == null || w.reset > Date.now()) return w;
+  const dur = windowDurationMs(w.key);
+  let reset = null;
+  if (dur && dur > 0) {
+    const k = Math.floor((Date.now() - w.reset) / dur) + 1; // first boundary in the future
+    reset = w.reset + k * dur;
+  }
+  return { ...w, utilization: 0, reset };
+}
 function routingPanelHtml(routing) {
   if (!routing || !routing.nextPick) return "";
   const r = routing.nextPick.reason || { summary: "", factors: [] };
@@ -342,10 +373,12 @@ function windowLabel(w) {
   return scope + dur + " window";
 }
 
-function windowBar(w) {
+function windowBar(w0) {
+  const w = rollOver(w0);
   const p = pct(w);
-  const stale = w.reset != null && w.reset <= Date.now();
-  const resetText = stale ? "rolled over — awaiting refresh" : "resets " + timeUntil(w.reset);
+  // After rollover a projected reset is always in the future; only a window
+  // with an unknown duration can still land here reset-less.
+  const resetText = w.reset == null ? "rolled over" : "resets " + timeUntil(w.reset);
   return '<div><div class="bar-label"><span>' + esc(windowLabel(w)) + ' · used</span><span class="num">'
     + p.toFixed(0) + "% · " + resetText
     + '</span></div><div class="bar"><span style="width:' + p + '%"></span></div></div>';
@@ -359,7 +392,7 @@ function summaryRowHtml(a, isNext) {
   const wins = (rl && Array.isArray(rl.windows) ? rl.windows : [])
     .filter((w) => w.utilization != null && !w.model);
   const winCell = (key) => {
-    const w = wins.find((x) => x.key === key);
+    const w = rollOver(wins.find((x) => x.key === key));
     const p = pct(w);
     const label = w ? p.toFixed(0) + "%" : "–";
     return '<td><div class="mini"><div class="bar"><span style="width:' + p

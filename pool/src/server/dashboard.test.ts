@@ -103,7 +103,7 @@ test("card() shows both real bars and no estimates once 5h and 7d are both known
   expect(html).not.toContain("(est.)");
 });
 
-test("card() renders a rolled-over window instead of a stale reset countdown", () => {
+test("card() assumes the reset for a rolled-over window instead of freezing a stale number", () => {
   const card = loadCard();
   const now = Date.now();
   const html = card(
@@ -117,7 +117,11 @@ test("card() renders a rolled-over window instead of a stale reset countdown", (
       },
     }),
   );
-  expect(html).toContain("rolled over — awaiting refresh");
+  // Reset was an hour ago on a 5h window: assume rollover — 0% used, next
+  // reset projected 4h out — not the stale 97% "awaiting refresh".
+  expect(html).not.toContain("awaiting refresh");
+  expect(html).not.toContain("97%");
+  expect(html).toContain("0% · resets 4h 0m");
 });
 
 function loadFns(): {
