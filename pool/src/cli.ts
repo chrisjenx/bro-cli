@@ -86,7 +86,7 @@ Pool dir: ${config.accountsDir}`);
       console.log(`Pool dir: ${config.accountsDir}\n`);
       for (const a of accounts) {
         const state = a.available ? "READY" : a.authenticated ? "SIDELINED" : "LOGGED OUT";
-        console.log(`● ${a.name}  [${a.provider}] [${state}]  priority ${a.priority}`);
+        console.log(`● ${a.name}  [${a.provider}] [${state}]  priority ${a.priority} · weight ${a.weight} · ${a.activeSessions} session${a.activeSessions === 1 ? "" : "s"}`);
         console.log(`    plan:      ${a.subscriptionType ?? "unknown"}   tier: ${a.rateLimitTier ?? "-"}`);
         console.log(
           `    token:     ${a.tokenExpired ? "expired (auto-refreshes on use)" : "valid until " + fmtWhen(a.tokenExpiresAt)}`,

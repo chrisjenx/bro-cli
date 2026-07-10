@@ -17,6 +17,8 @@ export interface Config {
   accountsDir: string;
   /** File where rolling usage counters are persisted between restarts. */
   usageFile: string;
+  /** File where session→account pins are persisted between restarts. */
+  sessionsFile: string;
   /** File where the model routing table is persisted between restarts. */
   modelsFile: string;
   /** Path to the `claude` executable. */
@@ -55,13 +57,19 @@ export interface Config {
   usageWindowMs: number;
   /** How long to sideline an account after it reports a rate limit, in ms. */
   rateLimitCooldownMs: number;
-  /** Account routing policy: spend soon-expiring viable quota by default. */
-  routingStrategy: "expiring" | "headroom";
   /**
-   * Minimum remaining headroom for an account to stay eligible in the `expiring`
-   * strategy, measured over the gate set — the tightest binding window except the
-   * account-wide 7d (which we deliberately drain). In practice this is the 5-hour
-   * window, plus any model-scoped window for model requests.
+   * A session idle longer than this loses its account pin and stops counting
+   * toward that account's active-session load. Claude Code sessions idle while
+   * the user reads/thinks; 30 min covers that without pinning abandoned ones.
+   */
+  sessionIdleMs: number;
+  /** Account routing policy: blended weighted score by default. */
+  routingStrategy: "weighted" | "expiring" | "headroom";
+  /**
+   * Minimum remaining headroom for an account to stay eligible in the `weighted`
+   * and `expiring` strategies, measured over the gate set — the tightest binding
+   * window except the account-wide 7d (which we deliberately drain). In practice
+   * this is the 5-hour window, plus any model-scoped window for model requests.
    */
   routingMinHeadroom: number;
   /** Log a line when a request fails over from one account to another. */
@@ -91,8 +99,10 @@ function clamp(n: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, n));
 }
 
-function routingStrategyEnv(): "expiring" | "headroom" {
-  return process.env.ROUTING_STRATEGY?.toLowerCase() === "headroom" ? "headroom" : "expiring";
+function routingStrategyEnv(): "weighted" | "expiring" | "headroom" {
+  const raw = process.env.ROUTING_STRATEGY?.toLowerCase();
+  if (raw === "headroom" || raw === "expiring") return raw;
+  return "weighted";
 }
 
 function backendEnv(): "oauth" | "cli" {
@@ -104,12 +114,14 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
   const poolDir = process.env.CLAUDE_POOL_DIR || join(homedir(), ".claude-max-pool");
   const accountsDir = join(poolDir, "accounts");
   const usageFile = join(poolDir, "usage.json");
+  const sessionsFile = join(poolDir, "sessions.json");
   const modelsFile = join(poolDir, "models.json");
 
   const config: Config = {
     poolDir,
     accountsDir,
     usageFile,
+    sessionsFile,
     modelsFile,
     claudeBin: process.env.CLAUDE_BIN || "claude",
     backend: backendEnv(),
@@ -125,6 +137,7 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
     streamKeepAliveMs: positiveIntEnv("STREAM_KEEPALIVE_MS", 1000, 100),
     usageWindowMs: intEnv("USAGE_WINDOW_MS", 5 * 60 * 60 * 1000),
     rateLimitCooldownMs: intEnv("RATE_LIMIT_COOLDOWN_MS", 60 * 60 * 1000),
+    sessionIdleMs: positiveIntEnv("SESSION_IDLE_MS", 30 * 60 * 1000, 60_000),
     routingStrategy: routingStrategyEnv(),
     routingMinHeadroom: clamp(floatEnv("ROUTING_MIN_HEADROOM", 0.1), 0, 1),
     logFailover: process.env.LOG_FAILOVER !== "0",

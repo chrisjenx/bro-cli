@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, utimesSync
 import { join } from "path";
 import { tmpdir } from "os";
 import { loadConfig, type Config } from "../config.ts";
-import { AccountManager, type KeychainOps } from "./manager.ts";
+import { AccountManager, type KeychainOps, DEFAULT_WEIGHT, isValidWeight } from "./manager.ts";
 import type { RateLimitSnapshot, RateLimitWindow } from "./types.ts";
 import { OPENAI_CREDS_FILENAME } from "./types.ts";
 
@@ -30,7 +30,14 @@ function tempPool(
       }),
     );
   }
-  const config = loadConfig({ poolDir, accountsDir, usageFile: join(poolDir, "usage.json"), ...overrides });
+  const config = loadConfig({
+    poolDir,
+    accountsDir,
+    usageFile: join(poolDir, "usage.json"),
+    sessionsFile: join(poolDir, "sessions.json"),
+    routingStrategy: "expiring",
+    ...overrides,
+  });
   return { poolDir, mgr: keychain ? new AccountManager(config, keychain) : new AccountManager(config) };
 }
 
@@ -236,7 +243,12 @@ test("expiring: stale windows are ignored after a cold reload from usage.json", 
     );
 
     // Fresh manager on the same pool dir -> loadState() reads usage.json.
-    const config = loadConfig({ poolDir, accountsDir: join(poolDir, "accounts"), usageFile: join(poolDir, "usage.json") });
+    const config = loadConfig({
+      poolDir,
+      accountsDir: join(poolDir, "accounts"),
+      usageFile: join(poolDir, "usage.json"),
+      sessionsFile: join(poolDir, "sessions.json"),
+    });
     const reloaded = new AccountManager(config);
     expect(reloaded.pick()?.name).toBe("stale-5h");
   } finally {
@@ -270,7 +282,7 @@ test("model-family reset timing only applies to matching model requests", async 
   }
 });
 
-test("session affinity yields to better soon-expiring quota", async () => {
+test("expiring: session pin is a hard pin and beats better expiring quota", async () => {
   const { poolDir, mgr } = tempPool(["soon", "later"]);
   try {
     const now = Date.now();
@@ -278,7 +290,8 @@ test("session affinity yields to better soon-expiring quota", async () => {
     mgr.recordRateLimitSnapshot("soon", snapshot([win("5h", { utilization: 0.5, reset: now + 30 * 60_000 })]));
     mgr.recordRateLimitSnapshot("later", snapshot([win("5h", { utilization: 0.1, reset: now + 5 * 60 * 60_000 })]));
 
-    expect(mgr.pick("session-1")?.name).toBe("soon");
+    // "soon" has better expiring quota, but the pin to "later" is hard now.
+    expect(mgr.pick("session-1")?.name).toBe("later");
   } finally {
     rmSync(poolDir, { recursive: true, force: true });
   }
@@ -568,7 +581,12 @@ test("legacy persisted snapshots (fixed 5h/7d fields) are upgraded on load", asy
       }),
     );
 
-    const config = loadConfig({ poolDir, accountsDir: join(poolDir, "accounts"), usageFile });
+    const config = loadConfig({
+      poolDir,
+      accountsDir: join(poolDir, "accounts"),
+      usageFile,
+      sessionsFile: join(poolDir, "sessions.json"),
+    });
     const fresh = new AccountManager(config);
     const rl = fresh.getAccount("legacy").usage.rateLimitStatus;
     expect(rl?.windows.map((w) => w.key)).toEqual(["5h", "7d"]);
@@ -691,6 +709,7 @@ test("a stale in-memory manager's saveState() doesn't resurrect a removed accoun
       poolDir,
       accountsDir: join(poolDir, "accounts"),
       usageFile: join(poolDir, "usage.json"),
+      sessionsFile: join(poolDir, "sessions.json"),
     });
     const cliMgr = new AccountManager(config);
     cliMgr.remove("gone");
@@ -1030,4 +1049,287 @@ test("markRateLimited falls back to the synthetic cooldown when no future blocki
   } finally {
     rmSync(poolDir, { recursive: true, force: true });
   }
+});
+
+describe("routing weight", () => {
+  test("weightFor defaults to 1 and setWeight round-trips", () => {
+    const { poolDir, mgr } = tempPool(["a"]);
+    try {
+      expect(mgr.weightFor("a")).toBe(1);
+      mgr.setWeight("a", 2.5);
+      expect(mgr.weightFor("a")).toBe(2.5);
+      expect(mgr.getAccount("a").weight).toBe(2.5);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("setWeight preserves priority and setPriority preserves weight", () => {
+    const { poolDir, mgr } = tempPool(["a"]);
+    try {
+      mgr.setPriority("a", 5);
+      mgr.setWeight("a", 3);
+      expect(mgr.priorityFor("a")).toBe(5);
+      mgr.setPriority("a", 7);
+      expect(mgr.weightFor("a")).toBe(3);
+      expect(mgr.priorityFor("a")).toBe(7);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("malformed weight in routing.json falls back to 1", () => {
+    const { poolDir, mgr } = tempPool(["a"]);
+    try {
+      writeFileSync(join(poolDir, "accounts", "a", "routing.json"), '{"priority": 1, "weight": "big"}');
+      expect(mgr.weightFor("a")).toBe(1);
+      expect(mgr.priorityFor("a")).toBe(1);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("isValidWeight accepts [0.1,10] numbers and rejects everything else", () => {
+    expect(isValidWeight(0.1)).toBe(true);
+    expect(isValidWeight(10)).toBe(true);
+    expect(isValidWeight(1.5)).toBe(true);
+    expect(isValidWeight(0.05)).toBe(false);
+    expect(isValidWeight(11)).toBe(false);
+    expect(isValidWeight(NaN)).toBe(false);
+    expect(isValidWeight("2")).toBe(false);
+  });
+
+  test("setWeight rejects out-of-range values", () => {
+    const { poolDir, mgr } = tempPool(["a"]);
+    try {
+      expect(() => mgr.setWeight("a", 0)).toThrow();
+      expect(() => mgr.setWeight("missing", 1)).toThrow();
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("session ledger integration", () => {
+  test("hard pin: a pinned session stays on its account even when another has better expiring quota", () => {
+    const { poolDir, mgr } = tempPool(["pinned", "better"]);
+    try {
+      const now = Date.now();
+      // "better" would win on soonest 7d reset; the pin must override that.
+      mgr.recordRateLimitSnapshot("pinned", snapshot([
+        win("5h", { utilization: 0.2, reset: now + 3600_000 }),
+        win("7d", { utilization: 0.2, reset: now + 6 * 86_400_000 }),
+      ]));
+      mgr.recordRateLimitSnapshot("better", snapshot([
+        win("5h", { utilization: 0.2, reset: now + 3600_000 }),
+        win("7d", { utilization: 0.2, reset: now + 1 * 86_400_000 }),
+      ]));
+      mgr.setAffinity("sess", "pinned");
+      expect(mgr.pick("sess")?.name).toBe("pinned");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("pin is dropped when the account is rate limited, and the session re-routes", () => {
+    const { poolDir, mgr } = tempPool(["a", "b"]);
+    try {
+      mgr.setAffinity("sess", "a");
+      mgr.markRateLimited("a");
+      expect(mgr.pick("sess")?.name).toBe("b");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("pin yields when its account leaves the active tier", () => {
+    const { poolDir, mgr } = tempPool(["primary", "fallback"]);
+    try {
+      mgr.setPriority("primary", 1);
+      mgr.setPriority("fallback", 2);
+      mgr.setAffinity("sess", "fallback"); // pinned during a primary outage
+      expect(mgr.pick("sess")?.name).toBe("primary"); // primary recovered: move back
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("pins survive a manager restart", () => {
+    const { poolDir, mgr } = tempPool(["a", "b"]);
+    try {
+      mgr.setAffinity("sess", "b");
+      const config = loadConfig({
+        poolDir,
+        accountsDir: join(poolDir, "accounts"),
+        usageFile: join(poolDir, "usage.json"),
+        sessionsFile: join(poolDir, "sessions.json"),
+      });
+      const reborn = new AccountManager(config);
+      expect(reborn.pick("sess")?.name).toBe("b");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("activeSessions on Account counts live pins", () => {
+    const { poolDir, mgr } = tempPool(["a", "b"]);
+    try {
+      mgr.setAffinity("s1", "a");
+      mgr.setAffinity("s2", "a");
+      mgr.setAffinity("s3", "b");
+      expect(mgr.getAccount("a").activeSessions).toBe(2);
+      expect(mgr.getAccount("b").activeSessions).toBe(1);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("pick() itself pins the chosen account for the session", () => {
+    const { poolDir, mgr } = tempPool(["a", "b"]);
+    try {
+      const first = mgr.pick("sess")!;
+      // Round-robin would alternate without a pin; repeated picks must not.
+      expect(mgr.pick("sess")?.name).toBe(first.name);
+      expect(mgr.pick("sess")?.name).toBe(first.name);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+});
+
+function weightedPool(names: string[]) {
+  return tempPool(names, undefined, { routingStrategy: "weighted" });
+}
+
+describe("weighted strategy", () => {
+  test("urgency dominates when weight, load, and headroom are equal (soonest 7d reset wins)", () => {
+    const { poolDir, mgr } = weightedPool(["soon", "later"]);
+    try {
+      const now = Date.now();
+      mgr.recordRateLimitSnapshot("soon", snapshot([
+        win("5h", { utilization: 0.2, reset: now + 3600_000 }),
+        win("7d", { utilization: 0.2, reset: now + 1 * 86_400_000 }),
+      ]));
+      mgr.recordRateLimitSnapshot("later", snapshot([
+        win("5h", { utilization: 0.2, reset: now + 3600_000 }),
+        win("7d", { utilization: 0.2, reset: now + 6 * 86_400_000 }),
+      ]));
+      expect(mgr.pick()?.name).toBe("soon");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("load flips the winner: a crowded soonest-expiring sub loses to the next one", () => {
+    const { poolDir, mgr } = weightedPool(["soon-busy", "later-idle"]);
+    try {
+      const now = Date.now();
+      mgr.recordRateLimitSnapshot("soon-busy", snapshot([
+        win("5h", { utilization: 0.2, reset: now + 3600_000 }),
+        win("7d", { utilization: 0.2, reset: now + 1 * 86_400_000 }),
+      ]));
+      mgr.recordRateLimitSnapshot("later-idle", snapshot([
+        win("5h", { utilization: 0.2, reset: now + 3600_000 }),
+        win("7d", { utilization: 0.2, reset: now + 6 * 86_400_000 }),
+      ]));
+      // soon-busy: urgency 1.0 but 2 sessions -> load 0.5 -> 0.5
+      // later-idle: urgency 0.8, 0 sessions -> 0.8 -> wins
+      mgr.setAffinity("s1", "soon-busy");
+      mgr.setAffinity("s2", "soon-busy");
+      expect(mgr.pick("new-session")?.name).toBe("later-idle");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("manual weight biases selection between otherwise-equal accounts", () => {
+    const { poolDir, mgr } = weightedPool(["plain", "boosted"]);
+    try {
+      const now = Date.now();
+      const same = () => snapshot([
+        win("5h", { utilization: 0.2, reset: now + 3600_000 }),
+        win("7d", { utilization: 0.2, reset: now + 3 * 86_400_000 }),
+      ]);
+      mgr.recordRateLimitSnapshot("plain", same());
+      mgr.recordRateLimitSnapshot("boosted", same());
+      mgr.setWeight("boosted", 2);
+      expect(mgr.pick()?.name).toBe("boosted");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("5h headroom collapse drops an account below a later-expiring alternative", () => {
+    const { poolDir, mgr } = weightedPool(["soon-full", "later-fresh"]);
+    try {
+      const now = Date.now();
+      mgr.recordRateLimitSnapshot("soon-full", snapshot([
+        win("5h", { utilization: 0.9, reset: now + 3600_000 }),
+        win("7d", { utilization: 0.2, reset: now + 1 * 86_400_000 }),
+      ]));
+      mgr.recordRateLimitSnapshot("later-fresh", snapshot([
+        win("5h", { utilization: 0.1, reset: now + 3600_000 }),
+        win("7d", { utilization: 0.2, reset: now + 6 * 86_400_000 }),
+      ]));
+      // soon-full: 1.0 urgency × 0.1 headroom = 0.1; later-fresh: 0.8 × 0.9 = 0.72
+      expect(mgr.pick()?.name).toBe("later-fresh");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("accounts below routingMinHeadroom fall to a fallback pool, not a hard exclusion", () => {
+    const { poolDir, mgr } = weightedPool(["nearly-out", "also-out"]);
+    try {
+      const now = Date.now();
+      mgr.recordRateLimitSnapshot("nearly-out", snapshot([
+        win("5h", { utilization: 0.95, reset: now + 3600_000 }),
+        win("7d", { utilization: 0.2, reset: now + 86_400_000 }),
+      ]));
+      mgr.recordRateLimitSnapshot("also-out", snapshot([
+        win("5h", { utilization: 0.99, reset: now + 3600_000 }),
+        win("7d", { utilization: 0.2, reset: now + 2 * 86_400_000 }),
+      ]));
+      // Nobody is viable; best-effort still serves the higher score.
+      expect(mgr.pick()?.name).toBe("nearly-out");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("priority tiers still gate hard: a heavy weight cannot pull a lower tier forward", () => {
+    const { poolDir, mgr } = weightedPool(["tier1", "tier2-heavy"]);
+    try {
+      mgr.setPriority("tier1", 1);
+      mgr.setPriority("tier2-heavy", 2);
+      mgr.setWeight("tier2-heavy", 10);
+      expect(mgr.pick()?.name).toBe("tier1");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("routingSnapshot exposes the per-candidate factor breakdown", () => {
+    const { poolDir, mgr } = weightedPool(["a", "b"]);
+    try {
+      mgr.setWeight("a", 2);
+      mgr.setAffinity("s1", "b");
+      const snap = mgr.routingSnapshot();
+      expect(snap.nextPick).not.toBe(null);
+      const cands = snap.candidates!;
+      expect(cands.length).toBe(2);
+      const a = cands.find((c) => c.account === "a")!;
+      const b = cands.find((c) => c.account === "b")!;
+      expect(a.weight).toBe(2);
+      expect(b.loadFactor).toBeCloseTo(1 / 1.5, 5);
+      for (const c of cands) {
+        expect(c.score).toBeCloseTo(c.weight * c.urgency * c.loadFactor * c.headroom, 8);
+      }
+      // Factors render into the reason list for the dashboard panel.
+      const labels = snap.nextPick!.reason.factors.map((f) => f.label);
+      expect(labels).toContain("Score");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
 });

@@ -42,6 +42,8 @@ function baseAccount(overrides: Record<string, unknown> = {}) {
     tokenExpired: false,
     tokenExpiresAt: Date.now() + 3_600_000,
     unavailableReason: null,
+    weight: 1,
+    activeSessions: 0,
     usage: {
       windowRequests: 3,
       windowInputTokens: 100,
@@ -285,4 +287,20 @@ test("summaryTableHtml rows are keyboard-focusable buttons (a11y)", () => {
 test("summaryTableHtml is empty for an empty pool", () => {
   const { summaryTableHtml } = loadFns();
   expect(summaryTableHtml([], null)).toBe("");
+});
+
+test("card() shows active sessions and the manual weight", () => {
+  const { card } = loadFns();
+  const html = card({ ...baseAccount(), priority: 100, weight: 2.5, activeSessions: 3 }, false);
+  expect(html).toContain("Sessions</span>");
+  expect(html).toContain("3 active");
+  expect(html).toContain('data-set-weight="acct"');
+  expect(html).toContain('value="2.5"');
+});
+
+test("card() weight editor defaults to 1 when weight is missing (older /api/status)", () => {
+  const { card } = loadFns();
+  const html = card({ ...baseAccount(), priority: 100 }, false);
+  expect(html).toContain('data-set-weight="acct"');
+  expect(html).toContain('value="1"');
 });

@@ -314,6 +314,7 @@ function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<
 // card so the two representations can never drift apart.
 function dotState(a) { return a.available ? "ok" : (a.authenticated ? "warn" : "err"); }
 function priorityOf(a) { return a.priority == null ? 100 : a.priority; }
+function weightOf(a) { return a.weight == null ? 1 : a.weight; }
 // Utilization fraction [0,1] -> clamped percent [0,100]; 0 when unknown.
 function pct(w) { return w && w.utilization != null ? Math.min(100, Math.max(0, w.utilization * 100)) : 0; }
 // Duration of a window from its key ("5h", "7d", "7d-fable" -> ms); null if
@@ -423,6 +424,7 @@ function card(a, isNext) {
   const state = a.available ? "Ready" : (a.authenticated ? "Sidelined" : "Logged out");
   const u = a.usage;
   const pr = priorityOf(a);
+  const w = weightOf(a);
   const rl = u.rateLimitStatus;
   const tok = u.windowInputTokens + u.windowOutputTokens;
 
@@ -459,6 +461,7 @@ function card(a, isNext) {
       <span class="k">Token</span><span class="v">\${a.tokenExpired ? "auto-refreshing" : "valid · " + timeUntil(a.tokenExpiresAt)}</span>
       <span class="k">Cost (window)</span><span class="v">\${fmtUsd(u.windowCostUsd)}</span>
       <span class="k">Requests</span><span class="v">\${fmtInt(u.totalRequests)} · \${ago(u.lastUsedAt)}</span>
+      <span class="k">Sessions</span><span class="v">\${fmtInt(a.activeSessions ?? 0)} active</span>
       \${limitStatusRow}
       \${cooldownRow}
     </div>
@@ -467,6 +470,9 @@ function card(a, isNext) {
     <div class="tier-edit">Priority
       <input type="number" min="0" value="\${pr}" data-acct="\${esc(a.name)}" />
       <button data-set-priority="\${esc(a.name)}">Set</button>
+      &nbsp;Weight
+      <input type="number" min="0.1" max="10" step="0.1" value="\${w}" data-weight-acct="\${esc(a.name)}" />
+      <button data-set-weight="\${esc(a.name)}">Set</button>
     </div>
   </div>\`;
 }
@@ -569,6 +575,23 @@ async function refresh() {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ account: name, priority }),
+          });
+          refresh();
+        } catch (e) { /* transient; next poll will reconcile */ }
+      });
+    });
+
+    document.querySelectorAll("[data-set-weight]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const name = btn.getAttribute("data-set-weight");
+        const input = document.querySelector('input[data-weight-acct="' + (window.CSS ? CSS.escape(name) : name) + '"]');
+        const weight = parseFloat(input.value);
+        if (!Number.isFinite(weight) || weight < 0.1 || weight > 10) return;
+        try {
+          await fetch("/api/routing", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ account: name, weight }),
           });
           refresh();
         } catch (e) { /* transient; next poll will reconcile */ }

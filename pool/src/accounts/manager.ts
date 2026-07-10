@@ -4,8 +4,9 @@
  * Each account is a directory under <poolDir>/accounts/<name>/ with its own
  * Claude Code OAuth credentials. The manager reads each account's credentials
  * for status, tracks rolling usage, sidelines rate-limited accounts, and picks
- * which account should serve a given request, preferring soon-expiring viable
- * quota when upstream rate-limit reset data is available.
+ * which account should serve a given request, blending manual weight, expiry
+ * urgency, active-session load, and headroom into one placement score by
+ * default (see the `weighted` routing strategy).
  */
 
 import { mkdirSync, existsSync, readdirSync, readFileSync, writeFileSync, rmSync, copyFileSync, statSync } from "fs";
@@ -28,6 +29,7 @@ import {
   readKeychainCreds,
   readKeychainCredsForConfigDir,
 } from "./keychain.ts";
+import { SessionLedger } from "./sessions.ts";
 import type { CliUsage } from "../subprocess/types.ts";
 
 /** Priority assigned to any account without a routing.json. Lower = preferred. */
@@ -40,6 +42,16 @@ export const DEFAULT_PRIORITY = 100;
  */
 export function isValidPriority(n: unknown): n is number {
   return typeof n === "number" && Number.isInteger(n) && n >= 0;
+}
+
+/** Manual routing weight bounds; a soft bias multiplier within a priority tier. */
+export const DEFAULT_WEIGHT = 1;
+export const MIN_WEIGHT = 0.1;
+export const MAX_WEIGHT = 10;
+
+/** The single source of truth for a valid weight: a finite number in [0.1, 10]. */
+export function isValidWeight(n: unknown): n is number {
+  return typeof n === "number" && Number.isFinite(n) && n >= MIN_WEIGHT && n <= MAX_WEIGHT;
 }
 
 /** One step of the routing decision, showing where the chosen account stood. */
@@ -65,6 +77,8 @@ export interface RoutingSnapshot {
   activeTier: number | null;
   nextPick: { account: string; reason: NextPickReason } | null;
   tiers: { priority: number; accounts: string[]; available: number }[];
+  /** Per-candidate factor breakdown; present only for the weighted strategy. */
+  candidates?: ({ account: string } & WeightedFactors)[];
 }
 
 interface PersistedState {
@@ -82,17 +96,18 @@ const defaultKeychainOps: KeychainOps = { read: readKeychainCreds, delete: delet
 export class AccountManager {
   private config: Config;
   private usage: Record<string, AccountUsage> = {};
-  /** Maps a caller session key to the account chosen for it (stickiness). */
-  private sessionAffinity = new Map<string, string>();
+  /** Persistent session→account pins + per-account active-session load. */
+  private sessions: SessionLedger;
   /** Round-robin cursor for tie-breaking least-loaded selection. */
   private rrCursor = 0;
   private keychain: KeychainOps;
-  /** Per-account priority cache, keyed to routing.json's mtime (see priorityFor). */
-  private priorityCache = new Map<string, { mtimeMs: number; priority: number }>();
+  /** Per-account routing.json cache, keyed to the file's mtime (see routingFileFor). */
+  private routingCache = new Map<string, { mtimeMs: number; priority: number; weight: number }>();
 
   constructor(config: Config, keychain: KeychainOps = defaultKeychainOps) {
     this.config = config;
     this.keychain = keychain;
+    this.sessions = new SessionLedger(config.sessionsFile, config.sessionIdleMs);
     mkdirSync(this.config.accountsDir, { recursive: true });
     this.loadState();
   }
@@ -195,40 +210,66 @@ export class AccountManager {
    * every request. Returns DEFAULT_PRIORITY when the file is missing, unreadable,
    * or holds a non-integer/negative value — routing must never throw on this.
    */
-  priorityFor(name: string): number {
+  private routingFileFor(name: string): { priority: number; weight: number } {
+    const fallback = { priority: DEFAULT_PRIORITY, weight: DEFAULT_WEIGHT };
     const path = this.routingPath(name);
     let mtimeMs: number;
     try {
       mtimeMs = statSync(path).mtimeMs;
     } catch {
-      // No routing.json yet (or unreadable) — default, and drop any stale cache.
-      this.priorityCache.delete(name);
-      return DEFAULT_PRIORITY;
+      this.routingCache.delete(name);
+      return fallback;
     }
-    const cached = this.priorityCache.get(name);
-    if (cached && cached.mtimeMs === mtimeMs) return cached.priority;
+    const cached = this.routingCache.get(name);
+    if (cached && cached.mtimeMs === mtimeMs) return cached;
     let priority = DEFAULT_PRIORITY;
+    let weight = DEFAULT_WEIGHT;
     try {
-      const parsed = JSON.parse(readFileSync(path, "utf8")) as { priority?: unknown };
+      const parsed = JSON.parse(readFileSync(path, "utf8")) as { priority?: unknown; weight?: unknown };
       if (isValidPriority(parsed.priority)) priority = parsed.priority;
+      if (isValidWeight(parsed.weight)) weight = parsed.weight;
     } catch {
-      priority = DEFAULT_PRIORITY;
+      /* fall through to defaults */
     }
-    this.priorityCache.set(name, { mtimeMs, priority });
-    return priority;
+    const entry = { mtimeMs, priority, weight };
+    this.routingCache.set(name, entry);
+    return entry;
+  }
+
+  priorityFor(name: string): number {
+    return this.routingFileFor(name).priority;
+  }
+
+  /** Manual routing weight; soft score multiplier, default 1 (see DEFAULT_WEIGHT). */
+  weightFor(name: string): number {
+    return this.routingFileFor(name).weight;
   }
 
   setPriority(name: string, priority: number): void {
     if (!isValidPriority(priority)) {
       throw new Error(`Priority must be a non-negative integer, got ${priority}`);
     }
+    this.writeRoutingField(name, { priority });
+  }
+
+  setWeight(name: string, weight: number): void {
+    if (!isValidWeight(weight)) {
+      throw new Error(`Weight must be a number between ${MIN_WEIGHT} and ${MAX_WEIGHT}, got ${weight}`);
+    }
+    this.writeRoutingField(name, { weight });
+  }
+
+  /** Merge one field into routing.json, preserving the other, then drop the cache. */
+  private writeRoutingField(name: string, patch: { priority?: number; weight?: number }): void {
     if (!existsSync(this.configDirFor(name))) {
       throw new Error(`Account "${name}" does not exist`);
     }
-    writeFileSync(this.routingPath(name), JSON.stringify({ priority }, null, 2));
+    const current = this.routingFileFor(name);
+    const next = { priority: current.priority, weight: current.weight, ...patch };
+    writeFileSync(this.routingPath(name), JSON.stringify(next, null, 2));
     // Drop the cache so the next read re-parses even if the mtime is unchanged
     // (two writes within one filesystem mtime tick would otherwise look stale).
-    this.priorityCache.delete(name);
+    this.routingCache.delete(name);
   }
 
   create(name: string): void {
@@ -382,6 +423,8 @@ export class AccountManager {
       rateLimitTier: oauth?.rateLimitTier ?? null,
       scopes: oauth?.scopes ?? [],
       priority: this.priorityFor(name),
+      weight: this.weightFor(name),
+      activeSessions: this.sessions.activeCount(name),
       tokenExpiresAt,
       tokenExpired,
       usage,
@@ -413,11 +456,13 @@ export class AccountManager {
   }
 
   /**
-   * Pick an account to serve a request. The default strategy spends viable quota
-   * with the soonest known reset first, so expiring capacity is used before
-   * longer-lived capacity. Session affinity is kept as a tiebreaker rather than
-   * an absolute pin; the optional headroom strategy preserves the old sticky,
-   * most-headroom-first behavior.
+   * Pick an account to serve a request. A session with a live pin always stays
+   * on its account (see the hard-pin block below); otherwise the default
+   * `weighted` strategy scores each candidate on manual weight, expiry
+   * urgency, active-session load, and headroom (see scoreWeighted), the
+   * optional `expiring` strategy spends viable quota with the soonest known
+   * reset first, and the optional `headroom` strategy prefers the
+   * most-headroom account.
    *
    * @param exclude account names to skip (e.g. ones already tried this request
    *   during failover).
@@ -435,7 +480,6 @@ export class AccountManager {
   ): Account | null {
     const now = Date.now();
     const family = modelFamily ?? null;
-    const affinityKey = sessionKey ? `${provider}:${sessionKey}` : undefined;
 
     const available = this.listAccounts().filter((a) => this.usableFor(a, provider, family, now, exclude));
     if (available.length === 0) return null;
@@ -447,31 +491,28 @@ export class AccountManager {
     const minPriority = Math.min(...available.map((a) => a.priority));
     const tierPool = available.filter((a) => a.priority === minPriority);
 
-    let prior: Account | null = null;
-    if (affinityKey) {
-      const priorName = this.sessionAffinity.get(affinityKey);
-      if (priorName && !exclude?.has(priorName)) {
-        const acct = this.getAccount(priorName);
-        // Honor the pin only if the account is still usable AND in the active
-        // tier — a session pinned to a fallback during a primary outage must
-        // move back to primary once primary recovers.
+    if (sessionKey) {
+      const pinned = this.sessions.get(provider, sessionKey, now);
+      if (pinned && !exclude?.has(pinned)) {
+        const acct = this.getAccount(pinned);
+        // Hard pin: switching accounts mid-session re-pays the full context
+        // cost, so an existing session stays put while its account is usable
+        // AND in the active tier — a session pinned to a fallback during a
+        // primary outage must still move back once primary recovers.
         if (this.usableFor(acct, provider, family, now, exclude) && acct.priority === minPriority) {
-          prior = acct;
-        } else {
-          this.sessionAffinity.delete(affinityKey);
+          this.sessions.touch(provider, sessionKey, pinned, now);
+          return acct;
         }
       }
     }
 
-    if (this.config.routingStrategy === "headroom") {
-      if (prior) return prior;
-      const best = this.pickByHeadroom(tierPool, family, now);
-      if (affinityKey) this.sessionAffinity.set(affinityKey, best.name);
-      return best;
-    }
-
-    const best = this.pickByExpiringQuota(tierPool, family, now, prior?.name);
-    if (affinityKey) this.sessionAffinity.set(affinityKey, best.name);
+    const best =
+      this.config.routingStrategy === "headroom"
+        ? this.pickByHeadroom(tierPool, family, now)
+        : this.config.routingStrategy === "expiring"
+          ? this.pickByExpiringQuota(tierPool, family, now)
+          : this.pickByWeighted(tierPool, family, now);
+    if (sessionKey) this.sessions.touch(provider, sessionKey, best.name, now);
     return best;
   }
 
@@ -479,13 +520,8 @@ export class AccountManager {
     return this.pickRoundRobin(this.rankHeadroom(available, family, now));
   }
 
-  private pickByExpiringQuota(
-    available: Account[],
-    family: string | null,
-    now: number,
-    affinityName?: string,
-  ): Account {
-    return this.pickRoundRobin(this.rankExpiring(available, family, now, affinityName));
+  private pickByExpiringQuota(available: Account[], family: string | null, now: number): Account {
+    return this.pickRoundRobin(this.rankExpiring(available, family, now));
   }
 
   /**
@@ -519,12 +555,7 @@ export class AccountManager {
    * a best-effort fallback. Pure — no round-robin, no mutation — so pick() and
    * the read-only snapshot share one ordering and never drift.
    */
-  private sortExpiringCandidates(
-    pool: Account[],
-    family: string | null,
-    now: number,
-    affinityName?: string,
-  ): ExpiringCandidate[] {
+  private sortExpiringCandidates(pool: Account[], family: string | null, now: number): ExpiringCandidate[] {
     const candidates: ExpiringCandidate[] = pool.map((account) => {
       const gateHeadroom = candidateGateHeadroom(account.usage, family, now);
       return {
@@ -534,16 +565,65 @@ export class AccountManager {
         viable: gateHeadroom >= this.config.routingMinHeadroom,
       };
     });
-    const viable = candidates.filter((c) => c.viable);
-    const chosen = viable.length > 0 ? viable : candidates;
-    return [...chosen].sort((a, b) => compareExpiringCandidates(a, b, affinityName));
+    return [...viableFirst(candidates)].sort(compareExpiringCandidates);
   }
 
   /** The tied set of expiring winners (see sortExpiringCandidates), in ranked order. */
-  private rankExpiring(pool: Account[], family: string | null, now: number, affinityName?: string): Account[] {
-    const sorted = this.sortExpiringCandidates(pool, family, now, affinityName);
+  private rankExpiring(pool: Account[], family: string | null, now: number): Account[] {
+    const sorted = this.sortExpiringCandidates(pool, family, now);
     const best = sorted[0]!;
-    return sorted.filter((c) => compareExpiringCandidates(c, best, affinityName) === 0).map((c) => c.account);
+    return sorted.filter((c) => compareExpiringCandidates(c, best) === 0).map((c) => c.account);
+  }
+
+  /**
+   * Weighted placement score for every tier-pool candidate:
+   *   score = weight × urgency × loadFactor × headroom5h
+   * urgency is rank-based over 7d expiry (soonest first, nulls first to keep
+   * probing unknown accounts), loadFactor decays with live pinned sessions,
+   * headroom is the same 5h gate the expiring strategy uses. Pure — no
+   * round-robin, no mutation — shared by pick() and routingSnapshot().
+   */
+  private scoreWeighted(pool: Account[], family: string | null, now: number): WeightedCandidate[] {
+    const resets = pool.map((a) => candidateExpiryReset(a.usage, family, now));
+    // Rank distinct reset values (nulls collapse to one, equal timestamps share
+    // a rank); a Map gives O(1) rank lookup instead of a linear scan per account.
+    const distinct = [...new Set(resets)].sort(compareNullableReset);
+    const rankByReset = new Map(distinct.map((r, i) => [r, i] as const));
+
+    return pool.map((account, i) => {
+      const expiryReset = resets[i]!;
+      const urgency = 1 / (1 + rankByReset.get(expiryReset)! * URGENCY_DECAY);
+      const headroom = candidateGateHeadroom(account.usage, family, now);
+      const loadFactor = 1 / (1 + this.sessions.activeCount(account.name, now) * LOAD_SLOPE);
+      const weight = this.weightFor(account.name);
+      return {
+        account,
+        expiryReset,
+        weight,
+        urgency,
+        loadFactor,
+        headroom,
+        score: weight * urgency * loadFactor * headroom,
+        viable: headroom >= this.config.routingMinHeadroom,
+      };
+    });
+  }
+
+  /** Rank already-scored candidates best-first: viable subset when any is viable. */
+  private rankWeighted(scored: WeightedCandidate[]): WeightedCandidate[] {
+    return [...viableFirst(scored)].sort((a, b) => b.score - a.score);
+  }
+
+  /** Weighted candidates best-first: viable subset when any is viable, sorted by score. */
+  private sortWeightedCandidates(pool: Account[], family: string | null, now: number): WeightedCandidate[] {
+    return this.rankWeighted(this.scoreWeighted(pool, family, now));
+  }
+
+  private pickByWeighted(pool: Account[], family: string | null, now: number): Account {
+    const sorted = this.sortWeightedCandidates(pool, family, now);
+    const best = sorted[0]!;
+    const tied = sorted.filter((c) => c.score === best.score).map((c) => c.account);
+    return this.pickRoundRobin(tied);
   }
 
   private pickRoundRobin(tied: Account[]): Account {
@@ -587,6 +667,7 @@ export class AccountManager {
 
     let best: Account;
     let reason: NextPickReason;
+    let candidates: RoutingSnapshot["candidates"];
     if (this.config.routingStrategy === "headroom") {
       // Same winner as pickByHeadroom (max headroom, then fewest requests); a
       // deterministic sort standing in for rankHeadroom + first-in-pool-order.
@@ -595,17 +676,35 @@ export class AccountManager {
         .sort((x, y) => y.headroom - x.headroom || x.account.usage.windowRequests - y.account.usage.windowRequests);
       best = ranked[0]!.account;
       reason = buildHeadroomReason(minPriority, reserveTiers, tierPool.length, ranked);
-    } else {
+    } else if (this.config.routingStrategy === "expiring") {
       const ranked = this.sortExpiringCandidates(tierPool, family, now);
       best = ranked[0]!.account;
       reason = buildExpiringReason(minPriority, reserveTiers, this.config.routingMinHeadroom, ranked, now, tierPool.length);
+    } else {
+      const scored = this.scoreWeighted(tierPool, family, now);
+      const ranked = this.rankWeighted(scored);
+      best = ranked[0]!.account;
+      reason = buildWeightedReason(minPriority, reserveTiers, ranked, now, tierPool.length);
+      candidates = scored.map((c) => ({
+        account: c.account.name,
+        weight: c.weight,
+        urgency: c.urgency,
+        loadFactor: c.loadFactor,
+        headroom: c.headroom,
+        score: c.score,
+      }));
     }
-    return { activeTier: minPriority, nextPick: { account: best.name, reason }, tiers };
+    return { activeTier: minPriority, nextPick: { account: best.name, reason }, tiers, candidates };
   }
 
   /** Pin a session to the account that actually served it (post-failover). */
   setAffinity(sessionKey: string, accountName: string, provider: Provider = "anthropic"): void {
-    this.sessionAffinity.set(`${provider}:${sessionKey}`, accountName);
+    this.sessions.touch(provider, sessionKey, accountName);
+  }
+
+  /** Expire idle session pins; called periodically by the server. */
+  pruneSessions(): void {
+    this.sessions.prune();
   }
 
   // ---- usage recording ---------------------------------------------------
@@ -639,8 +738,8 @@ export class AccountManager {
     u.rateLimitedUntil =
       resetAt ?? blockingWindowReset(u.rateLimitStatus, now) ?? now + this.config.rateLimitCooldownMs;
     u.lastError = "rate limited by Anthropic";
-    // Drop affinity so sessions reroute away from this account.
-    for (const [k, v] of this.sessionAffinity) if (v === name) this.sessionAffinity.delete(k);
+    // Drop pins so sessions reroute away from this account.
+    this.sessions.evictAccount(name);
     this.saveState();
   }
 
@@ -770,7 +869,7 @@ function buildExpiringReason(
     let rule: string;
     if (chosen.gateHeadroom !== runnerUp.gateHeadroom) rule = "more 5h headroom";
     else if (chosen.account.usage.windowRequests !== runnerUp.account.usage.windowRequests) rule = "fewer requests";
-    else rule = "session affinity / round-robin";
+    else rule = "round-robin";
     tiebreakDetail = `broke tie on ${rule}`;
     tiebreakDecisive = true;
   }
@@ -778,6 +877,47 @@ function buildExpiringReason(
 
   const summary = `tier ${activeTier} · ${chosen.expiryReset != null ? `7d resets in ${formatEta(chosen.expiryReset - now)}` : "no 7d data"} · ${chosenPct}% 5h headroom`;
   return { summary, factors: [tierFactor(activeTier, pool, reserveTiers), gateFactor, expiryFactor, tiebreakFactor] };
+}
+
+/** Build the structured reason for the weighted strategy from ranked candidates. */
+function buildWeightedReason(
+  activeTier: number,
+  reserveTiers: number[],
+  ranked: WeightedCandidate[],
+  now: number,
+  poolSize: number,
+): NextPickReason {
+  const chosen = ranked[0]!;
+  const runnerUp = ranked[1] ?? null;
+  const f = (n: number) => n.toFixed(2);
+
+  const expiryDetail =
+    chosen.expiryReset != null
+      ? `7d resets in ${formatEta(chosen.expiryReset - now)}`
+      : "no 7d reset data — probing";
+  const expiryFactor: NextPickFactor = {
+    label: "7d expiry",
+    detail: `${expiryDetail} · urgency ${f(chosen.urgency)}`,
+    decisive: false,
+  };
+  const scoreDecisive = runnerUp != null && chosen.score !== runnerUp.score;
+  const scoreFactor: NextPickFactor = {
+    label: "Score",
+    detail:
+      `${f(chosen.weight)}w × ${f(chosen.urgency)}u × ${f(chosen.loadFactor)}l × ${f(chosen.headroom)}h = ${f(chosen.score)}` +
+      (runnerUp ? ` (next: ${runnerUp.account.name} ${f(runnerUp.score)})` : ""),
+    decisive: scoreDecisive,
+  };
+  const tiebreakFactor: NextPickFactor = {
+    label: "Tie-break",
+    detail: runnerUp && !scoreDecisive ? "round-robin among tied scores" : "not needed",
+    decisive: runnerUp != null && !scoreDecisive,
+  };
+  const summary = `tier ${activeTier} · score ${f(chosen.score)} · ${expiryDetail}`;
+  return {
+    summary,
+    factors: [tierFactor(activeTier, poolSize, reserveTiers), expiryFactor, scoreFactor, tiebreakFactor],
+  };
 }
 
 /** Build a compact structured reason for the headroom strategy. */
@@ -826,11 +966,41 @@ function bindingWindows(
     .filter((w) => w.reset == null || w.reset > now);
 }
 
+/** Rank-decay for the 7d-expiry urgency term: soonest 1.0, next 0.8, 0.67, … */
+const URGENCY_DECAY = 0.25;
+/** Active-session decay for the load term: 0 sessions 1.0, 1 → 0.67, 2 → 0.5. */
+const LOAD_SLOPE = 0.5;
+
+/** Factor breakdown behind one weighted-strategy candidate's score. */
+export interface WeightedFactors {
+  weight: number;
+  urgency: number;
+  loadFactor: number;
+  headroom: number;
+  score: number;
+}
+
+interface WeightedCandidate extends WeightedFactors {
+  account: Account;
+  expiryReset: number | null;
+  viable: boolean;
+}
+
 interface ExpiringCandidate {
   account: Account;
   gateHeadroom: number;
   expiryReset: number | null;
   viable: boolean;
+}
+
+/**
+ * Prefer candidates that clear the headroom gate; fall back to the whole pool
+ * only when none are viable (best-effort, so a request is never stranded).
+ * Shared by the expiring and weighted strategies.
+ */
+function viableFirst<T extends { viable: boolean }>(candidates: T[]): T[] {
+  const viable = candidates.filter((c) => c.viable);
+  return viable.length > 0 ? viable : candidates;
 }
 
 /**
@@ -906,16 +1076,12 @@ function compareNullableReset(a: number | null, b: number | null): number {
   return a == null ? -1 : 1;
 }
 
-function compareExpiringCandidates(a: ExpiringCandidate, b: ExpiringCandidate, affinityName?: string): number {
+function compareExpiringCandidates(a: ExpiringCandidate, b: ExpiringCandidate): number {
   const reset = compareNullableReset(a.expiryReset, b.expiryReset);
   if (reset !== 0) return reset;
   if (a.gateHeadroom !== b.gateHeadroom) return b.gateHeadroom - a.gateHeadroom;
   if (a.account.usage.windowRequests !== b.account.usage.windowRequests) {
     return a.account.usage.windowRequests - b.account.usage.windowRequests;
-  }
-  if (affinityName) {
-    if (a.account.name === affinityName && b.account.name !== affinityName) return -1;
-    if (b.account.name === affinityName && a.account.name !== affinityName) return 1;
   }
   return 0;
 }

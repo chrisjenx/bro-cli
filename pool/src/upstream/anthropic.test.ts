@@ -47,6 +47,7 @@ function tempPool(accountNames: string[]): { poolDir: string; mgr: AccountManage
     poolDir,
     accountsDir,
     usageFile: join(poolDir, "usage.json"),
+    sessionsFile: join(poolDir, "sessions.json"),
     anthropicApiBaseUrl: "https://api.test",
     oauthTokenUrl: "https://oauth.test/token",
     requestTimeoutMs: 30_000,

@@ -26,7 +26,13 @@ function tempPool(accountNames: string[]): { poolDir: string; mgr: AccountManage
       }),
     );
   }
-  const config = loadConfig({ poolDir, accountsDir, usageFile: join(poolDir, "usage.json") });
+  const config = loadConfig({
+    poolDir,
+    accountsDir,
+    usageFile: join(poolDir, "usage.json"),
+    sessionsFile: join(poolDir, "sessions.json"),
+    routingStrategy: "expiring",
+  });
   return { poolDir, mgr: new AccountManager(config) };
 }
 
