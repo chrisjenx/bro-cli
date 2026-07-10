@@ -758,7 +758,7 @@ function buildExpiringReason(
   let tiebreakDetail = "not needed";
   let tiebreakDecisive = false;
   if (runnerUp && !resetDecisive) {
-    let rule = "round-robin among ties";
+    let rule: string;
     if (chosen.gateHeadroom !== runnerUp.gateHeadroom) rule = "more 5h headroom";
     else if (chosen.account.usage.windowRequests !== runnerUp.account.usage.windowRequests) rule = "fewer requests";
     else rule = "session affinity / round-robin";
