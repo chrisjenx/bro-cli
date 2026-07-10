@@ -298,7 +298,7 @@ test("session affinity wins among tied expiring-quota candidates", async () => {
   }
 });
 
-test("known soon-expiring quota beats unknown reset data, but unknown accounts remain eligible", async () => {
+test("expiring: an account with no window data is probed first (before a known reset)", async () => {
   const withKnown = tempPool(["known-soon", "unknown"]);
   try {
     const now = Date.now();
@@ -307,17 +307,52 @@ test("known soon-expiring quota beats unknown reset data, but unknown accounts r
       snapshot([win("5h", { utilization: 0.5, reset: now + 30 * 60_000 })]),
     );
 
-    expect(withKnown.mgr.pick()?.name).toBe("known-soon");
+    // "unknown" has no snapshot -> expiryReset null -> probe-first picks it so
+    // its real headers get refreshed.
+    expect(withKnown.mgr.pick()?.name).toBe("unknown");
   } finally {
     rmSync(withKnown.poolDir, { recursive: true, force: true });
   }
 
   const allUnknown = tempPool(["busy", "idle"]);
   try {
+    // Both unknown -> tie on expiryReset -> fewer-requests tie-break picks idle.
     allUnknown.mgr.recordSuccess("busy", { input_tokens: 1, output_tokens: 1 }, 0);
     expect(allUnknown.mgr.pick()?.name).toBe("idle");
   } finally {
     rmSync(allUnknown.poolDir, { recursive: true, force: true });
+  }
+});
+
+test("expiring: a probed account ranks by real reset once its snapshot arrives", () => {
+  const { poolDir, mgr } = tempPool(["known-later", "probed"]);
+  try {
+    const now = Date.now();
+    // known-later: live 7d that resets in 3 days.
+    mgr.recordRateLimitSnapshot("known-later", snapshot([win("7d", { utilization: 0.3, reset: now + 3 * 86_400_000 })]));
+
+    // probed has no data yet -> picked first.
+    expect(mgr.pick()?.name).toBe("probed");
+
+    // Its response arrives with a LATER 7d reset than known-later.
+    mgr.recordRateLimitSnapshot("probed", snapshot([win("7d", { utilization: 0.3, reset: now + 5 * 86_400_000 })]));
+
+    // Now both are known; known-later resets sooner -> it wins.
+    expect(mgr.pick()?.name).toBe("known-later");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("expiring: multiple no-data accounts are probed round-robin, not one repeatedly", () => {
+  const { poolDir, mgr } = tempPool(["a", "b", "c"]);
+  try {
+    // No snapshots -> all tie on null expiryReset and gate headroom 1 and 0
+    // requests -> pickRoundRobin cycles them.
+    const picks = new Set([mgr.pick()?.name, mgr.pick()?.name, mgr.pick()?.name]);
+    expect(picks.size).toBe(3);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
   }
 });
 

@@ -892,9 +892,9 @@ function candidateGateHeadroom(usage: AccountUsage, modelFamily: string | null, 
 
 function compareNullableReset(a: number | null, b: number | null): number {
   if (a != null && b != null) return a - b;
-  if (a != null) return -1;
-  if (b != null) return 1;
-  return 0;
+  if (a == null && b == null) return 0;
+  // null == "no usable expiry data" -> probe it first to refresh real headers.
+  return a == null ? -1 : 1;
 }
 
 function compareExpiringCandidates(a: ExpiringCandidate, b: ExpiringCandidate, affinityName?: string): number {
