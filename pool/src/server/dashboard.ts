@@ -117,6 +117,25 @@ export function dashboardHtml(): string {
     font-size: 12.5px; color: var(--warn); }
   .note.err { color: var(--err); }
 
+  /* Summary table: one glance row per account above the detail cards */
+  .summary-tbl { background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    overflow: hidden; box-shadow: var(--shadow); margin-bottom: 26px; }
+  .summary-tbl table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  .summary-tbl th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--muted); font-weight: 600; padding: 10px 14px; border-bottom: 1px solid var(--border);
+    background: var(--surface-2); }
+  .summary-tbl td { padding: 10px 14px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  .summary-tbl tr:last-child td { border-bottom: none; }
+  .summary-tbl tr.acct:hover { background: var(--surface-2); cursor: pointer; }
+  .summary-tbl .c-dot { width: 24px; padding-right: 0; }
+  .summary-tbl .prov { font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+  .summary-tbl .mini { display: flex; align-items: center; gap: 8px; min-width: 120px; }
+  .summary-tbl .mini .bar { flex: 1; }
+  .summary-tbl .mini .pct { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 12px;
+    width: 34px; text-align: right; }
+  .summary-tbl td.num { font-variant-numeric: tabular-nums; }
+  .summary-tbl td.muted { color: var(--muted); }
+
   /* Attention banner */
   .banner { display: none; background: var(--surface); border: 1px solid var(--border);
     border-left: 3px solid var(--warn); border-radius: 12px; padding: 14px 18px; margin-bottom: 20px;
@@ -205,6 +224,7 @@ export function dashboardHtml(): string {
 <main>
   <div class="routing-panel" id="routing-panel"></div>
   <div class="banner" id="banner"></div>
+  <div class="summary-tbl" id="summary" style="display:none"></div>
   <div class="grid" id="grid"></div>
 
   <section class="onboard" id="onboard">
@@ -323,6 +343,40 @@ function windowBar(w) {
     + '</span></div><div class="bar"><span style="width:' + pct + '%"></span></div></div>';
 }
 
+// Compact glance row: status dot, name (+next tag), plan, account-wide 5h/7d
+// mini-bars, priority, recency. Model-scoped windows stay on the detail card.
+function summaryRowHtml(a, isNext) {
+  const dot = a.available ? "ok" : (a.authenticated ? "warn" : "err");
+  const rl = a.usage.rateLimitStatus;
+  const wins = (rl && Array.isArray(rl.windows) ? rl.windows : [])
+    .filter((w) => w.utilization != null && !w.model);
+  const winCell = (key) => {
+    const w = wins.find((x) => x.key === key);
+    const pct = w ? Math.min(100, Math.max(0, w.utilization * 100)) : 0;
+    const label = w ? pct.toFixed(0) + "%" : "–";
+    return '<td><div class="mini"><div class="bar"><span style="width:' + pct
+      + '%"></span></div><span class="pct">' + label + "</span></div></td>";
+  };
+  const pr = a.priority == null ? 100 : a.priority;
+  return '<tr class="acct" data-scroll="' + esc(a.name) + '">'
+    + '<td class="c-dot"><span class="dot ' + dot + '"></span></td>'
+    + '<td><span class="acct-name">' + esc(a.name) + "</span>"
+    + (isNext ? ' <span class="badge next">next</span>' : "")
+    + '<div class="prov">' + esc(a.provider || "anthropic") + "</div></td>"
+    + '<td><span class="chip plan">' + esc(a.subscriptionType || "unknown") + "</span></td>"
+    + winCell("5h") + winCell("7d")
+    + '<td class="num">' + pr + "</td>"
+    + '<td class="muted">' + ago(a.usage.lastUsedAt) + "</td></tr>";
+}
+
+function summaryTableHtml(accounts, nextAcct) {
+  if (!accounts.length) return "";
+  const rows = accounts.map((a) => summaryRowHtml(a, a.name === nextAcct)).join("");
+  return "<table><thead><tr><th></th><th>Account</th><th>Plan</th><th>5h window</th>"
+    + "<th>7d window</th><th>Priority</th><th>Last used</th></tr></thead><tbody>"
+    + rows + "</tbody></table>";
+}
+
 function card(a, isNext) {
   const dot = a.available ? "ok" : (a.authenticated ? "warn" : "err");
   const state = a.available ? "Ready" : (a.authenticated ? "Sidelined" : "Logged out");
@@ -404,6 +458,7 @@ async function refresh() {
       grid.innerHTML = "";
       onboard.style.display = "block";
       banner.style.display = "none";
+      document.getElementById("summary").style.display = "none";
     } else {
       onboard.style.display = "none";
       const routing = d.routing || { tiers: [], nextPick: null, activeTier: null };
@@ -431,6 +486,11 @@ async function refresh() {
             + (t.priority === routing.activeTier ? " · active" : "") + "</span></div>";
         return '<section class="tier">' + head + '<div class="tier-grid">' + cardsHtml + "</div></section>";
       }).join("");
+
+      const summary = document.getElementById("summary");
+      const ordered = groups.flatMap((t) => t.accounts).map((n) => byName[n]).filter(Boolean);
+      summary.innerHTML = summaryTableHtml(ordered, nextAcct);
+      summary.style.display = ordered.length ? "block" : "none";
 
       const panel = document.getElementById("routing-panel");
       const panelHtml = routingPanelHtml(routing);
@@ -471,6 +531,17 @@ async function refresh() {
           });
           refresh();
         } catch (e) { /* transient; next poll will reconcile */ }
+      });
+    });
+
+    document.querySelectorAll("[data-scroll]").forEach((row) => {
+      row.addEventListener("click", () => {
+        const el = document.getElementById("card-" + row.getAttribute("data-scroll"));
+        if (!el) return;
+        el.scrollIntoView({ behavior: "smooth", block: "center" });
+        el.classList.remove("flash");
+        void el.offsetWidth; // restart animation on repeat clicks
+        el.classList.add("flash");
       });
     });
   } catch (e) {

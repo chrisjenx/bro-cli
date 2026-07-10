@@ -120,7 +120,11 @@ test("card() renders a rolled-over window instead of a stale reset countdown", (
   expect(html).toContain("rolled over — awaiting refresh");
 });
 
-function loadFns(): { card: (a: unknown, isNext?: boolean) => string; tierLabel: (p: number) => string } {
+function loadFns(): {
+  card: (a: unknown, isNext?: boolean) => string;
+  tierLabel: (p: number) => string;
+  summaryTableHtml: (accounts: unknown[], nextAcct: string | null) => string;
+} {
   const html = dashboardHtml();
   const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
   if (!script) throw new Error("dashboard <script> block not found");
@@ -131,7 +135,7 @@ function loadFns(): { card: (a: unknown, isNext?: boolean) => string; tierLabel:
     "document",
     "localStorage",
     "matchMedia",
-    `${stubbed}\nreturn { card, tierLabel };`,
+    `${stubbed}\nreturn { card, tierLabel, summaryTableHtml };`,
   );
   const noopEl = { addEventListener() {}, setAttribute() {}, getAttribute() { return null; }, textContent: "", style: {} };
   const doc = {
@@ -224,4 +228,41 @@ test("card() merges request count and recency into one row", () => {
   expect(html).toContain("10 · ");           // totalRequests · ago(lastUsedAt)
   expect(html).not.toContain("Total requests");
   expect(html).not.toContain("Last used");
+});
+
+test("summaryTableHtml renders one row per account with dot, next tag, windows, priority", () => {
+  const { summaryTableHtml } = loadFns();
+  const a = baseAccount({
+    name: "alpha",
+    priority: 100,
+    usage: {
+      rateLimitStatus: {
+        unifiedStatus: "allowed",
+        windows: [
+          { key: "5h", model: null, status: "allowed", utilization: 0.12, reset: Date.now() + 3600_000 },
+          { key: "7d", model: null, status: "allowed", utilization: 0.07, reset: Date.now() + 86_400_000 },
+          { key: "7d-fable", model: "fable", status: "allowed", utilization: 0.5, reset: Date.now() + 86_400_000 },
+        ],
+      },
+    },
+  });
+  const b = baseAccount({ name: "beta", priority: 50, usage: { lastUsedAt: null } });
+  const html = summaryTableHtml([a, b], "alpha");
+  expect(html).toContain("alpha");
+  expect(html).toContain("beta");
+  expect((html.match(/<tr class="acct"/g) || []).length).toBe(2);
+  expect(html).toContain("12%");           // alpha 5h
+  expect(html).toContain("7%");            // alpha 7d (account-wide only)
+  expect(html).not.toContain("50%");       // model-scoped fable window excluded
+  expect(html).toMatch(/data-scroll="alpha"/);
+  // Only the routed account carries the next tag.
+  const alphaRow = html.slice(html.indexOf("alpha"), html.indexOf("beta"));
+  expect(alphaRow).toContain("next");
+  // beta has no live windows -> em-dash placeholders, and "never" for last used.
+  expect(html).toContain("never");
+});
+
+test("summaryTableHtml is empty for an empty pool", () => {
+  const { summaryTableHtml } = loadFns();
+  expect(summaryTableHtml([], null)).toBe("");
 });
