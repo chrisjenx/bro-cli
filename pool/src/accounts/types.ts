@@ -94,6 +94,43 @@ export function windowModelOf(key: string): string | null {
   return scopes.length > 0 ? scopes.join("-").toLowerCase() : null;
 }
 
+/**
+ * Duration in milliseconds encoded by a window key's duration token, or null when
+ * the key carries no duration token (e.g. "overage"). Tolerates model scopes and
+ * `-`/`_` separators: "5h" → 5h, "7d-fable" → 7d, "7d_oi" → 7d. Units mirror
+ * DURATION_TOKEN (min/m = minute, h = hour, d = day, w = week, mo = month≈30d).
+ */
+export function windowDurationMs(key: string): number | null {
+  const token = key.split(/[-_]/).find((t) => DURATION_TOKEN.test(t));
+  if (!token) return null;
+  const m = /^(\d+)(mo|min|hrs|hr|days|day|wk|[hdwm])$/i.exec(token);
+  if (!m) return null;
+  const n = Number.parseInt(m[1]!, 10);
+  const MIN = 60_000;
+  const H = 60 * MIN;
+  const D = 24 * H;
+  switch (m[2]!.toLowerCase()) {
+    case "min":
+    case "m":
+      return n * MIN;
+    case "h":
+    case "hr":
+    case "hrs":
+      return n * H;
+    case "d":
+    case "day":
+    case "days":
+      return n * D;
+    case "w":
+    case "wk":
+      return n * 7 * D;
+    case "mo":
+      return n * 30 * D;
+    default:
+      return null;
+  }
+}
+
 /** Account-wide windows first, then model-scoped, stable by key. */
 export function sortRateLimitWindows(windows: RateLimitWindow[]): RateLimitWindow[] {
   return [...windows].sort((a, b) => {
