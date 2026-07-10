@@ -66,10 +66,10 @@ export interface Config {
   /** Account routing policy: blended weighted score by default. */
   routingStrategy: "weighted" | "expiring" | "headroom";
   /**
-   * Minimum remaining headroom for an account to stay eligible in the `expiring`
-   * strategy, measured over the gate set — the tightest binding window except the
-   * account-wide 7d (which we deliberately drain). In practice this is the 5-hour
-   * window, plus any model-scoped window for model requests.
+   * Minimum remaining headroom for an account to stay eligible in the `weighted`
+   * and `expiring` strategies, measured over the gate set — the tightest binding
+   * window except the account-wide 7d (which we deliberately drain). In practice
+   * this is the 5-hour window, plus any model-scoped window for model requests.
    */
   routingMinHeadroom: number;
   /** Log a line when a request fails over from one account to another. */
