@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, utimesSync
 import { join } from "path";
 import { tmpdir } from "os";
 import { loadConfig, type Config } from "../config.ts";
-import { AccountManager, type KeychainOps } from "./manager.ts";
+import { AccountManager, type KeychainOps, DEFAULT_WEIGHT, isValidWeight } from "./manager.ts";
 import type { RateLimitSnapshot, RateLimitWindow } from "./types.ts";
 import { OPENAI_CREDS_FILENAME } from "./types.ts";
 
@@ -1030,4 +1030,63 @@ test("markRateLimited falls back to the synthetic cooldown when no future blocki
   } finally {
     rmSync(poolDir, { recursive: true, force: true });
   }
+});
+
+describe("routing weight", () => {
+  test("weightFor defaults to 1 and setWeight round-trips", () => {
+    const { poolDir, mgr } = tempPool(["a"]);
+    try {
+      expect(mgr.weightFor("a")).toBe(1);
+      mgr.setWeight("a", 2.5);
+      expect(mgr.weightFor("a")).toBe(2.5);
+      expect(mgr.getAccount("a").weight).toBe(2.5);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("setWeight preserves priority and setPriority preserves weight", () => {
+    const { poolDir, mgr } = tempPool(["a"]);
+    try {
+      mgr.setPriority("a", 5);
+      mgr.setWeight("a", 3);
+      expect(mgr.priorityFor("a")).toBe(5);
+      mgr.setPriority("a", 7);
+      expect(mgr.weightFor("a")).toBe(3);
+      expect(mgr.priorityFor("a")).toBe(7);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("malformed weight in routing.json falls back to 1", () => {
+    const { poolDir, mgr } = tempPool(["a"]);
+    try {
+      writeFileSync(join(poolDir, "accounts", "a", "routing.json"), '{"priority": 1, "weight": "big"}');
+      expect(mgr.weightFor("a")).toBe(1);
+      expect(mgr.priorityFor("a")).toBe(1);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("isValidWeight accepts [0.1,10] numbers and rejects everything else", () => {
+    expect(isValidWeight(0.1)).toBe(true);
+    expect(isValidWeight(10)).toBe(true);
+    expect(isValidWeight(1.5)).toBe(true);
+    expect(isValidWeight(0.05)).toBe(false);
+    expect(isValidWeight(11)).toBe(false);
+    expect(isValidWeight(NaN)).toBe(false);
+    expect(isValidWeight("2")).toBe(false);
+  });
+
+  test("setWeight rejects out-of-range values", () => {
+    const { poolDir, mgr } = tempPool(["a"]);
+    try {
+      expect(() => mgr.setWeight("a", 0)).toThrow();
+      expect(() => mgr.setWeight("missing", 1)).toThrow();
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
 });

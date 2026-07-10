@@ -42,6 +42,16 @@ export function isValidPriority(n: unknown): n is number {
   return typeof n === "number" && Number.isInteger(n) && n >= 0;
 }
 
+/** Manual routing weight bounds; a soft bias multiplier within a priority tier. */
+export const DEFAULT_WEIGHT = 1;
+export const MIN_WEIGHT = 0.1;
+export const MAX_WEIGHT = 10;
+
+/** The single source of truth for a valid weight: a finite number in [0.1, 10]. */
+export function isValidWeight(n: unknown): n is number {
+  return typeof n === "number" && Number.isFinite(n) && n >= MIN_WEIGHT && n <= MAX_WEIGHT;
+}
+
 /** One step of the routing decision, showing where the chosen account stood. */
 export interface NextPickFactor {
   /** Short label, e.g. "Priority tier", "5h gate", "7d expiry", "Tie-break". */
@@ -87,8 +97,8 @@ export class AccountManager {
   /** Round-robin cursor for tie-breaking least-loaded selection. */
   private rrCursor = 0;
   private keychain: KeychainOps;
-  /** Per-account priority cache, keyed to routing.json's mtime (see priorityFor). */
-  private priorityCache = new Map<string, { mtimeMs: number; priority: number }>();
+  /** Per-account routing.json cache, keyed to the file's mtime (see routingFileFor). */
+  private routingCache = new Map<string, { mtimeMs: number; priority: number; weight: number }>();
 
   constructor(config: Config, keychain: KeychainOps = defaultKeychainOps) {
     this.config = config;
@@ -195,40 +205,66 @@ export class AccountManager {
    * every request. Returns DEFAULT_PRIORITY when the file is missing, unreadable,
    * or holds a non-integer/negative value — routing must never throw on this.
    */
-  priorityFor(name: string): number {
+  private routingFileFor(name: string): { priority: number; weight: number } {
+    const fallback = { priority: DEFAULT_PRIORITY, weight: DEFAULT_WEIGHT };
     const path = this.routingPath(name);
     let mtimeMs: number;
     try {
       mtimeMs = statSync(path).mtimeMs;
     } catch {
-      // No routing.json yet (or unreadable) — default, and drop any stale cache.
-      this.priorityCache.delete(name);
-      return DEFAULT_PRIORITY;
+      this.routingCache.delete(name);
+      return fallback;
     }
-    const cached = this.priorityCache.get(name);
-    if (cached && cached.mtimeMs === mtimeMs) return cached.priority;
+    const cached = this.routingCache.get(name);
+    if (cached && cached.mtimeMs === mtimeMs) return cached;
     let priority = DEFAULT_PRIORITY;
+    let weight = DEFAULT_WEIGHT;
     try {
-      const parsed = JSON.parse(readFileSync(path, "utf8")) as { priority?: unknown };
+      const parsed = JSON.parse(readFileSync(path, "utf8")) as { priority?: unknown; weight?: unknown };
       if (isValidPriority(parsed.priority)) priority = parsed.priority;
+      if (isValidWeight(parsed.weight)) weight = parsed.weight;
     } catch {
-      priority = DEFAULT_PRIORITY;
+      /* fall through to defaults */
     }
-    this.priorityCache.set(name, { mtimeMs, priority });
-    return priority;
+    const entry = { mtimeMs, priority, weight };
+    this.routingCache.set(name, entry);
+    return entry;
+  }
+
+  priorityFor(name: string): number {
+    return this.routingFileFor(name).priority;
+  }
+
+  /** Manual routing weight; soft score multiplier, default 1 (see DEFAULT_WEIGHT). */
+  weightFor(name: string): number {
+    return this.routingFileFor(name).weight;
   }
 
   setPriority(name: string, priority: number): void {
     if (!isValidPriority(priority)) {
       throw new Error(`Priority must be a non-negative integer, got ${priority}`);
     }
+    this.writeRoutingField(name, { priority });
+  }
+
+  setWeight(name: string, weight: number): void {
+    if (!isValidWeight(weight)) {
+      throw new Error(`Weight must be a number between ${MIN_WEIGHT} and ${MAX_WEIGHT}, got ${weight}`);
+    }
+    this.writeRoutingField(name, { weight });
+  }
+
+  /** Merge one field into routing.json, preserving the other, then drop the cache. */
+  private writeRoutingField(name: string, patch: { priority?: number; weight?: number }): void {
     if (!existsSync(this.configDirFor(name))) {
       throw new Error(`Account "${name}" does not exist`);
     }
-    writeFileSync(this.routingPath(name), JSON.stringify({ priority }, null, 2));
+    const current = this.routingFileFor(name);
+    const next = { priority: current.priority, weight: current.weight, ...patch };
+    writeFileSync(this.routingPath(name), JSON.stringify(next, null, 2));
     // Drop the cache so the next read re-parses even if the mtime is unchanged
     // (two writes within one filesystem mtime tick would otherwise look stale).
-    this.priorityCache.delete(name);
+    this.routingCache.delete(name);
   }
 
   create(name: string): void {
@@ -382,6 +418,7 @@ export class AccountManager {
       rateLimitTier: oauth?.rateLimitTier ?? null,
       scopes: oauth?.scopes ?? [],
       priority: this.priorityFor(name),
+      weight: this.weightFor(name),
       tokenExpiresAt,
       tokenExpired,
       usage,

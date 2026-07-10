@@ -228,6 +228,8 @@ export interface Account {
   scopes: string[];
   /** Routing priority; lower = preferred. Default 100 (see DEFAULT_PRIORITY). */
   priority: number;
+  /** Manual routing weight; soft score multiplier in [0.1, 10]. Default 1. */
+  weight: number;
   tokenExpiresAt: number | null;
   tokenExpired: boolean;
   usage: AccountUsage;
