@@ -21,7 +21,7 @@ import type {
   RateLimitSnapshot,
   RateLimitWindow,
 } from "./types.ts";
-import { emptyUsage, OPENAI_CREDS_FILENAME, normalizeRateLimitSnapshot, sortRateLimitWindows } from "./types.ts";
+import { emptyUsage, OPENAI_CREDS_FILENAME, normalizeRateLimitSnapshot, sortRateLimitWindows, windowDurationMs } from "./types.ts";
 import {
   deleteKeychainCreds,
   keychainServiceForConfigDir,
@@ -511,25 +511,36 @@ export class AccountManager {
   }
 
   /**
-   * The tied set of expiring-quota winners (soonest viable reset), in pool order.
-   * Pure ranking — see rankHeadroom.
+   * Fully-ranked expiring-strategy candidates (best first). Viable candidates
+   * (gate headroom ≥ min) are preferred; if none are viable we rank them all as
+   * a best-effort fallback. Pure — no round-robin, no mutation — so pick() and
+   * the read-only snapshot share one ordering and never drift.
    */
-  private rankExpiring(pool: Account[], family: string | null, now: number, affinityName?: string): Account[] {
-    const candidates = pool.map((account) => ({
-      account,
-      minHeadroom: candidateMinHeadroom(account.usage, family),
-      earliestReset: candidateEarliestReset(account.usage, family, now),
-      viable: candidateMinHeadroom(account.usage, family) >= this.config.routingMinHeadroom,
-    }));
+  private sortExpiringCandidates(
+    pool: Account[],
+    family: string | null,
+    now: number,
+    affinityName?: string,
+  ): ExpiringCandidate[] {
+    const candidates: ExpiringCandidate[] = pool.map((account) => {
+      const gateHeadroom = candidateGateHeadroom(account.usage, family);
+      return {
+        account,
+        gateHeadroom,
+        expiryReset: candidateExpiryReset(account.usage, family, now),
+        viable: gateHeadroom >= this.config.routingMinHeadroom,
+      };
+    });
     const viable = candidates.filter((c) => c.viable);
     const chosen = viable.length > 0 ? viable : candidates;
+    return [...chosen].sort((a, b) => compareExpiringCandidates(a, b, affinityName));
+  }
 
-    let best = chosen[0]!;
-    for (const c of chosen.slice(1)) {
-      if (compareExpiringCandidates(c, best, affinityName) < 0) best = c;
-    }
-
-    return chosen.filter((c) => compareExpiringCandidates(c, best, affinityName) === 0).map((c) => c.account);
+  /** The tied set of expiring winners (see sortExpiringCandidates), in ranked order. */
+  private rankExpiring(pool: Account[], family: string | null, now: number, affinityName?: string): Account[] {
+    const sorted = this.sortExpiringCandidates(pool, family, now, affinityName);
+    const best = sorted[0]!;
+    return sorted.filter((c) => compareExpiringCandidates(c, best, affinityName) === 0).map((c) => c.account);
   }
 
   private pickRoundRobin(tied: Account[]): Account {
@@ -587,8 +598,8 @@ export class AccountManager {
     const best = this.previewBest(tierPool, family, now);
     const reason = formatNextPickReason(
       minPriority,
-      candidateEarliestReset(best.usage, family, now),
-      candidateMinHeadroom(best.usage, family),
+      candidateExpiryReset(best.usage, family, now),
+      candidateGateHeadroom(best.usage, family),
       now,
     );
     return { activeTier: minPriority, nextPick: { account: best.name, reason }, tiers };
@@ -700,8 +711,8 @@ function bindingWindows(rl: RateLimitSnapshot | null, modelFamily: string | null
 
 interface ExpiringCandidate {
   account: Account;
-  minHeadroom: number;
-  earliestReset: number | null;
+  gateHeadroom: number;
+  expiryReset: number | null;
   viable: boolean;
 }
 
@@ -727,11 +738,47 @@ function candidateMinHeadroom(usage: AccountUsage, modelFamily: string | null): 
   return Math.max(0, 1 - Math.max(...utilizations));
 }
 
-function candidateEarliestReset(usage: AccountUsage, modelFamily: string | null, now: number): number | null {
-  const resets = bindingWindows(usage.rateLimitStatus, modelFamily)
+/**
+ * The "expiry" window for a request is the longest-duration binding window
+ * (account-wide 7d, or a model-scoped 7d-<model> when it is the longest for a
+ * model request). Its reset — soonest among any duration ties, and only when in
+ * the future and not fully spent — is the primary ranking key: the soonest to
+ * roll over is spent first so its allowance isn't wasted. null when unknown.
+ */
+function candidateExpiryReset(usage: AccountUsage, modelFamily: string | null, now: number): number | null {
+  const windows = bindingWindows(usage.rateLimitStatus, modelFamily);
+  const maxDur = Math.max(-1, ...windows.map((w) => windowDurationMs(w.key) ?? -1));
+  if (maxDur < 0) return null;
+  const resets = windows
+    .filter((w) => (windowDurationMs(w.key) ?? -1) === maxDur)
     .filter((w) => w.reset != null && w.reset > now && (w.utilization == null || w.utilization < 1))
     .map((w) => w.reset!);
   return resets.length > 0 ? Math.min(...resets) : null;
+}
+
+/**
+ * Headroom [0, 1] that gates eligibility and breaks headroom ties for the
+ * expiring strategy: the tightest binding window EXCEPT the account-wide expiry
+ * (longest-duration account-wide) window, which is deliberately excluded so we
+ * keep draining it ("pending headroom on the 5-hour window", not the 7-day one).
+ * The exclusion only applies when a shorter account-wide window also exists, so
+ * a lone 5h window still gates. 1 (full) when the gate set is empty / no snapshot.
+ */
+function candidateGateHeadroom(usage: AccountUsage, modelFamily: string | null): number {
+  const windows = bindingWindows(usage.rateLimitStatus, modelFamily);
+  const accountWide = windows.filter((w) => w.model == null);
+  let excluded: RateLimitWindow | null = null;
+  if (accountWide.length >= 2) {
+    excluded = accountWide.reduce((a, w) =>
+      (windowDurationMs(w.key) ?? -1) > (windowDurationMs(a.key) ?? -1) ? w : a,
+    );
+  }
+  const utilizations = windows
+    .filter((w) => w !== excluded)
+    .map((w) => w.utilization)
+    .filter((u): u is number => u != null);
+  if (utilizations.length === 0) return 1;
+  return Math.max(0, 1 - Math.max(...utilizations));
 }
 
 function compareNullableReset(a: number | null, b: number | null): number {
@@ -742,9 +789,9 @@ function compareNullableReset(a: number | null, b: number | null): number {
 }
 
 function compareExpiringCandidates(a: ExpiringCandidate, b: ExpiringCandidate, affinityName?: string): number {
-  const reset = compareNullableReset(a.earliestReset, b.earliestReset);
+  const reset = compareNullableReset(a.expiryReset, b.expiryReset);
   if (reset !== 0) return reset;
-  if (a.minHeadroom !== b.minHeadroom) return b.minHeadroom - a.minHeadroom;
+  if (a.gateHeadroom !== b.gateHeadroom) return b.gateHeadroom - a.gateHeadroom;
   if (a.account.usage.windowRequests !== b.account.usage.windowRequests) {
     return a.account.usage.windowRequests - b.account.usage.windowRequests;
   }

@@ -104,6 +104,86 @@ test("pick() skips soonest-resetting quota when it is below minimum headroom", a
   }
 });
 
+test("expiring: ranks by soonest 7d reset even when 5h resets are ordered the opposite way", () => {
+  const { poolDir, mgr } = tempPool(["burn-me", "keep"]);
+  try {
+    const now = Date.now();
+    // burn-me: 5h resets LATER, but its 7d window expires SOONER -> should win.
+    mgr.recordRateLimitSnapshot(
+      "burn-me",
+      snapshot([
+        win("5h", { utilization: 0.2, reset: now + 4 * 60 * 60_000 }),
+        win("7d", { utilization: 0.3, reset: now + 2 * 86_400_000 }),
+      ]),
+    );
+    // keep: 5h resets sooner (old code would pick this), but 7d expires later.
+    mgr.recordRateLimitSnapshot(
+      "keep",
+      snapshot([
+        win("5h", { utilization: 0.2, reset: now + 20 * 60_000 }),
+        win("7d", { utilization: 0.3, reset: now + 5 * 86_400_000 }),
+      ]),
+    );
+
+    expect(mgr.pick()?.name).toBe("burn-me");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("expiring: a nearly-spent account-wide 7d does NOT bench the account (7d excluded from the gate)", () => {
+  const { poolDir, mgr } = tempPool(["almost-out", "fresh"]);
+  try {
+    const now = Date.now();
+    // almost-out: 7d 95% used (headroom 0.05) but healthy 5h, and expires soonest.
+    mgr.recordRateLimitSnapshot(
+      "almost-out",
+      snapshot([
+        win("5h", { utilization: 0.2, reset: now + 60 * 60_000 }),
+        win("7d", { utilization: 0.95, reset: now + 1 * 86_400_000 }),
+      ]),
+    );
+    mgr.recordRateLimitSnapshot(
+      "fresh",
+      snapshot([
+        win("5h", { utilization: 0.2, reset: now + 60 * 60_000 }),
+        win("7d", { utilization: 0.1, reset: now + 5 * 86_400_000 }),
+      ]),
+    );
+
+    // Old min-across-all gate would bench almost-out (min headroom 0.05 < 0.1);
+    // the new gate ignores the account-wide 7d, so it stays viable and wins.
+    expect(mgr.pick()?.name).toBe("almost-out");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("expiring: soonest-7d account is skipped when its 5h headroom is below the minimum", () => {
+  const { poolDir, mgr } = tempPool(["soon-but-hot", "later-ok"]);
+  try {
+    const now = Date.now();
+    mgr.recordRateLimitSnapshot(
+      "soon-but-hot",
+      snapshot([
+        win("5h", { utilization: 0.95, reset: now + 60 * 60_000 }),
+        win("7d", { utilization: 0.2, reset: now + 1 * 86_400_000 }),
+      ]),
+    );
+    mgr.recordRateLimitSnapshot(
+      "later-ok",
+      snapshot([
+        win("5h", { utilization: 0.3, reset: now + 60 * 60_000 }),
+        win("7d", { utilization: 0.2, reset: now + 5 * 86_400_000 }),
+      ]),
+    );
+
+    expect(mgr.pick()?.name).toBe("later-ok");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
 test("model-family reset timing only applies to matching model requests", async () => {
   const { poolDir, mgr } = tempPool(["fable-soon", "fable-later"]);
   try {

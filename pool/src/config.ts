@@ -57,7 +57,12 @@ export interface Config {
   rateLimitCooldownMs: number;
   /** Account routing policy: spend soon-expiring viable quota by default. */
   routingStrategy: "expiring" | "headroom";
-  /** Minimum remaining headroom required for a rate-limit window to be preferred. */
+  /**
+   * Minimum remaining headroom for an account to stay eligible in the `expiring`
+   * strategy, measured over the gate set — the tightest binding window except the
+   * account-wide 7d (which we deliberately drain). In practice this is the 5-hour
+   * window, plus any model-scoped window for model requests.
+   */
   routingMinHeadroom: number;
   /** Log a line when a request fails over from one account to another. */
   logFailover: boolean;
