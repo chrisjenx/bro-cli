@@ -40,6 +40,9 @@ export function startServer(config: Config): void {
   const mgr = new AccountManager(config);
   const modelTable = loadModelTable(config.modelsFile);
 
+  // Sweep idle session pins so load counts decay even when traffic stops.
+  setInterval(() => mgr.pruneSessions(), 60_000);
+
   const server = Bun.serve({
     hostname: config.host,
     port: config.port,

@@ -30,7 +30,13 @@ function tempPool(
       }),
     );
   }
-  const config = loadConfig({ poolDir, accountsDir, usageFile: join(poolDir, "usage.json"), ...overrides });
+  const config = loadConfig({
+    poolDir,
+    accountsDir,
+    usageFile: join(poolDir, "usage.json"),
+    sessionsFile: join(poolDir, "sessions.json"),
+    ...overrides,
+  });
   return { poolDir, mgr: keychain ? new AccountManager(config, keychain) : new AccountManager(config) };
 }
 
@@ -236,7 +242,12 @@ test("expiring: stale windows are ignored after a cold reload from usage.json", 
     );
 
     // Fresh manager on the same pool dir -> loadState() reads usage.json.
-    const config = loadConfig({ poolDir, accountsDir: join(poolDir, "accounts"), usageFile: join(poolDir, "usage.json") });
+    const config = loadConfig({
+      poolDir,
+      accountsDir: join(poolDir, "accounts"),
+      usageFile: join(poolDir, "usage.json"),
+      sessionsFile: join(poolDir, "sessions.json"),
+    });
     const reloaded = new AccountManager(config);
     expect(reloaded.pick()?.name).toBe("stale-5h");
   } finally {
@@ -270,7 +281,7 @@ test("model-family reset timing only applies to matching model requests", async 
   }
 });
 
-test("session affinity yields to better soon-expiring quota", async () => {
+test("expiring: session pin is a hard pin and beats better expiring quota", async () => {
   const { poolDir, mgr } = tempPool(["soon", "later"]);
   try {
     const now = Date.now();
@@ -278,7 +289,8 @@ test("session affinity yields to better soon-expiring quota", async () => {
     mgr.recordRateLimitSnapshot("soon", snapshot([win("5h", { utilization: 0.5, reset: now + 30 * 60_000 })]));
     mgr.recordRateLimitSnapshot("later", snapshot([win("5h", { utilization: 0.1, reset: now + 5 * 60 * 60_000 })]));
 
-    expect(mgr.pick("session-1")?.name).toBe("soon");
+    // "soon" has better expiring quota, but the pin to "later" is hard now.
+    expect(mgr.pick("session-1")?.name).toBe("later");
   } finally {
     rmSync(poolDir, { recursive: true, force: true });
   }
@@ -568,7 +580,12 @@ test("legacy persisted snapshots (fixed 5h/7d fields) are upgraded on load", asy
       }),
     );
 
-    const config = loadConfig({ poolDir, accountsDir: join(poolDir, "accounts"), usageFile });
+    const config = loadConfig({
+      poolDir,
+      accountsDir: join(poolDir, "accounts"),
+      usageFile,
+      sessionsFile: join(poolDir, "sessions.json"),
+    });
     const fresh = new AccountManager(config);
     const rl = fresh.getAccount("legacy").usage.rateLimitStatus;
     expect(rl?.windows.map((w) => w.key)).toEqual(["5h", "7d"]);
@@ -691,6 +708,7 @@ test("a stale in-memory manager's saveState() doesn't resurrect a removed accoun
       poolDir,
       accountsDir: join(poolDir, "accounts"),
       usageFile: join(poolDir, "usage.json"),
+      sessionsFile: join(poolDir, "sessions.json"),
     });
     const cliMgr = new AccountManager(config);
     cliMgr.remove("gone");
@@ -1085,6 +1103,93 @@ describe("routing weight", () => {
     try {
       expect(() => mgr.setWeight("a", 0)).toThrow();
       expect(() => mgr.setWeight("missing", 1)).toThrow();
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("session ledger integration", () => {
+  test("hard pin: a pinned session stays on its account even when another has better expiring quota", () => {
+    const { poolDir, mgr } = tempPool(["pinned", "better"]);
+    try {
+      const now = Date.now();
+      // "better" would win on soonest 7d reset; the pin must override that.
+      mgr.recordRateLimitSnapshot("pinned", snapshot([
+        win("5h", { utilization: 0.2, reset: now + 3600_000 }),
+        win("7d", { utilization: 0.2, reset: now + 6 * 86_400_000 }),
+      ]));
+      mgr.recordRateLimitSnapshot("better", snapshot([
+        win("5h", { utilization: 0.2, reset: now + 3600_000 }),
+        win("7d", { utilization: 0.2, reset: now + 1 * 86_400_000 }),
+      ]));
+      mgr.setAffinity("sess", "pinned");
+      expect(mgr.pick("sess")?.name).toBe("pinned");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("pin is dropped when the account is rate limited, and the session re-routes", () => {
+    const { poolDir, mgr } = tempPool(["a", "b"]);
+    try {
+      mgr.setAffinity("sess", "a");
+      mgr.markRateLimited("a");
+      expect(mgr.pick("sess")?.name).toBe("b");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("pin yields when its account leaves the active tier", () => {
+    const { poolDir, mgr } = tempPool(["primary", "fallback"]);
+    try {
+      mgr.setPriority("primary", 1);
+      mgr.setPriority("fallback", 2);
+      mgr.setAffinity("sess", "fallback"); // pinned during a primary outage
+      expect(mgr.pick("sess")?.name).toBe("primary"); // primary recovered: move back
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("pins survive a manager restart", () => {
+    const { poolDir, mgr } = tempPool(["a", "b"]);
+    try {
+      mgr.setAffinity("sess", "b");
+      const config = loadConfig({
+        poolDir,
+        accountsDir: join(poolDir, "accounts"),
+        usageFile: join(poolDir, "usage.json"),
+        sessionsFile: join(poolDir, "sessions.json"),
+      });
+      const reborn = new AccountManager(config);
+      expect(reborn.pick("sess")?.name).toBe("b");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("activeSessions on Account counts live pins", () => {
+    const { poolDir, mgr } = tempPool(["a", "b"]);
+    try {
+      mgr.setAffinity("s1", "a");
+      mgr.setAffinity("s2", "a");
+      mgr.setAffinity("s3", "b");
+      expect(mgr.getAccount("a").activeSessions).toBe(2);
+      expect(mgr.getAccount("b").activeSessions).toBe(1);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("pick() itself pins the chosen account for the session", () => {
+    const { poolDir, mgr } = tempPool(["a", "b"]);
+    try {
+      const first = mgr.pick("sess")!;
+      // Round-robin would alternate without a pin; repeated picks must not.
+      expect(mgr.pick("sess")?.name).toBe(first.name);
+      expect(mgr.pick("sess")?.name).toBe(first.name);
     } finally {
       rmSync(poolDir, { recursive: true, force: true });
     }

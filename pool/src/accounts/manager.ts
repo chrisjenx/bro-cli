@@ -28,6 +28,7 @@ import {
   readKeychainCreds,
   readKeychainCredsForConfigDir,
 } from "./keychain.ts";
+import { SessionLedger } from "./sessions.ts";
 import type { CliUsage } from "../subprocess/types.ts";
 
 /** Priority assigned to any account without a routing.json. Lower = preferred. */
@@ -92,8 +93,8 @@ const defaultKeychainOps: KeychainOps = { read: readKeychainCreds, delete: delet
 export class AccountManager {
   private config: Config;
   private usage: Record<string, AccountUsage> = {};
-  /** Maps a caller session key to the account chosen for it (stickiness). */
-  private sessionAffinity = new Map<string, string>();
+  /** Persistent session→account pins + per-account active-session load. */
+  private sessions: SessionLedger;
   /** Round-robin cursor for tie-breaking least-loaded selection. */
   private rrCursor = 0;
   private keychain: KeychainOps;
@@ -103,6 +104,7 @@ export class AccountManager {
   constructor(config: Config, keychain: KeychainOps = defaultKeychainOps) {
     this.config = config;
     this.keychain = keychain;
+    this.sessions = new SessionLedger(config.sessionsFile, config.sessionIdleMs);
     mkdirSync(this.config.accountsDir, { recursive: true });
     this.loadState();
   }
@@ -419,6 +421,7 @@ export class AccountManager {
       scopes: oauth?.scopes ?? [],
       priority: this.priorityFor(name),
       weight: this.weightFor(name),
+      activeSessions: this.sessions.activeCount(name),
       tokenExpiresAt,
       tokenExpired,
       usage,
@@ -450,11 +453,11 @@ export class AccountManager {
   }
 
   /**
-   * Pick an account to serve a request. The default strategy spends viable quota
-   * with the soonest known reset first, so expiring capacity is used before
-   * longer-lived capacity. Session affinity is kept as a tiebreaker rather than
-   * an absolute pin; the optional headroom strategy preserves the old sticky,
-   * most-headroom-first behavior.
+   * Pick an account to serve a request. A session with a live pin always stays
+   * on its account (see the hard-pin block below); otherwise the default
+   * strategy spends viable quota with the soonest known reset first, so
+   * expiring capacity is used before longer-lived capacity, and the optional
+   * headroom strategy prefers the most-headroom account.
    *
    * @param exclude account names to skip (e.g. ones already tried this request
    *   during failover).
@@ -472,7 +475,6 @@ export class AccountManager {
   ): Account | null {
     const now = Date.now();
     const family = modelFamily ?? null;
-    const affinityKey = sessionKey ? `${provider}:${sessionKey}` : undefined;
 
     const available = this.listAccounts().filter((a) => this.usableFor(a, provider, family, now, exclude));
     if (available.length === 0) return null;
@@ -484,31 +486,26 @@ export class AccountManager {
     const minPriority = Math.min(...available.map((a) => a.priority));
     const tierPool = available.filter((a) => a.priority === minPriority);
 
-    let prior: Account | null = null;
-    if (affinityKey) {
-      const priorName = this.sessionAffinity.get(affinityKey);
-      if (priorName && !exclude?.has(priorName)) {
-        const acct = this.getAccount(priorName);
-        // Honor the pin only if the account is still usable AND in the active
-        // tier — a session pinned to a fallback during a primary outage must
-        // move back to primary once primary recovers.
+    if (sessionKey) {
+      const pinned = this.sessions.get(provider, sessionKey, now);
+      if (pinned && !exclude?.has(pinned)) {
+        const acct = this.getAccount(pinned);
+        // Hard pin: switching accounts mid-session re-pays the full context
+        // cost, so an existing session stays put while its account is usable
+        // AND in the active tier — a session pinned to a fallback during a
+        // primary outage must still move back once primary recovers.
         if (this.usableFor(acct, provider, family, now, exclude) && acct.priority === minPriority) {
-          prior = acct;
-        } else {
-          this.sessionAffinity.delete(affinityKey);
+          this.sessions.touch(provider, sessionKey, pinned, now);
+          return acct;
         }
       }
     }
 
-    if (this.config.routingStrategy === "headroom") {
-      if (prior) return prior;
-      const best = this.pickByHeadroom(tierPool, family, now);
-      if (affinityKey) this.sessionAffinity.set(affinityKey, best.name);
-      return best;
-    }
-
-    const best = this.pickByExpiringQuota(tierPool, family, now, prior?.name);
-    if (affinityKey) this.sessionAffinity.set(affinityKey, best.name);
+    const best =
+      this.config.routingStrategy === "headroom"
+        ? this.pickByHeadroom(tierPool, family, now)
+        : this.pickByExpiringQuota(tierPool, family, now);
+    if (sessionKey) this.sessions.touch(provider, sessionKey, best.name, now);
     return best;
   }
 
@@ -516,13 +513,8 @@ export class AccountManager {
     return this.pickRoundRobin(this.rankHeadroom(available, family, now));
   }
 
-  private pickByExpiringQuota(
-    available: Account[],
-    family: string | null,
-    now: number,
-    affinityName?: string,
-  ): Account {
-    return this.pickRoundRobin(this.rankExpiring(available, family, now, affinityName));
+  private pickByExpiringQuota(available: Account[], family: string | null, now: number): Account {
+    return this.pickRoundRobin(this.rankExpiring(available, family, now));
   }
 
   /**
@@ -556,12 +548,7 @@ export class AccountManager {
    * a best-effort fallback. Pure — no round-robin, no mutation — so pick() and
    * the read-only snapshot share one ordering and never drift.
    */
-  private sortExpiringCandidates(
-    pool: Account[],
-    family: string | null,
-    now: number,
-    affinityName?: string,
-  ): ExpiringCandidate[] {
+  private sortExpiringCandidates(pool: Account[], family: string | null, now: number): ExpiringCandidate[] {
     const candidates: ExpiringCandidate[] = pool.map((account) => {
       const gateHeadroom = candidateGateHeadroom(account.usage, family, now);
       return {
@@ -573,14 +560,14 @@ export class AccountManager {
     });
     const viable = candidates.filter((c) => c.viable);
     const chosen = viable.length > 0 ? viable : candidates;
-    return [...chosen].sort((a, b) => compareExpiringCandidates(a, b, affinityName));
+    return [...chosen].sort(compareExpiringCandidates);
   }
 
   /** The tied set of expiring winners (see sortExpiringCandidates), in ranked order. */
-  private rankExpiring(pool: Account[], family: string | null, now: number, affinityName?: string): Account[] {
-    const sorted = this.sortExpiringCandidates(pool, family, now, affinityName);
+  private rankExpiring(pool: Account[], family: string | null, now: number): Account[] {
+    const sorted = this.sortExpiringCandidates(pool, family, now);
     const best = sorted[0]!;
-    return sorted.filter((c) => compareExpiringCandidates(c, best, affinityName) === 0).map((c) => c.account);
+    return sorted.filter((c) => compareExpiringCandidates(c, best) === 0).map((c) => c.account);
   }
 
   private pickRoundRobin(tied: Account[]): Account {
@@ -642,7 +629,12 @@ export class AccountManager {
 
   /** Pin a session to the account that actually served it (post-failover). */
   setAffinity(sessionKey: string, accountName: string, provider: Provider = "anthropic"): void {
-    this.sessionAffinity.set(`${provider}:${sessionKey}`, accountName);
+    this.sessions.touch(provider, sessionKey, accountName);
+  }
+
+  /** Expire idle session pins; called periodically by the server. */
+  pruneSessions(): void {
+    this.sessions.prune();
   }
 
   // ---- usage recording ---------------------------------------------------
@@ -676,8 +668,8 @@ export class AccountManager {
     u.rateLimitedUntil =
       resetAt ?? blockingWindowReset(u.rateLimitStatus, now) ?? now + this.config.rateLimitCooldownMs;
     u.lastError = "rate limited by Anthropic";
-    // Drop affinity so sessions reroute away from this account.
-    for (const [k, v] of this.sessionAffinity) if (v === name) this.sessionAffinity.delete(k);
+    // Drop pins so sessions reroute away from this account.
+    this.sessions.evictAccount(name);
     this.saveState();
   }
 
@@ -807,7 +799,7 @@ function buildExpiringReason(
     let rule: string;
     if (chosen.gateHeadroom !== runnerUp.gateHeadroom) rule = "more 5h headroom";
     else if (chosen.account.usage.windowRequests !== runnerUp.account.usage.windowRequests) rule = "fewer requests";
-    else rule = "session affinity / round-robin";
+    else rule = "round-robin";
     tiebreakDetail = `broke tie on ${rule}`;
     tiebreakDecisive = true;
   }
@@ -943,16 +935,12 @@ function compareNullableReset(a: number | null, b: number | null): number {
   return a == null ? -1 : 1;
 }
 
-function compareExpiringCandidates(a: ExpiringCandidate, b: ExpiringCandidate, affinityName?: string): number {
+function compareExpiringCandidates(a: ExpiringCandidate, b: ExpiringCandidate): number {
   const reset = compareNullableReset(a.expiryReset, b.expiryReset);
   if (reset !== 0) return reset;
   if (a.gateHeadroom !== b.gateHeadroom) return b.gateHeadroom - a.gateHeadroom;
   if (a.account.usage.windowRequests !== b.account.usage.windowRequests) {
     return a.account.usage.windowRequests - b.account.usage.windowRequests;
-  }
-  if (affinityName) {
-    if (a.account.name === affinityName && b.account.name !== affinityName) return -1;
-    if (b.account.name === affinityName && a.account.name !== affinityName) return 1;
   }
   return 0;
 }

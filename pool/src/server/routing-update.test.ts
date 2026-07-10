@@ -16,7 +16,12 @@ function tempMgr(names: string[]): { poolDir: string; accountsDir: string; mgr: 
       JSON.stringify({ claudeAiOauth: { accessToken: "t" } }),
     );
   }
-  const config = loadConfig({ poolDir, accountsDir, usageFile: join(poolDir, "usage.json") });
+  const config = loadConfig({
+    poolDir,
+    accountsDir,
+    usageFile: join(poolDir, "usage.json"),
+    sessionsFile: join(poolDir, "sessions.json"),
+  });
   return { poolDir, accountsDir, mgr: new AccountManager(config) };
 }
 

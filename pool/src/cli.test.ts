@@ -41,7 +41,12 @@ test("accounts tier <name> <priority> writes routing.json", async () => {
     join(accountsDir, "work", ".credentials.json"),
     JSON.stringify({ claudeAiOauth: { accessToken: "t" } }),
   );
-  const config = loadConfig({ poolDir, accountsDir, usageFile: join(poolDir, "usage.json") });
+  const config = loadConfig({
+    poolDir,
+    accountsDir,
+    usageFile: join(poolDir, "usage.json"),
+    sessionsFile: join(poolDir, "sessions.json"),
+  });
   try {
     const code = await runAccountsCommand(config, ["tier", "work", "1"]);
     expect(code).toBe(0);
@@ -60,7 +65,12 @@ test("accounts tier rejects a bad priority with a non-zero exit code", async () 
     join(accountsDir, "work", ".credentials.json"),
     JSON.stringify({ claudeAiOauth: { accessToken: "t" } }),
   );
-  const config = loadConfig({ poolDir, accountsDir, usageFile: join(poolDir, "usage.json") });
+  const config = loadConfig({
+    poolDir,
+    accountsDir,
+    usageFile: join(poolDir, "usage.json"),
+    sessionsFile: join(poolDir, "sessions.json"),
+  });
   try {
     expect(await runAccountsCommand(config, ["tier", "work", "-1"])).toBe(1);
     expect(await runAccountsCommand(config, ["tier", "ghost", "1"])).toBe(1);

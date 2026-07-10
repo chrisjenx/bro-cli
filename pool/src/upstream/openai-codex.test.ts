@@ -24,7 +24,12 @@ function tempOpenAIPool(accountNames: string[]): { poolDir: string; mgr: Account
       }),
     );
   }
-  const config = loadConfig({ poolDir, accountsDir, usageFile: join(poolDir, "usage.json") });
+  const config = loadConfig({
+    poolDir,
+    accountsDir,
+    usageFile: join(poolDir, "usage.json"),
+    sessionsFile: join(poolDir, "sessions.json"),
+  });
   return { poolDir, mgr: new AccountManager(config) };
 }
 
