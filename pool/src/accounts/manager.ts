@@ -465,7 +465,7 @@ export class AccountManager {
 
     if (this.config.routingStrategy === "headroom") {
       if (prior) return prior;
-      const best = this.pickByHeadroom(tierPool, family);
+      const best = this.pickByHeadroom(tierPool, family, now);
       if (affinityKey) this.sessionAffinity.set(affinityKey, best.name);
       return best;
     }
@@ -475,8 +475,8 @@ export class AccountManager {
     return best;
   }
 
-  private pickByHeadroom(available: Account[], family: string | null): Account {
-    return this.pickRoundRobin(this.rankHeadroom(available, family));
+  private pickByHeadroom(available: Account[], family: string | null, now: number): Account {
+    return this.pickRoundRobin(this.rankHeadroom(available, family, now));
   }
 
   private pickByExpiringQuota(
@@ -494,11 +494,11 @@ export class AccountManager {
    * both pick() (via pickRoundRobin) and the read-only preview can share it and
    * never drift apart.
    */
-  private rankHeadroom(pool: Account[], family: string | null): Account[] {
+  private rankHeadroom(pool: Account[], family: string | null, now: number): Account[] {
     let best = pool[0]!;
-    let bestHeadroom = headroomFraction(best.usage, family);
+    let bestHeadroom = headroomFraction(best.usage, family, now);
     for (const a of pool) {
-      const headroom = headroomFraction(a.usage, family);
+      const headroom = headroomFraction(a.usage, family, now);
       if (
         headroom > bestHeadroom ||
         (headroom === bestHeadroom && a.usage.windowRequests < best.usage.windowRequests)
@@ -509,7 +509,7 @@ export class AccountManager {
     }
     const minLoad = best.usage.windowRequests;
     return pool.filter(
-      (a) => headroomFraction(a.usage, family) === bestHeadroom && a.usage.windowRequests === minLoad,
+      (a) => headroomFraction(a.usage, family, now) === bestHeadroom && a.usage.windowRequests === minLoad,
     );
   }
 
@@ -526,7 +526,7 @@ export class AccountManager {
     affinityName?: string,
   ): ExpiringCandidate[] {
     const candidates: ExpiringCandidate[] = pool.map((account) => {
-      const gateHeadroom = candidateGateHeadroom(account.usage, family);
+      const gateHeadroom = candidateGateHeadroom(account.usage, family, now);
       return {
         account,
         gateHeadroom,
@@ -591,7 +591,7 @@ export class AccountManager {
       // Same winner as pickByHeadroom (max headroom, then fewest requests); a
       // deterministic sort standing in for rankHeadroom + first-in-pool-order.
       const ranked = tierPool
-        .map((a) => ({ account: a, headroom: headroomFraction(a.usage, family) }))
+        .map((a) => ({ account: a, headroom: headroomFraction(a.usage, family, now) }))
         .sort((x, y) => y.headroom - x.headroom || x.account.usage.windowRequests - y.account.usage.windowRequests);
       best = ranked[0]!.account;
       reason = buildHeadroomReason(minPriority, reserveTiers, tierPool.length, ranked);
@@ -806,9 +806,15 @@ function buildHeadroomReason(
  * windows always do; model-scoped windows only when the request's model
  * matches (a spent Fable window shouldn't affect Sonnet traffic).
  */
-function bindingWindows(rl: RateLimitSnapshot | null, modelFamily: string | null): RateLimitWindow[] {
+function bindingWindows(
+  rl: RateLimitSnapshot | null,
+  modelFamily: string | null,
+  now: number,
+): RateLimitWindow[] {
   if (!rl?.windows) return [];
-  return rl.windows.filter((w) => w.model == null || (modelFamily != null && w.model === modelFamily));
+  return rl.windows
+    .filter((w) => w.model == null || (modelFamily != null && w.model === modelFamily))
+    .filter((w) => w.reset == null || w.reset > now);
 }
 
 interface ExpiringCandidate {
@@ -827,8 +833,8 @@ interface ExpiringCandidate {
  * joined the pool, or it's served via the CLI-subprocess backend, which has no
  * HTTP access to these headers.
  */
-function headroomFraction(usage: AccountUsage, modelFamily: string | null): number {
-  return candidateMinHeadroom(usage, modelFamily);
+function headroomFraction(usage: AccountUsage, modelFamily: string | null, now: number): number {
+  return candidateMinHeadroom(usage, modelFamily, now);
 }
 
 /**
@@ -842,8 +848,8 @@ function headroomOf(windows: RateLimitWindow[]): number {
   return Math.max(0, 1 - Math.max(...utilizations));
 }
 
-function candidateMinHeadroom(usage: AccountUsage, modelFamily: string | null): number {
-  return headroomOf(bindingWindows(usage.rateLimitStatus, modelFamily));
+function candidateMinHeadroom(usage: AccountUsage, modelFamily: string | null, now: number): number {
+  return headroomOf(bindingWindows(usage.rateLimitStatus, modelFamily, now));
 }
 
 /**
@@ -854,7 +860,7 @@ function candidateMinHeadroom(usage: AccountUsage, modelFamily: string | null): 
  * roll over is spent first so its allowance isn't wasted. null when unknown.
  */
 function candidateExpiryReset(usage: AccountUsage, modelFamily: string | null, now: number): number | null {
-  const windows = bindingWindows(usage.rateLimitStatus, modelFamily);
+  const windows = bindingWindows(usage.rateLimitStatus, modelFamily, now);
   const maxDur = Math.max(-1, ...windows.map((w) => windowDurationMs(w.key) ?? -1));
   if (maxDur < 0) return null;
   const resets = windows
@@ -872,8 +878,8 @@ function candidateExpiryReset(usage: AccountUsage, modelFamily: string | null, n
  * The exclusion only applies when a shorter account-wide window also exists, so
  * a lone 5h window still gates. 1 (full) when the gate set is empty / no snapshot.
  */
-function candidateGateHeadroom(usage: AccountUsage, modelFamily: string | null): number {
-  const windows = bindingWindows(usage.rateLimitStatus, modelFamily);
+function candidateGateHeadroom(usage: AccountUsage, modelFamily: string | null, now: number): number {
+  const windows = bindingWindows(usage.rateLimitStatus, modelFamily, now);
   const accountWide = windows.filter((w) => w.model == null);
   let excluded: RateLimitWindow | null = null;
   if (accountWide.length >= 2) {

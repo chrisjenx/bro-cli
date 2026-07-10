@@ -184,6 +184,66 @@ test("expiring: soonest-7d account is skipped when its 5h headroom is below the 
   }
 });
 
+test("expiring: a stale 5h window does not bench an account with a healthy live 7d", () => {
+  const { poolDir, mgr } = tempPool(["stale-5h", "fresh-5h"]);
+  try {
+    const now = Date.now();
+    // stale-5h: 5h looks 97% spent but its reset is in the PAST (rolled over);
+    // its live 7d expires SOONEST -> should win once the stale 5h is ignored.
+    mgr.recordRateLimitSnapshot(
+      "stale-5h",
+      snapshot([
+        win("5h", { utilization: 0.97, reset: now - 60 * 60_000 }),
+        win("7d", { utilization: 0.3, reset: now + 1 * 86_400_000 }),
+      ]),
+    );
+    // fresh-5h: healthy live 5h, but its 7d expires LATER.
+    mgr.recordRateLimitSnapshot(
+      "fresh-5h",
+      snapshot([
+        win("5h", { utilization: 0.2, reset: now + 3 * 60 * 60_000 }),
+        win("7d", { utilization: 0.3, reset: now + 3 * 86_400_000 }),
+      ]),
+    );
+
+    // Without the staleness fix, stale-5h's gate headroom is ~0.03 (< default
+    // 0.1 min) -> benched -> fresh-5h picked. With the fix, the stale 5h is
+    // dropped, stale-5h is viable, and its sooner 7d reset wins.
+    expect(mgr.pick()?.name).toBe("stale-5h");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("expiring: stale windows are ignored after a cold reload from usage.json", () => {
+  const { poolDir, mgr } = tempPool(["stale-5h", "fresh-5h"]);
+  try {
+    const now = Date.now();
+    // recordRateLimitSnapshot writes usage.json each time.
+    mgr.recordRateLimitSnapshot(
+      "stale-5h",
+      snapshot([
+        win("5h", { utilization: 0.97, reset: now - 60 * 60_000 }),
+        win("7d", { utilization: 0.3, reset: now + 1 * 86_400_000 }),
+      ]),
+    );
+    mgr.recordRateLimitSnapshot(
+      "fresh-5h",
+      snapshot([
+        win("5h", { utilization: 0.2, reset: now + 3 * 60 * 60_000 }),
+        win("7d", { utilization: 0.3, reset: now + 3 * 86_400_000 }),
+      ]),
+    );
+
+    // Fresh manager on the same pool dir -> loadState() reads usage.json.
+    const config = loadConfig({ poolDir, accountsDir: join(poolDir, "accounts"), usageFile: join(poolDir, "usage.json") });
+    const reloaded = new AccountManager(config);
+    expect(reloaded.pick()?.name).toBe("stale-5h");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
 test("model-family reset timing only applies to matching model requests", async () => {
   const { poolDir, mgr } = tempPool(["fable-soon", "fable-later"]);
   try {
