@@ -846,3 +846,34 @@ test("routingSnapshot reason: headroom strategy describes most-headroom + fewer-
     rmSync(poolDir, { recursive: true, force: true });
   }
 });
+
+test("routingSnapshot reason (headroom): equal headroom but differing requests → tie-break names fewer requests", () => {
+  const { poolDir, mgr } = tempPool(["busy", "idle"], undefined, { routingStrategy: "headroom" });
+  try {
+    // No snapshots → headroom ties at 1; busy has one more request than idle.
+    mgr.recordSuccess("busy", { input_tokens: 1, output_tokens: 1 }, 0);
+
+    const snap = mgr.routingSnapshot();
+    expect(snap.nextPick?.account).toBe("idle");
+    const tb = snap.nextPick!.reason.factors.find((f) => f.label === "Tie-break")!;
+    expect(tb.decisive).toBe(true);
+    expect(tb.detail).toContain("fewer requests");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("routingSnapshot reason (headroom): headroom AND requests tied → tie-break is round-robin, not 'fewer requests'", () => {
+  const { poolDir, mgr } = tempPool(["a", "b"], undefined, { routingStrategy: "headroom" });
+  try {
+    // Both fresh: headroom 1==1 and windowRequests 0==0, so the real tiebreak
+    // is round-robin — the reason must NOT claim "fewer requests".
+    const snap = mgr.routingSnapshot();
+    const tb = snap.nextPick!.reason.factors.find((f) => f.label === "Tie-break")!;
+    expect(tb.decisive).toBe(true);
+    expect(tb.detail).not.toContain("fewer requests");
+    expect(tb.detail).toContain("round-robin");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});

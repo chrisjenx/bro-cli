@@ -702,7 +702,7 @@ function formatEta(ms: number): string {
   const min = Math.round(ms / 60_000);
   if (min < 90) return `${Math.max(0, min)}m`;
   const hours = ms / 3_600_000;
-  if (hours < 48) return `~${hours.toFixed(1)}h`;
+  if (hours < 24) return `~${hours.toFixed(1)}h`;
   return `~${(ms / 86_400_000).toFixed(1)}d`;
 }
 
@@ -722,7 +722,7 @@ function buildExpiringReason(
   minHeadroom: number,
   ranked: ExpiringCandidate[],
   now: number,
-  poolSize: number = ranked.length,
+  poolSize: number,
 ): NextPickReason {
   const chosen = ranked[0]!;
   const runnerUp = ranked[1] ?? null;
@@ -787,11 +787,16 @@ function buildHeadroomReason(
     detail: `chosen ${chosenPct}% headroom${runnerUp ? ` (next: ${runnerUp.account.name} ${Math.round(runnerUp.headroom * 100)}%)` : ""}`,
     decisive: primaryDecisive,
   };
-  const tiebreak: NextPickFactor = {
-    label: "Tie-break",
-    detail: primaryDecisive ? "not needed" : runnerUp ? "broke tie on fewer requests" : "not needed",
-    decisive: !primaryDecisive && runnerUp != null,
-  };
+  let tiebreakDetail = "not needed";
+  let tiebreakDecisive = false;
+  if (runnerUp && !primaryDecisive) {
+    tiebreakDetail =
+      chosen.account.usage.windowRequests !== runnerUp.account.usage.windowRequests
+        ? "broke tie on fewer requests"
+        : "broke tie on round-robin among ties";
+    tiebreakDecisive = true;
+  }
+  const tiebreak: NextPickFactor = { label: "Tie-break", detail: tiebreakDetail, decisive: tiebreakDecisive };
   const summary = `tier ${activeTier} · ${chosenPct}% headroom`;
   return { summary, factors: [tierFactor(activeTier, tierCount, reserveTiers), primary, tiebreak] };
 }
@@ -826,13 +831,19 @@ function headroomFraction(usage: AccountUsage, modelFamily: string | null): numb
   return candidateMinHeadroom(usage, modelFamily);
 }
 
-function candidateMinHeadroom(usage: AccountUsage, modelFamily: string | null): number {
-  const utilizations = bindingWindows(usage.rateLimitStatus, modelFamily)
-    .map((w) => w.utilization)
-    .filter((u): u is number => u != null);
+/**
+ * Remaining headroom [0, 1] over a window set: 1 minus the highest utilization
+ * seen (the window closest to full is the binding constraint), or 1 (full) when
+ * no window reports a utilization.
+ */
+function headroomOf(windows: RateLimitWindow[]): number {
+  const utilizations = windows.map((w) => w.utilization).filter((u): u is number => u != null);
   if (utilizations.length === 0) return 1;
-  // The window closest to full (highest utilization) is the binding constraint.
   return Math.max(0, 1 - Math.max(...utilizations));
+}
+
+function candidateMinHeadroom(usage: AccountUsage, modelFamily: string | null): number {
+  return headroomOf(bindingWindows(usage.rateLimitStatus, modelFamily));
 }
 
 /**
@@ -870,12 +881,7 @@ function candidateGateHeadroom(usage: AccountUsage, modelFamily: string | null):
       (windowDurationMs(w.key) ?? -1) > (windowDurationMs(a.key) ?? -1) ? w : a,
     );
   }
-  const utilizations = windows
-    .filter((w) => w !== excluded)
-    .map((w) => w.utilization)
-    .filter((u): u is number => u != null);
-  if (utilizations.length === 0) return 1;
-  return Math.max(0, 1 - Math.max(...utilizations));
+  return headroomOf(windows.filter((w) => w !== excluded));
 }
 
 function compareNullableReset(a: number | null, b: number | null): number {
