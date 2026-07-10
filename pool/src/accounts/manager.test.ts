@@ -885,6 +885,30 @@ test("routingSnapshot reason: 7d expiry is the decisive factor and names the run
   }
 });
 
+test("routingSnapshot: expiry factor says 'probing' for a no-data account", () => {
+  const { poolDir, mgr } = tempPool(["fresh"]);
+  try {
+    const snap = mgr.routingSnapshot();
+    const expiry = snap.nextPick?.reason.factors.find((f) => f.label === "7d expiry");
+    expect(expiry?.detail).toMatch(/no live window data yet — probing/);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("routingSnapshot: expiry factor says 'expired — probing' when a snapshot went stale", () => {
+  const { poolDir, mgr } = tempPool(["went-stale"]);
+  try {
+    const now = Date.now();
+    mgr.recordRateLimitSnapshot("went-stale", snapshot([win("7d", { utilization: 0.3, reset: now - 1000 })]));
+    const snap = mgr.routingSnapshot();
+    const expiry = snap.nextPick?.reason.factors.find((f) => f.label === "7d expiry");
+    expect(expiry?.detail).toMatch(/prior window data expired — probing/);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
 test("routingSnapshot reason: a tie on 7d reset is settled by a decisive Tie-break factor", () => {
   const { poolDir, mgr } = tempPool(["a", "b"]);
   try {

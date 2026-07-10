@@ -103,6 +103,23 @@ test("card() shows both real bars and no estimates once 5h and 7d are both known
   expect(html).not.toContain("(est.)");
 });
 
+test("card() renders a rolled-over window instead of a stale reset countdown", () => {
+  const card = loadCard();
+  const now = Date.now();
+  const html = card(
+    baseAccount({
+      usage: {
+        rateLimitStatus: {
+          unifiedStatus: "allowed",
+          updatedAt: now,
+          windows: [{ key: "5h", model: null, status: "allowed", utilization: 0.97, reset: now - 60 * 60_000 }],
+        },
+      },
+    }),
+  );
+  expect(html).toContain("rolled over — awaiting refresh");
+});
+
 function loadFns(): { card: (a: unknown, isNext?: boolean) => string; tierLabel: (p: number) => string } {
   const html = dashboardHtml();
   const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];

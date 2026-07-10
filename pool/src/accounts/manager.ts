@@ -743,7 +743,14 @@ function buildExpiringReason(
     decisive: eligible < pool,
   };
 
-  const chosenEta = chosen.expiryReset != null ? `resets in ${formatEta(chosen.expiryReset - now)}` : "no 7d reset data";
+  let chosenEta: string;
+  if (chosen.expiryReset != null) {
+    chosenEta = `resets in ${formatEta(chosen.expiryReset - now)}`;
+  } else if (chosen.account.usage.rateLimitStatus == null) {
+    chosenEta = "no live window data yet — probing to refresh headers";
+  } else {
+    chosenEta = "prior window data expired — probing to refresh";
+  }
   let nextPart = "";
   if (runnerUp) {
     nextPart = runnerUp.expiryReset != null

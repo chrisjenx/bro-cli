@@ -312,8 +312,10 @@ function windowLabel(w) {
 
 function windowBar(w) {
   const pct = w.utilization != null ? Math.min(100, Math.max(0, w.utilization * 100)) : 0;
+  const stale = w.reset != null && w.reset <= Date.now();
+  const resetText = stale ? "rolled over — awaiting refresh" : "resets " + timeUntil(w.reset);
   return '<div><div class="bar-label"><span>' + esc(windowLabel(w)) + ' · used</span><span class="num">'
-    + pct.toFixed(0) + "% · resets " + timeUntil(w.reset)
+    + pct.toFixed(0) + "% · " + resetText
     + '</span></div><div class="bar"><span style="width:' + pct + '%"></span></div></div>';
 }
 
