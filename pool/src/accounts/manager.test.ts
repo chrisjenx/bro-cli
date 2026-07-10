@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, utimesSync
 import { join } from "path";
 import { tmpdir } from "os";
 import { loadConfig, type Config } from "../config.ts";
-import { AccountManager, formatNextPickReason, type KeychainOps } from "./manager.ts";
+import { AccountManager, type KeychainOps } from "./manager.ts";
 import type { RateLimitSnapshot, RateLimitWindow } from "./types.ts";
 import { OPENAI_CREDS_FILENAME } from "./types.ts";
 
@@ -719,14 +719,6 @@ test("affinity to a fallback account is dropped once a primary recovers", () => 
   }
 });
 
-test("formatNextPickReason describes tier, reset, and headroom", () => {
-  const now = 1_000_000;
-  expect(formatNextPickReason(1, now + 41 * 60_000, 0.62, now)).toBe(
-    "tier 1 · soonest reset in 41m · 62% headroom",
-  );
-  expect(formatNextPickReason(2, null, 1, now)).toBe("tier 2 · no reset data · 100% headroom");
-});
-
 test("routingSnapshot groups tiers and picks the active (lowest-number) tier", () => {
   const { poolDir, mgr } = tempPool(["primary", "fallback"]);
   try {
@@ -764,6 +756,92 @@ test("routingSnapshot is read-only: it does not advance the round-robin cursor",
     mgr.routingSnapshot(); // must NOT consume a round-robin step
     const p2 = mgr.pick()?.name;
     expect(p1).not.toBe(p2);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("routingSnapshot reason: 7d expiry is the decisive factor and names the runner-up", () => {
+  const { poolDir, mgr } = tempPool(["burn-me", "keep"]);
+  try {
+    const now = Date.now();
+    mgr.recordRateLimitSnapshot(
+      "burn-me",
+      snapshot([win("5h", { utilization: 0.2 }), win("7d", { utilization: 0.3, reset: now + 2 * 86_400_000 })]),
+    );
+    mgr.recordRateLimitSnapshot(
+      "keep",
+      snapshot([win("5h", { utilization: 0.2 }), win("7d", { utilization: 0.3, reset: now + 5 * 86_400_000 })]),
+    );
+
+    const snap = mgr.routingSnapshot();
+    expect(snap.nextPick?.account).toBe("burn-me");
+    const reason = snap.nextPick!.reason;
+    expect(reason.summary.length).toBeGreaterThan(0);
+    const labels = reason.factors.map((f) => f.label);
+    expect(labels).toContain("Priority tier");
+    expect(labels).toContain("5h gate");
+    expect(labels).toContain("7d expiry");
+    const expiry = reason.factors.find((f) => f.label === "7d expiry")!;
+    expect(expiry.decisive).toBe(true);
+    expect(expiry.detail).toContain("keep"); // runner-up named for contrast
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("routingSnapshot reason: a tie on 7d reset is settled by a decisive Tie-break factor", () => {
+  const { poolDir, mgr } = tempPool(["a", "b"]);
+  try {
+    const now = Date.now();
+    // Identical 7d reset + headroom; b has fewer requests -> tie-break decides.
+    mgr.recordRateLimitSnapshot("a", snapshot([win("5h", { utilization: 0.2 }), win("7d", { utilization: 0.3, reset: now + 3 * 86_400_000 })]));
+    mgr.recordRateLimitSnapshot("b", snapshot([win("5h", { utilization: 0.2 }), win("7d", { utilization: 0.3, reset: now + 3 * 86_400_000 })]));
+    mgr.recordSuccess("a", { input_tokens: 1, output_tokens: 1 }, 0);
+
+    const snap = mgr.routingSnapshot();
+    expect(snap.nextPick?.account).toBe("b");
+    const reason = snap.nextPick!.reason;
+    const expiry = reason.factors.find((f) => f.label === "7d expiry")!;
+    const tiebreak = reason.factors.find((f) => f.label === "Tie-break")!;
+    expect(expiry.decisive).toBe(false);
+    expect(tiebreak.decisive).toBe(true);
+    expect(tiebreak.detail).toContain("fewer requests");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("routingSnapshot reason: 5h gate factor reflects an excluded candidate", () => {
+  const { poolDir, mgr } = tempPool(["hot", "ok"]);
+  try {
+    const now = Date.now();
+    mgr.recordRateLimitSnapshot("hot", snapshot([win("5h", { utilization: 0.95 }), win("7d", { utilization: 0.2, reset: now + 1 * 86_400_000 })]));
+    mgr.recordRateLimitSnapshot("ok", snapshot([win("5h", { utilization: 0.3 }), win("7d", { utilization: 0.2, reset: now + 5 * 86_400_000 })]));
+
+    const snap = mgr.routingSnapshot();
+    expect(snap.nextPick?.account).toBe("ok");
+    const gate = snap.nextPick!.reason.factors.find((f) => f.label === "5h gate")!;
+    expect(gate.decisive).toBe(true);
+    expect(gate.detail).toContain("1/2"); // one of two eligible
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("routingSnapshot reason: headroom strategy describes most-headroom + fewer-requests", () => {
+  const { poolDir, mgr } = tempPool(["big", "small"], undefined, { routingStrategy: "headroom" });
+  try {
+    mgr.recordRateLimitSnapshot("big", snapshot([win("5h", { utilization: 0.1 })]));
+    mgr.recordRateLimitSnapshot("small", snapshot([win("5h", { utilization: 0.6 })]));
+
+    const snap = mgr.routingSnapshot();
+    expect(snap.nextPick?.account).toBe("big");
+    const labels = snap.nextPick!.reason.factors.map((f) => f.label);
+    expect(labels).toContain("Most headroom");
+    expect(labels).toContain("Tie-break");
+    const primary = snap.nextPick!.reason.factors.find((f) => f.label === "Most headroom")!;
+    expect(primary.decisive).toBe(true);
   } finally {
     rmSync(poolDir, { recursive: true, force: true });
   }

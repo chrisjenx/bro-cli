@@ -42,26 +42,29 @@ export function isValidPriority(n: unknown): n is number {
   return typeof n === "number" && Number.isInteger(n) && n >= 0;
 }
 
+/** One step of the routing decision, showing where the chosen account stood. */
+export interface NextPickFactor {
+  /** Short label, e.g. "Priority tier", "5h gate", "7d expiry", "Tie-break". */
+  label: string;
+  /** Human-readable detail with the actual values this step contributed. */
+  detail: string;
+  /** True for the step that actually determined the winner. */
+  decisive: boolean;
+}
+
+/** Structured "why this account is next" for the dashboard/status. */
+export interface NextPickReason {
+  /** Compact one-line summary, kept for logs and narrow displays. */
+  summary: string;
+  /** Ordered decision steps (tier → gate → primary key → tie-break). */
+  factors: NextPickFactor[];
+}
+
 /** Read-only view of the current routing decision, for the dashboard/status. */
 export interface RoutingSnapshot {
   activeTier: number | null;
-  nextPick: { account: string; reason: string } | null;
+  nextPick: { account: string; reason: NextPickReason } | null;
   tiers: { priority: number; accounts: string[]; available: number }[];
-}
-
-/** Human-readable one-liner explaining why an account would be picked next. */
-export function formatNextPickReason(
-  tier: number,
-  earliestReset: number | null,
-  headroom: number,
-  now: number,
-): string {
-  const pct = Math.round(headroom * 100);
-  const resetPart =
-    earliestReset != null && earliestReset > now
-      ? `soonest reset in ${Math.ceil((earliestReset - now) / 60000)}m`
-      : "no reset data";
-  return `tier ${tier} · ${resetPart} · ${pct}% headroom`;
 }
 
 interface PersistedState {
@@ -551,21 +554,6 @@ export class AccountManager {
   }
 
   /**
-   * Non-mutating "who would be picked next" for the dashboard. Shares the exact
-   * ranking pick() uses (rankHeadroom/rankExpiring) but never advances the
-   * round-robin cursor or touches affinity, so polling /api/status has zero
-   * effect on real routing. Ties are broken deterministically (first in pool
-   * order) rather than round-robin, so the two can't silently diverge.
-   */
-  private previewBest(tierPool: Account[], family: string | null, now: number): Account {
-    const tied =
-      this.config.routingStrategy === "headroom"
-        ? this.rankHeadroom(tierPool, family)
-        : this.rankExpiring(tierPool, family, now);
-    return tied[0]!;
-  }
-
-  /**
    * Current routing decision for one provider: every tier (grouped by priority,
    * with an available count), the active tier, and the account that would serve
    * the next non-sticky request with a human-readable reason. The decision is
@@ -595,13 +583,23 @@ export class AccountManager {
 
     const minPriority = Math.min(...available.map((a) => a.priority));
     const tierPool = available.filter((a) => a.priority === minPriority);
-    const best = this.previewBest(tierPool, family, now);
-    const reason = formatNextPickReason(
-      minPriority,
-      candidateExpiryReset(best.usage, family, now),
-      candidateGateHeadroom(best.usage, family),
-      now,
-    );
+    const reserveTiers = tiers.map((t) => t.priority).filter((p) => p > minPriority);
+
+    let best: Account;
+    let reason: NextPickReason;
+    if (this.config.routingStrategy === "headroom") {
+      // Same winner as pickByHeadroom (max headroom, then fewest requests); a
+      // deterministic sort standing in for rankHeadroom + first-in-pool-order.
+      const ranked = tierPool
+        .map((a) => ({ account: a, headroom: headroomFraction(a.usage, family) }))
+        .sort((x, y) => y.headroom - x.headroom || x.account.usage.windowRequests - y.account.usage.windowRequests);
+      best = ranked[0]!.account;
+      reason = buildHeadroomReason(minPriority, reserveTiers, tierPool.length, ranked);
+    } else {
+      const ranked = this.sortExpiringCandidates(tierPool, family, now);
+      best = ranked[0]!.account;
+      reason = buildExpiringReason(minPriority, reserveTiers, this.config.routingMinHeadroom, ranked, now, tierPool.length);
+    }
     return { activeTier: minPriority, nextPick: { account: best.name, reason }, tiers };
   }
 
@@ -697,6 +695,105 @@ function mergeRateLimitSnapshot(
     windows: sortRateLimitWindows([...windows.values()]),
     updatedAt: next.updatedAt,
   };
+}
+
+/** Terse human ETA for a future timestamp delta in ms: "41m", "~3.5h", "~2.6d". */
+function formatEta(ms: number): string {
+  const min = Math.round(ms / 60_000);
+  if (min < 90) return `${Math.max(0, min)}m`;
+  const hours = ms / 3_600_000;
+  if (hours < 48) return `~${hours.toFixed(1)}h`;
+  return `~${(ms / 86_400_000).toFixed(1)}d`;
+}
+
+/** Shared "Priority tier" factor for both strategies. */
+function tierFactor(activeTier: number, tierCount: number, reserveTiers: number[]): NextPickFactor {
+  const accts = `${tierCount} account${tierCount === 1 ? "" : "s"}`;
+  const reserve = reserveTiers.length
+    ? `tier${reserveTiers.length === 1 ? "" : "s"} ${reserveTiers.join(", ")} held in reserve`
+    : "no lower tiers in reserve";
+  return { label: "Priority tier", detail: `${activeTier} active (${accts}) · ${reserve}`, decisive: reserveTiers.length > 0 };
+}
+
+/** Build the structured reason for the expiring strategy from ranked candidates. */
+function buildExpiringReason(
+  activeTier: number,
+  reserveTiers: number[],
+  minHeadroom: number,
+  ranked: ExpiringCandidate[],
+  now: number,
+  poolSize: number = ranked.length,
+): NextPickReason {
+  const chosen = ranked[0]!;
+  const runnerUp = ranked[1] ?? null;
+  // sortExpiringCandidates() pre-filters to the viable subset whenever any
+  // candidate is viable (falling back to the full pool only when none are),
+  // so `ranked` alone can't distinguish "1 of 1 eligible" from "1 of 2
+  // eligible". `poolSize` carries the true tier-pool size for that count.
+  const eligible = chosen.viable ? ranked.length : 0;
+  const pool = poolSize;
+
+  const chosenPct = Math.round(chosen.gateHeadroom * 100);
+  const minPct = Math.round(minHeadroom * 100);
+  const gateFactor: NextPickFactor = {
+    label: "5h gate",
+    detail: `${eligible}/${pool} eligible (≥${minPct}% headroom) · chosen ${chosenPct}% headroom`,
+    decisive: eligible < pool,
+  };
+
+  const chosenEta = chosen.expiryReset != null ? `resets in ${formatEta(chosen.expiryReset - now)}` : "no 7d reset data";
+  let nextPart = "";
+  if (runnerUp) {
+    nextPart = runnerUp.expiryReset != null
+      ? ` (next: ${runnerUp.account.name} ${formatEta(runnerUp.expiryReset - now)})`
+      : ` (next: ${runnerUp.account.name} no reset data)`;
+  }
+  const resetDecisive = runnerUp != null && compareNullableReset(chosen.expiryReset, runnerUp.expiryReset) !== 0;
+  const expiryFactor: NextPickFactor = {
+    label: "7d expiry",
+    detail: `${chosenEta} · soonest eligible${nextPart}`,
+    decisive: resetDecisive,
+  };
+
+  let tiebreakDetail = "not needed";
+  let tiebreakDecisive = false;
+  if (runnerUp && !resetDecisive) {
+    let rule = "round-robin among ties";
+    if (chosen.gateHeadroom !== runnerUp.gateHeadroom) rule = "more 5h headroom";
+    else if (chosen.account.usage.windowRequests !== runnerUp.account.usage.windowRequests) rule = "fewer requests";
+    else rule = "session affinity / round-robin";
+    tiebreakDetail = `broke tie on ${rule}`;
+    tiebreakDecisive = true;
+  }
+  const tiebreakFactor: NextPickFactor = { label: "Tie-break", detail: tiebreakDetail, decisive: tiebreakDecisive };
+
+  const summary = `tier ${activeTier} · ${chosen.expiryReset != null ? `7d resets in ${formatEta(chosen.expiryReset - now)}` : "no 7d data"} · ${chosenPct}% 5h headroom`;
+  return { summary, factors: [tierFactor(activeTier, pool, reserveTiers), gateFactor, expiryFactor, tiebreakFactor] };
+}
+
+/** Build a compact structured reason for the headroom strategy. */
+function buildHeadroomReason(
+  activeTier: number,
+  reserveTiers: number[],
+  tierCount: number,
+  ranked: { account: Account; headroom: number }[],
+): NextPickReason {
+  const chosen = ranked[0]!;
+  const runnerUp = ranked[1] ?? null;
+  const chosenPct = Math.round(chosen.headroom * 100);
+  const primaryDecisive = runnerUp != null && chosen.headroom !== runnerUp.headroom;
+  const primary: NextPickFactor = {
+    label: "Most headroom",
+    detail: `chosen ${chosenPct}% headroom${runnerUp ? ` (next: ${runnerUp.account.name} ${Math.round(runnerUp.headroom * 100)}%)` : ""}`,
+    decisive: primaryDecisive,
+  };
+  const tiebreak: NextPickFactor = {
+    label: "Tie-break",
+    detail: primaryDecisive ? "not needed" : runnerUp ? "broke tie on fewer requests" : "not needed",
+    decisive: !primaryDecisive && runnerUp != null,
+  };
+  const summary = `tier ${activeTier} · ${chosenPct}% headroom`;
+  return { summary, factors: [tierFactor(activeTier, tierCount, reserveTiers), primary, tiebreak] };
 }
 
 /**
