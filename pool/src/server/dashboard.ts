@@ -166,6 +166,11 @@ export function dashboardHtml(): string {
     border-left: 3px solid var(--accent); border-radius: 12px; padding: 12px 16px; margin-bottom: 20px;
     font-size: 13.5px; color: var(--text); box-shadow: var(--shadow); }
   .routing-panel .muted { color: var(--muted); }
+  .routing-panel .summary { font-size: 12px; margin: 2px 0 8px; }
+  .routing-panel .why { list-style: none; margin: 0; padding: 0; display: grid; gap: 3px; }
+  .routing-panel .why .fact { display: grid; grid-template-columns: 92px 1fr; gap: 10px; font-size: 12.5px; }
+  .routing-panel .why .fk { color: var(--muted); }
+  .routing-panel .why .fact.decisive .fv { color: var(--accent); font-weight: 600; }
   .tier-edit { margin-top: 14px; padding-top: 13px; border-top: 1px solid var(--border);
     display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); }
   .tier-edit input { width: 60px; font: inherit; padding: 4px 6px; border: 1px solid var(--border);
@@ -279,6 +284,18 @@ function ago(ts) {
   const h = Math.floor(m / 60); return h + "h ago";
 }
 function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+function routingPanelHtml(routing) {
+  if (!routing || !routing.nextPick) return "";
+  const r = routing.nextPick.reason || { summary: "", factors: [] };
+  const items = (r.factors || []).map((f) =>
+    '<li class="fact' + (f.decisive ? " decisive" : "") + '">'
+      + '<span class="fk">' + esc(f.label) + "</span>"
+      + '<span class="fv">' + esc(f.detail) + (f.decisive ? " ◀" : "") + "</span></li>"
+  ).join("");
+  return "Next request &rarr; <b>" + esc(routing.nextPick.account) + "</b>"
+    + '<div class="summary muted" title="' + esc(r.summary) + '">' + esc(r.summary) + "</div>"
+    + '<ul class="why">' + items + "</ul>";
+}
 
 function tierLabel(priority) {
   if (priority === 1) return "Priority 1 — Primary";
@@ -411,9 +428,9 @@ async function refresh() {
       }).join("");
 
       const panel = document.getElementById("routing-panel");
-      if (routing.nextPick) {
-        panel.innerHTML = "Next request → <b>" + esc(routing.nextPick.account)
-          + '</b> <span class="muted">(' + esc(routing.nextPick.reason) + ")</span>";
+      const panelHtml = routingPanelHtml(routing);
+      if (panelHtml) {
+        panel.innerHTML = panelHtml;
         panel.style.display = "block";
       } else {
         panel.style.display = "none";

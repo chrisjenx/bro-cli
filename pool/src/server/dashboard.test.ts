@@ -138,3 +138,45 @@ test("card() marks the next-pick account and shows its priority", () => {
   expect(html).toContain("next");
   expect(html.toLowerCase()).toContain("priority");
 });
+
+function loadRoutingPanel(): (routing: unknown) => string {
+  const html = dashboardHtml();
+  const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+  if (!script) throw new Error("dashboard <script> block not found");
+  const stubbed = script
+    .replace(/^refresh\(\);$/m, "")
+    .replace(/^setInterval\(refresh, 4000\);$/m, "");
+  const noopEl = { addEventListener() {}, setAttribute() {}, getAttribute() { return null; }, textContent: "", style: {} };
+  const doc = { getElementById: () => noopEl, querySelectorAll: () => [], documentElement: noopEl };
+  const factory = new Function("document", "localStorage", "matchMedia", `${stubbed}\nreturn routingPanelHtml;`);
+  return factory(doc, { getItem: () => null, setItem() {} }, () => ({ matches: false }));
+}
+
+test("routingPanelHtml lists every decision factor and marks the decisive one", () => {
+  const routingPanelHtml = loadRoutingPanel();
+  const html = routingPanelHtml({
+    nextPick: {
+      account: "burn-me",
+      reason: {
+        summary: "tier 100 · 7d resets in ~2.6d · 98% 5h headroom",
+        factors: [
+          { label: "Priority tier", detail: "100 active (2 accounts) · no lower tiers in reserve", decisive: false },
+          { label: "5h gate", detail: "2/2 eligible (≥10% headroom) · chosen 98% headroom", decisive: false },
+          { label: "7d expiry", detail: "resets in ~2.6d · soonest eligible (next: keep ~5.3d)", decisive: true },
+          { label: "Tie-break", detail: "not needed", decisive: false },
+        ],
+      },
+    },
+  });
+  expect(html).toContain("burn-me");
+  expect(html).toContain("Priority tier");
+  expect(html).toContain("7d expiry");
+  expect(html).toContain("◀"); // decisive marker
+  expect(html).toContain("98% 5h headroom"); // summary present
+});
+
+test("routingPanelHtml is empty when there is no next pick", () => {
+  const routingPanelHtml = loadRoutingPanel();
+  expect(routingPanelHtml({ nextPick: null })).toBe("");
+  expect(routingPanelHtml(null)).toBe("");
+});
