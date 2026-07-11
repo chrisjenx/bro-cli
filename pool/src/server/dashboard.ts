@@ -218,8 +218,17 @@ export function dashboardHtml(): string {
   .routing-panel .why .fk { color: var(--muted); }
   .routing-panel .why .fact.decisive .fv { color: var(--accent); font-weight: 600; }
   .tuning-panel { display: none; background: var(--surface); border: 1px solid var(--border);
-    border-radius: 12px; padding: 14px 18px; margin-bottom: 20px; box-shadow: var(--shadow); }
-  .tuning-panel h3 { margin: 0 0 3px; font-size: 14px; font-weight: 600; letter-spacing: -0.01em; }
+    border-radius: 12px; margin-bottom: 20px; box-shadow: var(--shadow); }
+  .tuning-panel > summary { list-style: none; cursor: pointer; padding: 12px 18px;
+    display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600;
+    letter-spacing: -0.01em; color: var(--text); user-select: none; }
+  .tuning-panel > summary::-webkit-details-marker { display: none; }
+  .tuning-panel > summary::before { content: "⚙"; color: var(--muted); font-weight: 400; }
+  .tuning-panel > summary .caret { margin-left: auto; color: var(--muted); font-size: 11px;
+    transition: transform .15s ease; }
+  .tuning-panel[open] > summary { border-bottom: 1px solid var(--border); }
+  .tuning-panel[open] > summary .caret { transform: rotate(90deg); }
+  .tuning-panel .tuning-body { padding: 13px 18px 15px; }
   .tuning-panel .hint { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
   .tuning-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px 18px; }
   .tuning-field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
@@ -261,7 +270,7 @@ export function dashboardHtml(): string {
 </header>
 <main>
   <div class="routing-panel" id="routing-panel"></div>
-  <div class="tuning-panel" id="tuning-panel"></div>
+  <details class="tuning-panel" id="tuning-panel"></details>
   <div class="banner" id="banner"></div>
   <div class="summary-tbl" id="summary" style="display:none"></div>
   <div class="grid" id="grid"></div>
@@ -413,11 +422,13 @@ function tuningPanelHtml(tuning) {
       + '<input type="number" step="' + f.step + '" min="' + f.min + '" max="' + f.max + '"'
       + ' value="' + esc(String(val)) + '" data-tuning="' + f.key + '"></div>';
   }).join("");
-  return '<h3>Routing tuning</h3>'
+  return '<summary>Routing tuning<span class="caret">▶</span></summary>'
+    + '<div class="tuning-body">'
     + '<div class="hint">Weighted-strategy score knobs. Higher weekly weight loads the account with the most 7d headroom first.</div>'
     + '<div class="tuning-grid">' + fields + "</div>"
     + '<div class="tuning-actions"><button id="tuning-apply">Apply</button>'
-    + '<span class="status" id="tuning-status"></span></div>';
+    + '<span class="status" id="tuning-status"></span></div>'
+    + "</div>";
 }
 
 function tierLabel(priority) {
