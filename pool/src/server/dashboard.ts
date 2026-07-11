@@ -8,7 +8,28 @@
  * light/dark theme toggle (dark is Claude's warm charcoal).
  */
 
+import { TUNING_BOUNDS } from "../accounts/manager.ts";
+
+/** Presentation for each tuning knob; min/max come from the shared TUNING_BOUNDS. */
+const TUNING_LABELS: Record<keyof typeof TUNING_BOUNDS, { label: string; step: string }> = {
+  weeklyExp: { label: "Weekly (7d) weight", step: "0.1" },
+  fiveHourExp: { label: "5h weight", step: "0.1" },
+  loadSlope: { label: "Session load", step: "0.1" },
+  urgencyDecay: { label: "7d urgency decay", step: "0.05" },
+  minHeadroom: { label: "Min headroom gate", step: "0.05" },
+};
+
 export function dashboardHtml(): string {
+  // Field descriptors built once from the single source of truth (TUNING_BOUNDS)
+  // and inlined into the client script, so client input ranges can't drift from
+  // the server's validation bounds.
+  const tuningFields = (Object.keys(TUNING_BOUNDS) as (keyof typeof TUNING_BOUNDS)[]).map((key) => ({
+    key,
+    label: TUNING_LABELS[key].label,
+    step: TUNING_LABELS[key].step,
+    min: TUNING_BOUNDS[key].min,
+    max: TUNING_BOUNDS[key].max,
+  }));
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -377,16 +398,11 @@ function routingPanelHtml(routing) {
     + '<ul class="why">' + items + "</ul>";
 }
 
-// Editable weighted-score knobs. Each field maps to a RoutingTuning key; the
+// Editable weighted-score knobs (key/label/step/min/max), built server-side
+// from TUNING_BOUNDS so the input ranges match the server's validation. The
 // score is weight × urgency × loadFactor × 5h^fiveHourExp × weekly^weeklyExp,
 // so a larger weeklyExp makes the emptier 7d window win more decisively.
-var TUNING_FIELDS = [
-  { key: "weeklyExp", label: "Weekly (7d) weight", step: "0.1", min: 0, max: 5 },
-  { key: "fiveHourExp", label: "5h weight", step: "0.1", min: 0, max: 5 },
-  { key: "loadSlope", label: "Session load", step: "0.1", min: 0, max: 5 },
-  { key: "urgencyDecay", label: "7d urgency decay", step: "0.05", min: 0, max: 5 },
-  { key: "minHeadroom", label: "Min headroom gate", step: "0.05", min: 0, max: 1 },
-];
+var TUNING_FIELDS = ${JSON.stringify(tuningFields)};
 
 function tuningPanelHtml(tuning) {
   if (!tuning) return "";

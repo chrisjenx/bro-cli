@@ -690,8 +690,12 @@ export class AccountManager {
    * Exponents/slopes come from getTuning(). Pure — no round-robin, no mutation —
    * shared by pick() and routingSnapshot().
    */
-  private scoreWeighted(pool: Account[], family: string | null, now: number): WeightedCandidate[] {
-    const tuning = this.getTuning();
+  private scoreWeighted(
+    pool: Account[],
+    family: string | null,
+    now: number,
+    tuning: RoutingTuning = this.getTuning(),
+  ): WeightedCandidate[] {
     const resets = pool.map((a) => candidateExpiryReset(a.usage, family, now));
     // Rank distinct reset values (nulls collapse to one, equal timestamps share
     // a rank); a Map gives O(1) rank lookup instead of a linear scan per account.
@@ -701,8 +705,8 @@ export class AccountManager {
     return pool.map((account, i) => {
       const expiryReset = resets[i]!;
       const urgency = 1 / (1 + rankByReset.get(expiryReset)! * tuning.urgencyDecay);
-      const headroom = candidateGateHeadroom(account.usage, family, now);
-      const weeklyHeadroom = candidateExpiryHeadroom(account.usage, family, now);
+      // One partition pass yields both headrooms; they can't drift apart.
+      const { gate: headroom, expiry: weeklyHeadroom } = partitionHeadroom(account.usage, family, now);
       const loadFactor = 1 / (1 + this.sessions.activeCount(account.name, now) * tuning.loadSlope);
       const weight = this.weightFor(account.name);
       const score =
@@ -793,10 +797,11 @@ export class AccountManager {
       best = ranked[0]!.account;
       reason = buildExpiringReason(minPriority, reserveTiers, this.config.routingMinHeadroom, ranked, now, tierPool.length);
     } else {
-      const scored = this.scoreWeighted(tierPool, family, now);
+      const tuning = this.getTuning();
+      const scored = this.scoreWeighted(tierPool, family, now, tuning);
       const ranked = this.rankWeighted(scored);
       best = ranked[0]!.account;
-      reason = buildWeightedReason(minPriority, reserveTiers, ranked, now, tierPool.length, this.getTuning());
+      reason = buildWeightedReason(minPriority, reserveTiers, ranked, now, tierPool.length, tuning);
       candidates = scored.map((c) => ({
         account: c.account.name,
         weight: c.weight,
@@ -1166,14 +1171,23 @@ function candidateExpiryReset(usage: AccountUsage, modelFamily: string | null, n
 }
 
 /**
- * Headroom [0, 1] that gates eligibility and breaks headroom ties for the
- * expiring strategy: the tightest binding window EXCEPT the account-wide expiry
- * (longest-duration account-wide) window, which is deliberately excluded so we
- * keep draining it ("pending headroom on the 5-hour window", not the 7-day one).
- * The exclusion only applies when a shorter account-wide window also exists, so
- * a lone 5h window still gates. 1 (full) when the gate set is empty / no snapshot.
+ * Split an account's binding windows into the two headrooms the routing
+ * strategies need, in one pass so their definitions can't drift:
+ *   - `gate`: tightest binding window EXCEPT the account-wide expiry
+ *     (longest-duration account-wide) window, which is deliberately excluded so
+ *     we keep draining it ("pending headroom on the 5-hour window", not the
+ *     7-day one). The exclusion only applies when a shorter account-wide window
+ *     also exists, so a lone 5h window still gates.
+ *   - `expiry`: headroom of that excluded window (the weekly/7d allowance the
+ *     weighted strategy prefers to spread load across); 1 when there is no
+ *     separate expiry window.
+ * Both are 1 (full) when the relevant set is empty / there is no snapshot.
  */
-function candidateGateHeadroom(usage: AccountUsage, modelFamily: string | null, now: number): number {
+function partitionHeadroom(
+  usage: AccountUsage,
+  modelFamily: string | null,
+  now: number,
+): { gate: number; expiry: number } {
   const windows = bindingWindows(usage.rateLimitStatus, modelFamily, now);
   const accountWide = windows.filter((w) => w.model == null);
   let excluded: RateLimitWindow | null = null;
@@ -1182,26 +1196,15 @@ function candidateGateHeadroom(usage: AccountUsage, modelFamily: string | null, 
       (windowDurationMs(w.key) ?? -1) > (windowDurationMs(a.key) ?? -1) ? w : a,
     );
   }
-  return headroomOf(windows.filter((w) => w !== excluded));
+  return {
+    gate: headroomOf(windows.filter((w) => w !== excluded)),
+    expiry: excluded ? headroomOf([excluded]) : 1,
+  };
 }
 
-/**
- * Remaining headroom [0, 1] of the account-wide "expiry" window — the
- * longest-duration account-wide binding window (typically 7d), i.e. exactly the
- * one candidateGateHeadroom excludes. The weighted strategy prefers the account
- * with the most weekly room; the gate ignores this window, so the two compose
- * (gate for eligibility, this for preference). 1 (full, no penalty) when that
- * window is absent or reports no utilization / no snapshot.
- */
-function candidateExpiryHeadroom(usage: AccountUsage, modelFamily: string | null, now: number): number {
-  const accountWide = bindingWindows(usage.rateLimitStatus, modelFamily, now).filter((w) => w.model == null);
-  // Mirror candidateGateHeadroom: a lone account-wide window IS the gate window,
-  // so there is no separate expiry/7d window — return full (no double-counting).
-  if (accountWide.length < 2) return 1;
-  const expiry = accountWide.reduce((a, w) =>
-    (windowDurationMs(w.key) ?? -1) > (windowDurationMs(a.key) ?? -1) ? w : a,
-  );
-  return headroomOf([expiry]);
+/** Eligibility/tiebreak headroom for the expiring strategy (see partitionHeadroom). */
+function candidateGateHeadroom(usage: AccountUsage, modelFamily: string | null, now: number): number {
+  return partitionHeadroom(usage, modelFamily, now).gate;
 }
 
 function compareNullableReset(a: number | null, b: number | null): number {

@@ -9,7 +9,7 @@
  */
 
 import type { Config } from "../config.ts";
-import { AccountManager, isValidPriority, isValidWeight, isValidTuningField, TUNING_BOUNDS, type RoutingTuning } from "../accounts/manager.ts";
+import { AccountManager, isValidPriority, isValidWeight, TUNING_BOUNDS, type RoutingTuning } from "../accounts/manager.ts";
 import { loadModelTable, resolveModel, type ModelRoute } from "../models.ts";
 import { runClaude } from "../subprocess/claude.ts";
 import type { Account } from "../accounts/types.ts";
@@ -361,18 +361,18 @@ export function handleTuningUpdate(mgr: AccountManager, body: unknown): Response
   const b = (body ?? {}) as Partial<Record<keyof RoutingTuning, unknown>>;
   const patch: Partial<RoutingTuning> = {};
   for (const key of Object.keys(TUNING_BOUNDS) as (keyof RoutingTuning)[]) {
-    const value = b[key];
-    if (value === undefined) continue;
-    if (!isValidTuningField(key, value)) {
-      const bound = TUNING_BOUNDS[key];
-      return json({ error: { message: `${key} must be a number between ${bound.min} and ${bound.max}` } }, 400);
-    }
-    patch[key] = value;
+    if (b[key] !== undefined) patch[key] = b[key] as number;
   }
   if (Object.keys(patch).length === 0) {
     return json({ error: { message: "provide at least one tuning field" } }, 400);
   }
-  mgr.setTuning(patch);
+  // setTuning is the single validation authority; surface its bounds error
+  // (per-field, with the offending value) as a 400 instead of a 500.
+  try {
+    mgr.setTuning(patch);
+  } catch (e) {
+    return json({ error: { message: e instanceof Error ? e.message : String(e) } }, 400);
+  }
   return json({ ok: true, tuning: mgr.getTuning() });
 }
 
