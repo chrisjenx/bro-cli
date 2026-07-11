@@ -87,7 +87,7 @@ export const TUNING_BOUNDS: Record<keyof RoutingTuning, { min: number; max: numb
 
 /** Defaults for the tuning knobs except minHeadroom, which seeds from config (env). */
 const DEFAULT_TUNING_EXP: Omit<RoutingTuning, "minHeadroom"> = {
-  weeklyExp: 1.5,
+  weeklyExp: 0.9,
   fiveHourExp: 1,
   loadSlope: 0.5,
   urgencyDecay: 0.25,

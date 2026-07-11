@@ -1354,7 +1354,7 @@ describe("weighted strategy", () => {
         win("7d", { utilization: 0.41, reset: reset7d }),
       ]));
       // Old score (5h only) would pick low-5h (0.94 > 0.70); the weekly factor
-      // (0.89^1.5 vs 0.59^1.5) flips it to empty-weekly.
+      // (0.89^0.9 vs 0.59^0.9) flips it to empty-weekly.
       expect(mgr.pick()?.name).toBe("empty-weekly");
     } finally {
       rmSync(poolDir, { recursive: true, force: true });
@@ -1401,7 +1401,7 @@ describe("routing tuning", () => {
     const { poolDir, mgr } = weightedPool(["a"]);
     try {
       const t = mgr.getTuning();
-      expect(t.weeklyExp).toBe(1.5);
+      expect(t.weeklyExp).toBe(0.9);
       expect(t.fiveHourExp).toBe(1);
       expect(t.loadSlope).toBe(0.5);
       expect(t.urgencyDecay).toBe(0.25);
@@ -1433,7 +1433,7 @@ describe("routing tuning", () => {
     try {
       writeFileSync(join(poolDir, "tuning.json"), JSON.stringify({ weeklyExp: 99, fiveHourExp: 2 }));
       const t = mgr.getTuning();
-      expect(t.weeklyExp).toBe(1.5); // 99 > max 5 -> default
+      expect(t.weeklyExp).toBe(0.9); // 99 > max 5 -> default
       expect(t.fiveHourExp).toBe(2); // valid -> applied
     } finally {
       rmSync(poolDir, { recursive: true, force: true });
