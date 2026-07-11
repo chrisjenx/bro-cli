@@ -54,6 +54,51 @@ export function isValidWeight(n: unknown): n is number {
   return typeof n === "number" && Number.isFinite(n) && n >= MIN_WEIGHT && n <= MAX_WEIGHT;
 }
 
+/**
+ * Live-editable knobs behind the `weighted` placement score. Persisted to
+ * <poolDir>/tuning.json and editable from the dashboard, so the blend can be
+ * retuned without a redeploy. See scoreWeighted for how each is applied.
+ */
+export interface RoutingTuning {
+  /** Exponent on the 7d ("weekly") headroom factor. Higher = weekly matters more. */
+  weeklyExp: number;
+  /** Exponent on the 5h headroom factor. */
+  fiveHourExp: number;
+  /** Active-session load decay: 0 sessions → 1.0, 1 → 1/(1+slope), … */
+  loadSlope: number;
+  /** 7d-expiry urgency rank decay: soonest → 1.0, next → 1/(1+decay), … */
+  urgencyDecay: number;
+  /** Minimum gate headroom for an account to stay viable (else best-effort). */
+  minHeadroom: number;
+}
+
+/**
+ * Per-knob bounds. Exponents/slopes share a generous [0, 5] range (0 disables a
+ * factor, 5 makes it dominate); minHeadroom is a fraction in [0, 1]. Each field
+ * validates independently so one bad value never rejects the rest.
+ */
+export const TUNING_BOUNDS: Record<keyof RoutingTuning, { min: number; max: number }> = {
+  weeklyExp: { min: 0, max: 5 },
+  fiveHourExp: { min: 0, max: 5 },
+  loadSlope: { min: 0, max: 5 },
+  urgencyDecay: { min: 0, max: 5 },
+  minHeadroom: { min: 0, max: 1 },
+};
+
+/** Defaults for the tuning knobs except minHeadroom, which seeds from config (env). */
+const DEFAULT_TUNING_EXP: Omit<RoutingTuning, "minHeadroom"> = {
+  weeklyExp: 1.5,
+  fiveHourExp: 1,
+  loadSlope: 0.5,
+  urgencyDecay: 0.25,
+};
+
+/** True when `n` is a finite number within `key`'s bounds. */
+export function isValidTuningField(key: keyof RoutingTuning, n: unknown): n is number {
+  const b = TUNING_BOUNDS[key];
+  return typeof n === "number" && Number.isFinite(n) && n >= b.min && n <= b.max;
+}
+
 /** One step of the routing decision, showing where the chosen account stood. */
 export interface NextPickFactor {
   /** Short label, e.g. "Priority tier", "5h gate", "7d expiry", "Tie-break". */
@@ -103,6 +148,8 @@ export class AccountManager {
   private keychain: KeychainOps;
   /** Per-account routing.json cache, keyed to the file's mtime (see routingFileFor). */
   private routingCache = new Map<string, { mtimeMs: number; priority: number; weight: number }>();
+  /** tuning.json cache, keyed to the file's mtime (see getTuning). */
+  private tuningCache: { mtimeMs: number; tuning: RoutingTuning } | null = null;
 
   constructor(config: Config, keychain: KeychainOps = defaultKeychainOps) {
     this.config = config;
@@ -270,6 +317,63 @@ export class AccountManager {
     // Drop the cache so the next read re-parses even if the mtime is unchanged
     // (two writes within one filesystem mtime tick would otherwise look stale).
     this.routingCache.delete(name);
+  }
+
+  private tuningPath(): string {
+    return join(this.config.poolDir, "tuning.json");
+  }
+
+  /** Default tuning; minHeadroom seeds from config so ROUTING_MIN_HEADROOM keeps working. */
+  private tuningDefaults(): RoutingTuning {
+    return { ...DEFAULT_TUNING_EXP, minHeadroom: this.config.routingMinHeadroom };
+  }
+
+  /**
+   * Resolved routing tuning: defaults overlaid with any valid fields from
+   * tuning.json. mtime-cached like routingFileFor so a live server sees an
+   * external edit without re-parsing on every request. Each field validates
+   * independently — a malformed value falls back to its default, never throwing.
+   */
+  getTuning(): RoutingTuning {
+    const defaults = this.tuningDefaults();
+    const path = this.tuningPath();
+    let mtimeMs: number;
+    try {
+      mtimeMs = statSync(path).mtimeMs;
+    } catch {
+      this.tuningCache = null;
+      return defaults;
+    }
+    if (this.tuningCache && this.tuningCache.mtimeMs === mtimeMs) return this.tuningCache.tuning;
+    const tuning = { ...defaults };
+    try {
+      const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<Record<keyof RoutingTuning, unknown>>;
+      for (const key of Object.keys(TUNING_BOUNDS) as (keyof RoutingTuning)[]) {
+        if (isValidTuningField(key, parsed[key])) tuning[key] = parsed[key];
+      }
+    } catch {
+      /* fall through to defaults */
+    }
+    this.tuningCache = { mtimeMs, tuning };
+    return tuning;
+  }
+
+  /** Merge validated knobs into tuning.json, preserving the rest, then drop the cache. */
+  setTuning(patch: Partial<RoutingTuning>): void {
+    const current = this.getTuning();
+    const next = { ...current };
+    for (const key of Object.keys(patch) as (keyof RoutingTuning)[]) {
+      const value = patch[key];
+      if (value === undefined) continue;
+      if (!isValidTuningField(key, value)) {
+        const b = TUNING_BOUNDS[key];
+        throw new Error(`${key} must be a number between ${b.min} and ${b.max}, got ${value}`);
+      }
+      next[key] = value;
+    }
+    writeFileSync(this.tuningPath(), JSON.stringify(next, null, 2));
+    // Drop the cache so a second write within one mtime tick is still seen.
+    this.tuningCache = null;
   }
 
   create(name: string): void {
@@ -577,13 +681,17 @@ export class AccountManager {
 
   /**
    * Weighted placement score for every tier-pool candidate:
-   *   score = weight × urgency × loadFactor × headroom5h
+   *   score = weight × urgency × loadFactor × headroom5h^fiveHourExp × weekly^weeklyExp
    * urgency is rank-based over 7d expiry (soonest first, nulls first to keep
    * probing unknown accounts), loadFactor decays with live pinned sessions,
-   * headroom is the same 5h gate the expiring strategy uses. Pure — no
-   * round-robin, no mutation — shared by pick() and routingSnapshot().
+   * headroom is the same 5h gate the expiring strategy uses, and `weekly` is the
+   * remaining 7d headroom — the window the gate deliberately drains, weighted
+   * here so the emptiest weekly allowance is preferred among eligible accounts.
+   * Exponents/slopes come from getTuning(). Pure — no round-robin, no mutation —
+   * shared by pick() and routingSnapshot().
    */
   private scoreWeighted(pool: Account[], family: string | null, now: number): WeightedCandidate[] {
+    const tuning = this.getTuning();
     const resets = pool.map((a) => candidateExpiryReset(a.usage, family, now));
     // Rank distinct reset values (nulls collapse to one, equal timestamps share
     // a rank); a Map gives O(1) rank lookup instead of a linear scan per account.
@@ -592,10 +700,13 @@ export class AccountManager {
 
     return pool.map((account, i) => {
       const expiryReset = resets[i]!;
-      const urgency = 1 / (1 + rankByReset.get(expiryReset)! * URGENCY_DECAY);
+      const urgency = 1 / (1 + rankByReset.get(expiryReset)! * tuning.urgencyDecay);
       const headroom = candidateGateHeadroom(account.usage, family, now);
-      const loadFactor = 1 / (1 + this.sessions.activeCount(account.name, now) * LOAD_SLOPE);
+      const weeklyHeadroom = candidateExpiryHeadroom(account.usage, family, now);
+      const loadFactor = 1 / (1 + this.sessions.activeCount(account.name, now) * tuning.loadSlope);
       const weight = this.weightFor(account.name);
+      const score =
+        weight * urgency * loadFactor * headroom ** tuning.fiveHourExp * weeklyHeadroom ** tuning.weeklyExp;
       return {
         account,
         expiryReset,
@@ -603,8 +714,9 @@ export class AccountManager {
         urgency,
         loadFactor,
         headroom,
-        score: weight * urgency * loadFactor * headroom,
-        viable: headroom >= this.config.routingMinHeadroom,
+        weeklyHeadroom,
+        score,
+        viable: headroom >= tuning.minHeadroom,
       };
     });
   }
@@ -684,13 +796,14 @@ export class AccountManager {
       const scored = this.scoreWeighted(tierPool, family, now);
       const ranked = this.rankWeighted(scored);
       best = ranked[0]!.account;
-      reason = buildWeightedReason(minPriority, reserveTiers, ranked, now, tierPool.length);
+      reason = buildWeightedReason(minPriority, reserveTiers, ranked, now, tierPool.length, this.getTuning());
       candidates = scored.map((c) => ({
         account: c.account.name,
         weight: c.weight,
         urgency: c.urgency,
         loadFactor: c.loadFactor,
         headroom: c.headroom,
+        weeklyHeadroom: c.weeklyHeadroom,
         score: c.score,
       }));
     }
@@ -886,10 +999,15 @@ function buildWeightedReason(
   ranked: WeightedCandidate[],
   now: number,
   poolSize: number,
+  tuning: RoutingTuning,
 ): NextPickReason {
   const chosen = ranked[0]!;
   const runnerUp = ranked[1] ?? null;
   const f = (n: number) => n.toFixed(2);
+  // Post-exponent effective factor values, so the shown numbers still multiply
+  // to the score (h5 = 5h headroom, h7 = weekly/7d headroom).
+  const h5 = chosen.headroom ** tuning.fiveHourExp;
+  const h7 = chosen.weeklyHeadroom ** tuning.weeklyExp;
 
   const expiryDetail =
     chosen.expiryReset != null
@@ -904,7 +1022,7 @@ function buildWeightedReason(
   const scoreFactor: NextPickFactor = {
     label: "Score",
     detail:
-      `${f(chosen.weight)}w × ${f(chosen.urgency)}u × ${f(chosen.loadFactor)}l × ${f(chosen.headroom)}h = ${f(chosen.score)}` +
+      `${f(chosen.weight)}w × ${f(chosen.urgency)}u × ${f(chosen.loadFactor)}l × ${f(h5)}h5 × ${f(h7)}h7 = ${f(chosen.score)}` +
       (runnerUp ? ` (next: ${runnerUp.account.name} ${f(runnerUp.score)})` : ""),
     decisive: scoreDecisive,
   };
@@ -966,17 +1084,15 @@ function bindingWindows(
     .filter((w) => w.reset == null || w.reset > now);
 }
 
-/** Rank-decay for the 7d-expiry urgency term: soonest 1.0, next 0.8, 0.67, … */
-const URGENCY_DECAY = 0.25;
-/** Active-session decay for the load term: 0 sessions 1.0, 1 → 0.67, 2 → 0.5. */
-const LOAD_SLOPE = 0.5;
-
 /** Factor breakdown behind one weighted-strategy candidate's score. */
 export interface WeightedFactors {
   weight: number;
   urgency: number;
   loadFactor: number;
+  /** Remaining 5h gate headroom (raw, pre-exponent). */
   headroom: number;
+  /** Remaining 7d/weekly headroom (raw, pre-exponent). */
+  weeklyHeadroom: number;
   score: number;
 }
 
@@ -1067,6 +1183,25 @@ function candidateGateHeadroom(usage: AccountUsage, modelFamily: string | null, 
     );
   }
   return headroomOf(windows.filter((w) => w !== excluded));
+}
+
+/**
+ * Remaining headroom [0, 1] of the account-wide "expiry" window — the
+ * longest-duration account-wide binding window (typically 7d), i.e. exactly the
+ * one candidateGateHeadroom excludes. The weighted strategy prefers the account
+ * with the most weekly room; the gate ignores this window, so the two compose
+ * (gate for eligibility, this for preference). 1 (full, no penalty) when that
+ * window is absent or reports no utilization / no snapshot.
+ */
+function candidateExpiryHeadroom(usage: AccountUsage, modelFamily: string | null, now: number): number {
+  const accountWide = bindingWindows(usage.rateLimitStatus, modelFamily, now).filter((w) => w.model == null);
+  // Mirror candidateGateHeadroom: a lone account-wide window IS the gate window,
+  // so there is no separate expiry/7d window — return full (no double-counting).
+  if (accountWide.length < 2) return 1;
+  const expiry = accountWide.reduce((a, w) =>
+    (windowDurationMs(w.key) ?? -1) > (windowDurationMs(a.key) ?? -1) ? w : a,
+  );
+  return headroomOf([expiry]);
 }
 
 function compareNullableReset(a: number | null, b: number | null): number {

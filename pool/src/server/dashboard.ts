@@ -196,6 +196,21 @@ export function dashboardHtml(): string {
   .routing-panel .why .fact { display: grid; grid-template-columns: 110px 1fr; gap: 10px; font-size: 12.5px; }
   .routing-panel .why .fk { color: var(--muted); }
   .routing-panel .why .fact.decisive .fv { color: var(--accent); font-weight: 600; }
+  .tuning-panel { display: none; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 14px 18px; margin-bottom: 20px; box-shadow: var(--shadow); }
+  .tuning-panel h3 { margin: 0 0 3px; font-size: 14px; font-weight: 600; letter-spacing: -0.01em; }
+  .tuning-panel .hint { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+  .tuning-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px 18px; }
+  .tuning-field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+  .tuning-field label { color: var(--muted); }
+  .tuning-field .k { color: var(--text); font-weight: 600; }
+  .tuning-field input { width: 100%; font: inherit; padding: 5px 7px; border: 1px solid var(--border);
+    border-radius: 6px; background: var(--surface-2); color: var(--text); }
+  .tuning-actions { margin-top: 13px; display: flex; align-items: center; gap: 10px; }
+  .tuning-actions button { background: var(--surface); color: var(--muted); border: 1px solid var(--border);
+    border-radius: 7px; padding: 5px 14px; font-size: 12px; cursor: pointer; }
+  .tuning-actions button:hover { color: var(--text); border-color: var(--border-strong); }
+  .tuning-actions .status { font-size: 12px; color: var(--muted); }
   .tier-edit { margin-top: 14px; padding-top: 13px; border-top: 1px solid var(--border);
     display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); }
   .tier-edit input { width: 60px; font: inherit; padding: 4px 6px; border: 1px solid var(--border);
@@ -225,6 +240,7 @@ export function dashboardHtml(): string {
 </header>
 <main>
   <div class="routing-panel" id="routing-panel"></div>
+  <div class="tuning-panel" id="tuning-panel"></div>
   <div class="banner" id="banner"></div>
   <div class="summary-tbl" id="summary" style="display:none"></div>
   <div class="grid" id="grid"></div>
@@ -359,6 +375,33 @@ function routingPanelHtml(routing) {
   return '<div class="pick">Next request &rarr; <b>' + esc(routing.nextPick.account) + "</b>"
     + '<div class="summary muted" title="' + esc(r.summary) + '">' + esc(r.summary) + "</div></div>"
     + '<ul class="why">' + items + "</ul>";
+}
+
+// Editable weighted-score knobs. Each field maps to a RoutingTuning key; the
+// score is weight × urgency × loadFactor × 5h^fiveHourExp × weekly^weeklyExp,
+// so a larger weeklyExp makes the emptier 7d window win more decisively.
+var TUNING_FIELDS = [
+  { key: "weeklyExp", label: "Weekly (7d) weight", step: "0.1", min: 0, max: 5 },
+  { key: "fiveHourExp", label: "5h weight", step: "0.1", min: 0, max: 5 },
+  { key: "loadSlope", label: "Session load", step: "0.1", min: 0, max: 5 },
+  { key: "urgencyDecay", label: "7d urgency decay", step: "0.05", min: 0, max: 5 },
+  { key: "minHeadroom", label: "Min headroom gate", step: "0.05", min: 0, max: 1 },
+];
+
+function tuningPanelHtml(tuning) {
+  if (!tuning) return "";
+  var fields = TUNING_FIELDS.map(function (f) {
+    var v = tuning[f.key];
+    var val = typeof v === "number" ? v : "";
+    return '<div class="tuning-field"><label><span class="k">' + esc(f.label) + "</span></label>"
+      + '<input type="number" step="' + f.step + '" min="' + f.min + '" max="' + f.max + '"'
+      + ' value="' + esc(String(val)) + '" data-tuning="' + f.key + '"></div>';
+  }).join("");
+  return '<h3>Routing tuning</h3>'
+    + '<div class="hint">Weighted-strategy score knobs. Higher weekly weight loads the account with the most 7d headroom first.</div>'
+    + '<div class="tuning-grid">' + fields + "</div>"
+    + '<div class="tuning-actions"><button id="tuning-apply">Apply</button>'
+    + '<span class="status" id="tuning-status"></span></div>';
 }
 
 function tierLabel(priority) {
@@ -548,6 +591,19 @@ async function refresh() {
         panel.style.display = "none";
       }
 
+      // Skip re-rendering the tuning panel while a field is focused, so a poll
+      // tick can't clobber a value the user is mid-edit.
+      const tuningPanel = document.getElementById("tuning-panel");
+      const editing = tuningPanel.contains(document.activeElement);
+      const tuningHtml = tuningPanelHtml(d.tuning);
+      if (tuningHtml && !editing) {
+        tuningPanel.innerHTML = tuningHtml;
+        tuningPanel.style.display = "block";
+        wireTuning();
+      } else if (!tuningHtml) {
+        tuningPanel.style.display = "none";
+      }
+
       if (avail === 0) {
         const anyAuthed = accounts.some((a) => a.authenticated);
         banner.innerHTML = anyAuthed
@@ -616,6 +672,38 @@ async function refresh() {
   } catch (e) {
     document.getElementById("p-updated").textContent = "offline";
   }
+}
+
+// Attach the Apply handler for the routing-tuning panel. Reads every changed
+// knob, POSTs the batch to /api/tuning, and reports the outcome inline.
+function wireTuning() {
+  const apply = document.getElementById("tuning-apply");
+  if (!apply) return;
+  apply.addEventListener("click", async () => {
+    const status = document.getElementById("tuning-status");
+    const patch = {};
+    let bad = false;
+    document.querySelectorAll("[data-tuning]").forEach((input) => {
+      const v = parseFloat(input.value);
+      const min = parseFloat(input.getAttribute("min"));
+      const max = parseFloat(input.getAttribute("max"));
+      if (!Number.isFinite(v) || v < min || v > max) { bad = true; return; }
+      patch[input.getAttribute("data-tuning")] = v;
+    });
+    if (bad) { if (status) status.textContent = "out of range"; return; }
+    if (status) status.textContent = "saving…";
+    try {
+      const res = await fetch("/api/tuning", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+      if (status) status.textContent = res.ok ? "saved" : "rejected";
+      refresh();
+    } catch (e) {
+      if (status) status.textContent = "offline";
+    }
+  });
 }
 refresh();
 setInterval(refresh, 4000);

@@ -9,7 +9,7 @@
  */
 
 import type { Config } from "../config.ts";
-import { AccountManager, isValidPriority, isValidWeight } from "../accounts/manager.ts";
+import { AccountManager, isValidPriority, isValidWeight, isValidTuningField, TUNING_BOUNDS, type RoutingTuning } from "../accounts/manager.ts";
 import { loadModelTable, resolveModel, type ModelRoute } from "../models.ts";
 import { runClaude } from "../subprocess/claude.ts";
 import type { Account } from "../accounts/types.ts";
@@ -66,6 +66,7 @@ export function startServer(config: Config): void {
         return json({
           accounts: mgr.listAccounts(),
           routing: mgr.routingSnapshot(),
+          tuning: mgr.getTuning(),
           usageWindowMs: config.usageWindowMs,
           now: Date.now(),
         });
@@ -79,6 +80,16 @@ export function startServer(config: Config): void {
           return json({ error: { message: "Invalid JSON body" } }, 400);
         }
         return handleRoutingUpdate(mgr, body);
+      }
+      if (path === "/api/tuning") {
+        if (req.method !== "POST") return json({ error: "method not allowed" }, 405);
+        let body: unknown;
+        try {
+          body = await req.json();
+        } catch {
+          return json({ error: { message: "Invalid JSON body" } }, 400);
+        }
+        return handleTuningUpdate(mgr, body);
       }
       if (req.method === "GET" && (path === "/v1/models" || path === "/models")) {
         return json({
@@ -339,6 +350,30 @@ export function handleRoutingUpdate(mgr: AccountManager, body: unknown): Respons
   if (priority !== undefined) mgr.setPriority(account, priority);
   if (weight !== undefined) mgr.setWeight(account, weight);
   return json({ ok: true, account, priority: mgr.priorityFor(account), weight: mgr.weightFor(account) });
+}
+
+/**
+ * Apply a dashboard routing-tuning edit: any subset of the weighted-score knobs.
+ * Each supplied field is validated against its bounds; the rest are preserved.
+ * Unauthenticated by design, like the other dashboard/status routes.
+ */
+export function handleTuningUpdate(mgr: AccountManager, body: unknown): Response {
+  const b = (body ?? {}) as Partial<Record<keyof RoutingTuning, unknown>>;
+  const patch: Partial<RoutingTuning> = {};
+  for (const key of Object.keys(TUNING_BOUNDS) as (keyof RoutingTuning)[]) {
+    const value = b[key];
+    if (value === undefined) continue;
+    if (!isValidTuningField(key, value)) {
+      const bound = TUNING_BOUNDS[key];
+      return json({ error: { message: `${key} must be a number between ${bound.min} and ${bound.max}` } }, 400);
+    }
+    patch[key] = value;
+  }
+  if (Object.keys(patch).length === 0) {
+    return json({ error: { message: "provide at least one tuning field" } }, 400);
+  }
+  mgr.setTuning(patch);
+  return json({ ok: true, tuning: mgr.getTuning() });
 }
 
 function checkAuth(req: Request, config: Config): Response | null {
