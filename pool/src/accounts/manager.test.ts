@@ -1449,4 +1449,51 @@ describe("routing tuning", () => {
       rmSync(poolDir, { recursive: true, force: true });
     }
   });
+
+  test("setTuning persists only explicit overrides, so untouched knobs keep seeding from config", () => {
+    const { poolDir, mgr } = weightedPool(["a"]);
+    try {
+      mgr.setTuning({ weeklyExp: 2 });
+      const onDisk = JSON.parse(readFileSync(join(poolDir, "tuning.json"), "utf8"));
+      expect(onDisk.weeklyExp).toBe(2);
+      expect("minHeadroom" in onDisk).toBe(false); // NOT frozen at the current default
+      // A restart with a different ROUTING_MIN_HEADROOM still takes effect for the
+      // untouched minHeadroom knob, while the explicit weeklyExp override persists.
+      const cfg2 = loadConfig({
+        poolDir,
+        accountsDir: join(poolDir, "accounts"),
+        usageFile: join(poolDir, "usage.json"),
+        sessionsFile: join(poolDir, "sessions.json"),
+        routingStrategy: "weighted",
+        routingMinHeadroom: 0.3,
+      });
+      const mgr2 = new AccountManager(cfg2);
+      const t = mgr2.getTuning();
+      expect(t.minHeadroom).toBeCloseTo(0.3, 8);
+      expect(t.weeklyExp).toBe(2);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a tuned minHeadroom gate also applies to the expiring strategy", () => {
+    const { poolDir, mgr } = tempPool(["mid", "fresh"], undefined, { routingStrategy: "expiring" });
+    try {
+      const now = Date.now();
+      // mid: 5h 40% used (gate headroom 0.6), 7d expires SOONEST → normally wins.
+      mgr.recordRateLimitSnapshot("mid", snapshot([
+        win("5h", { utilization: 0.4, reset: now + 60 * 60_000 }),
+        win("7d", { utilization: 0.2, reset: now + 1 * 86_400_000 }),
+      ]));
+      mgr.recordRateLimitSnapshot("fresh", snapshot([
+        win("5h", { utilization: 0.1, reset: now + 60 * 60_000 }),
+        win("7d", { utilization: 0.2, reset: now + 5 * 86_400_000 }),
+      ]));
+      expect(mgr.pick()?.name).toBe("mid"); // default gate 0.1 keeps mid viable
+      mgr.setTuning({ minHeadroom: 0.7 }); // above mid's 0.6 headroom → mid benched
+      expect(mgr.pick()?.name).toBe("fresh");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
 });

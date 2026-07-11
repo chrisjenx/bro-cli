@@ -345,23 +345,33 @@ export class AccountManager {
       return defaults;
     }
     if (this.tuningCache && this.tuningCache.mtimeMs === mtimeMs) return this.tuningCache.tuning;
-    const tuning = { ...defaults };
-    try {
-      const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<Record<keyof RoutingTuning, unknown>>;
-      for (const key of Object.keys(TUNING_BOUNDS) as (keyof RoutingTuning)[]) {
-        if (isValidTuningField(key, parsed[key])) tuning[key] = parsed[key];
-      }
-    } catch {
-      /* fall through to defaults */
-    }
+    const tuning = { ...defaults, ...this.readPersistedTuning() };
     this.tuningCache = { mtimeMs, tuning };
     return tuning;
   }
 
-  /** Merge validated knobs into tuning.json, preserving the rest, then drop the cache. */
+  /** Valid tuning overrides currently on disk ({} when the file is absent/unreadable). */
+  private readPersistedTuning(): Partial<RoutingTuning> {
+    const out: Partial<RoutingTuning> = {};
+    try {
+      const parsed = JSON.parse(readFileSync(this.tuningPath(), "utf8")) as Partial<Record<keyof RoutingTuning, unknown>>;
+      for (const key of Object.keys(TUNING_BOUNDS) as (keyof RoutingTuning)[]) {
+        if (isValidTuningField(key, parsed[key])) out[key] = parsed[key];
+      }
+    } catch {
+      /* no file / unreadable → no overrides */
+    }
+    return out;
+  }
+
+  /**
+   * Merge validated knobs into tuning.json's persisted OVERRIDES, then drop the
+   * cache. Only fields ever explicitly set are written — untouched knobs stay
+   * absent so they keep seeding from config/env (e.g. ROUTING_MIN_HEADROOM)
+   * across restarts, rather than being frozen at whatever the default was now.
+   */
   setTuning(patch: Partial<RoutingTuning>): void {
-    const current = this.getTuning();
-    const next = { ...current };
+    const next = this.readPersistedTuning();
     for (const key of Object.keys(patch) as (keyof RoutingTuning)[]) {
       const value = patch[key];
       if (value === undefined) continue;
@@ -659,14 +669,19 @@ export class AccountManager {
    * a best-effort fallback. Pure — no round-robin, no mutation — so pick() and
    * the read-only snapshot share one ordering and never drift.
    */
-  private sortExpiringCandidates(pool: Account[], family: string | null, now: number): ExpiringCandidate[] {
+  private sortExpiringCandidates(
+    pool: Account[],
+    family: string | null,
+    now: number,
+    minHeadroom: number = this.getTuning().minHeadroom,
+  ): ExpiringCandidate[] {
     const candidates: ExpiringCandidate[] = pool.map((account) => {
       const gateHeadroom = candidateGateHeadroom(account.usage, family, now);
       return {
         account,
         gateHeadroom,
         expiryReset: candidateExpiryReset(account.usage, family, now),
-        viable: gateHeadroom >= this.config.routingMinHeadroom,
+        viable: gateHeadroom >= minHeadroom,
       };
     });
     return [...viableFirst(candidates)].sort(compareExpiringCandidates);
@@ -793,9 +808,10 @@ export class AccountManager {
       best = ranked[0]!.account;
       reason = buildHeadroomReason(minPriority, reserveTiers, tierPool.length, ranked);
     } else if (this.config.routingStrategy === "expiring") {
-      const ranked = this.sortExpiringCandidates(tierPool, family, now);
+      const minHeadroom = this.getTuning().minHeadroom;
+      const ranked = this.sortExpiringCandidates(tierPool, family, now, minHeadroom);
       best = ranked[0]!.account;
-      reason = buildExpiringReason(minPriority, reserveTiers, this.config.routingMinHeadroom, ranked, now, tierPool.length);
+      reason = buildExpiringReason(minPriority, reserveTiers, minHeadroom, ranked, now, tierPool.length);
     } else {
       const tuning = this.getTuning();
       const scored = this.scoreWeighted(tierPool, family, now, tuning);
