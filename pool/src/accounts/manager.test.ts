@@ -1359,6 +1359,30 @@ describe("weighted strategy", () => {
     }
   });
 
+  test("a weekly-spent account with an unknown reset ranks last, not first (no probe-boost)", () => {
+    const { poolDir, mgr } = weightedPool(["spent", "known-later"]);
+    try {
+      const now = Date.now();
+      // spent: 5h window healthy (viable) but the 7d allowance is fully consumed
+      // with NO known reset -> usableFor keeps it in the pool (spentWindowReason
+      // needs a future reset to sideline), and candidateExpiryReset returns null
+      // for the exhausted 7d window. It must NOT be treated like an unprobed
+      // account (which would hand it max urgency and jump it to the front).
+      mgr.recordRateLimitSnapshot("spent", snapshot([
+        win("5h", { utilization: 0, reset: now + 3600_000 }),
+        win("7d", { utilization: 1 }), // spent, reset unknown (null) -> stays available
+      ]));
+      // known-later: a real future reset, days out.
+      mgr.recordRateLimitSnapshot("known-later", snapshot([
+        win("5h", { utilization: 0, reset: now + 3600_000 }),
+        win("7d", { utilization: 0.5, reset: now + 5 * 86_400_000 }),
+      ]));
+      expect(mgr.pick()?.name).toBe("known-later");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
 });
 
 describe("routing tuning", () => {

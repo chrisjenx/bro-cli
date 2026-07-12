@@ -716,8 +716,13 @@ export class AccountManager {
     const rows = pool.map((account) => {
       const expiryReset = candidateExpiryReset(account.usage, family, now);
       const { gate: headroom } = partitionHeadroom(account.usage, family, now);
-      // Unknown reset (no snapshot) sorts first (−Infinity) so we probe it.
-      const rankKey = expiryReset ?? Number.NEGATIVE_INFINITY;
+      // Unknown reset (no snapshot) sorts first to probe; a spent window sorts
+      // LAST (its allowance is already burned) — both surface as a null reset.
+      const rankKey =
+        expiryReset ??
+        (weeklyWindowSpent(account.usage, family, now)
+          ? Number.POSITIVE_INFINITY
+          : Number.NEGATIVE_INFINITY);
       return { account, expiryReset, headroom, rankKey };
     });
     const distinct = [...new Set(rows.map((r) => r.rankKey))].sort((a, b) => a - b);
@@ -1181,6 +1186,22 @@ function candidateExpiryReset(usage: AccountUsage, modelFamily: string | null, n
     .filter((w) => w.reset != null && w.reset > now && (w.utilization == null || w.utilization < 1))
     .map((w) => w.reset!);
   return resets.length > 0 ? Math.min(...resets) : null;
+}
+
+/**
+ * True when the account's longest binding window (its 7d/expiry allowance) is
+ * fully consumed. candidateExpiryReset returns null for both "no data" and
+ * "spent"; the weighted strategy uses this to tell them apart so an exhausted
+ * account ranks LAST instead of inheriting an unprobed account's first-place
+ * (max-urgency) rank. Mirrors candidateExpiryReset's window resolution.
+ */
+function weeklyWindowSpent(usage: AccountUsage, modelFamily: string | null, now: number): boolean {
+  const windows = bindingWindows(usage.rateLimitStatus, modelFamily, now);
+  const maxDur = Math.max(-1, ...windows.map((w) => windowDurationMs(w.key) ?? -1));
+  if (maxDur < 0) return false; // no expiry window at all → unknown, not spent
+  return windows
+    .filter((w) => (windowDurationMs(w.key) ?? -1) === maxDur)
+    .every((w) => w.utilization != null && w.utilization >= 1);
 }
 
 /**
