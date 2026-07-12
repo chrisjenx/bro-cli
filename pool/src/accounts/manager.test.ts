@@ -1526,4 +1526,25 @@ describe("routing tuning", () => {
       rmSync(poolDir, { recursive: true, force: true });
     }
   });
+
+  test("expiring reason marks 7d expiry decisive when an unprobed account beats a spent one", () => {
+    const { poolDir, mgr } = tempPool(["unprobed", "spent"], undefined, { routingStrategy: "expiring" });
+    try {
+      const now = Date.now();
+      // unprobed: no snapshot -> ranks first (probe). spent: 7d fully consumed,
+      // unknown reset -> ranks last. Both have null expiryReset, so the reason's
+      // "decisive" flag must come from the shared rank key, not raw reset compare.
+      mgr.recordRateLimitSnapshot("spent", snapshot([
+        win("5h", { utilization: 0, reset: now + 3600_000 }),
+        win("7d", { utilization: 1 }),
+      ]));
+      const reason = mgr.routingSnapshot().nextPick!.reason;
+      const byLabel = (l: string) => reason.factors.find((f) => f.label === l)!;
+      expect(mgr.routingSnapshot().nextPick!.account).toBe("unprobed");
+      expect(byLabel("7d expiry").decisive).toBe(true);
+      expect(byLabel("Tie-break").decisive).toBe(false);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
 });

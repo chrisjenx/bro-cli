@@ -991,7 +991,10 @@ function buildExpiringReason(
       ? ` (next: ${runnerUp.account.name} ${formatEta(runnerUp.expiryReset - now)})`
       : ` (next: ${runnerUp.account.name} no reset data)`;
   }
-  const resetDecisive = runnerUp != null && compareNullableReset(chosen.expiryReset, runnerUp.expiryReset) !== 0;
+  // Compare the shared expiry rank key (not the raw reset) so a spent runner-up
+  // (+Infinity) vs an unprobed chosen (−Infinity) still reads as expiry-decisive,
+  // matching how sortExpiringCandidates actually ordered them.
+  const resetDecisive = runnerUp != null && chosen.rankKey !== runnerUp.rankKey;
   const expiryFactor: NextPickFactor = {
     label: "7d expiry",
     detail: `${chosenEta} · soonest eligible${nextPart}`,
@@ -1232,13 +1235,6 @@ function candidateGateHeadroom(usage: AccountUsage, modelFamily: string | null, 
     );
   }
   return headroomOf(windows.filter((w) => w !== excluded));
-}
-
-function compareNullableReset(a: number | null, b: number | null): number {
-  if (a != null && b != null) return a - b;
-  if (a == null && b == null) return 0;
-  // null == "no usable expiry data" -> probe it first to refresh real headers.
-  return a == null ? -1 : 1;
 }
 
 function compareExpiringCandidates(a: ExpiringCandidate, b: ExpiringCandidate): number {
