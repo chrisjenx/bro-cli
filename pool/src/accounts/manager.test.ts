@@ -1242,6 +1242,28 @@ describe("weighted strategy", () => {
     }
   });
 
+  test("expiry order beats weekly headroom: the soonest-resetting account is drained first even when nearly full", () => {
+    const { poolDir, mgr } = weightedPool(["expiring-soon", "fresh"]);
+    try {
+      const now = Date.now();
+      // expiring-soon: 7d window 97% used but resets in ~3h -> burn it before reset.
+      mgr.recordRateLimitSnapshot("expiring-soon", snapshot([
+        win("5h", { utilization: 0, reset: now + 3600_000 }),
+        win("7d", { utilization: 0.97, reset: now + 3 * 3600_000 }),
+      ]));
+      // fresh: half the weekly window left, but resets days away.
+      mgr.recordRateLimitSnapshot("fresh", snapshot([
+        win("5h", { utilization: 0, reset: now + 3600_000 }),
+        win("7d", { utilization: 0.49, reset: now + 65 * 3600_000 }),
+      ]));
+      // Old formula multiplied by weekly headroom (0.03) and buried the expiring
+      // account; the fix ranks purely on reset order at equal 5h load.
+      expect(mgr.pick()?.name).toBe("expiring-soon");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
   test("manual weight biases selection between otherwise-equal accounts", () => {
     const { poolDir, mgr } = weightedPool(["plain", "boosted"]);
     try {
@@ -1325,7 +1347,7 @@ describe("weighted strategy", () => {
       const t = mgr.getTuning();
       for (const c of cands) {
         expect(c.score).toBeCloseTo(
-          c.weight * c.urgency * c.loadFactor * c.headroom ** t.fiveHourExp * c.weeklyHeadroom ** t.weeklyExp,
+          c.weight * c.urgency * c.loadFactor * c.headroom ** t.fiveHourExp,
           8,
         );
       }
@@ -1337,63 +1359,6 @@ describe("weighted strategy", () => {
     }
   });
 
-  test("weekly (7d) headroom outranks 5h: the emptier-weekly account wins with default tuning", () => {
-    const { poolDir, mgr } = weightedPool(["empty-weekly", "low-5h"]);
-    try {
-      const now = Date.now();
-      // Same 7d reset -> equal urgency, so only headroom differs (the screenshot).
-      const reset7d = now + 3 * 86_400_000;
-      // empty-weekly: more 5h used (0.30) but far more weekly room (11% used).
-      mgr.recordRateLimitSnapshot("empty-weekly", snapshot([
-        win("5h", { utilization: 0.3, reset: now + 3600_000 }),
-        win("7d", { utilization: 0.11, reset: reset7d }),
-      ]));
-      // low-5h: barely any 5h used (0.06) but 41% of the weekly window gone.
-      mgr.recordRateLimitSnapshot("low-5h", snapshot([
-        win("5h", { utilization: 0.06, reset: now + 3600_000 }),
-        win("7d", { utilization: 0.41, reset: reset7d }),
-      ]));
-      // Old score (5h only) would pick low-5h (0.94 > 0.70); the weekly factor
-      // (0.89^0.9 vs 0.59^0.9) flips it to empty-weekly.
-      expect(mgr.pick()?.name).toBe("empty-weekly");
-    } finally {
-      rmSync(poolDir, { recursive: true, force: true });
-    }
-  });
-
-  test("weeklyExp is load-bearing: setting it to 0 restores the 5h-driven winner", () => {
-    const { poolDir, mgr } = weightedPool(["empty-weekly", "low-5h"]);
-    try {
-      const now = Date.now();
-      const reset7d = now + 3 * 86_400_000;
-      mgr.recordRateLimitSnapshot("empty-weekly", snapshot([
-        win("5h", { utilization: 0.3, reset: now + 3600_000 }),
-        win("7d", { utilization: 0.11, reset: reset7d }),
-      ]));
-      mgr.recordRateLimitSnapshot("low-5h", snapshot([
-        win("5h", { utilization: 0.06, reset: now + 3600_000 }),
-        win("7d", { utilization: 0.41, reset: reset7d }),
-      ]));
-      mgr.setTuning({ weeklyExp: 0 });
-      expect(mgr.pick()?.name).toBe("low-5h");
-    } finally {
-      rmSync(poolDir, { recursive: true, force: true });
-    }
-  });
-
-  test("no 7d window -> weekly headroom is full (1) and does not change the score", () => {
-    const { poolDir, mgr } = weightedPool(["only-5h"]);
-    try {
-      const now = Date.now();
-      mgr.recordRateLimitSnapshot("only-5h", snapshot([win("5h", { utilization: 0.4, reset: now + 3600_000 })]));
-      const c = mgr.routingSnapshot().candidates!.find((x) => x.account === "only-5h")!;
-      expect(c.weeklyHeadroom).toBe(1);
-      const t = mgr.getTuning();
-      expect(c.score).toBeCloseTo(c.weight * c.urgency * c.loadFactor * c.headroom ** t.fiveHourExp, 8);
-    } finally {
-      rmSync(poolDir, { recursive: true, force: true });
-    }
-  });
 });
 
 describe("routing tuning", () => {
@@ -1401,10 +1366,9 @@ describe("routing tuning", () => {
     const { poolDir, mgr } = weightedPool(["a"]);
     try {
       const t = mgr.getTuning();
-      expect(t.weeklyExp).toBe(0.9);
       expect(t.fiveHourExp).toBe(1);
       expect(t.loadSlope).toBe(0.5);
-      expect(t.urgencyDecay).toBe(0.25);
+      expect(t.urgencyDecay).toBe(0.75);
       expect(t.minHeadroom).toBeCloseTo(0.1, 8);
     } finally {
       rmSync(poolDir, { recursive: true, force: true });
@@ -1414,14 +1378,14 @@ describe("routing tuning", () => {
   test("setTuning round-trips and is visible immediately (cache invalidated within one mtime tick)", () => {
     const { poolDir, mgr } = weightedPool(["a"]);
     try {
-      mgr.setTuning({ weeklyExp: 2 });
+      mgr.setTuning({ fiveHourExp: 2 });
       mgr.setTuning({ loadSlope: 1 }); // second write within the same fs mtime tick
       const t = mgr.getTuning();
-      expect(t.weeklyExp).toBe(2);
+      expect(t.fiveHourExp).toBe(2);
       expect(t.loadSlope).toBe(1);
       // Persisted to tuning.json in the pool dir.
       const onDisk = JSON.parse(readFileSync(join(poolDir, "tuning.json"), "utf8"));
-      expect(onDisk.weeklyExp).toBe(2);
+      expect(onDisk.fiveHourExp).toBe(2);
       expect(onDisk.loadSlope).toBe(1);
     } finally {
       rmSync(poolDir, { recursive: true, force: true });
@@ -1431,9 +1395,9 @@ describe("routing tuning", () => {
   test("an out-of-bounds field in tuning.json falls back to its default; valid fields still apply", () => {
     const { poolDir, mgr } = weightedPool(["a"]);
     try {
-      writeFileSync(join(poolDir, "tuning.json"), JSON.stringify({ weeklyExp: 99, fiveHourExp: 2 }));
+      writeFileSync(join(poolDir, "tuning.json"), JSON.stringify({ urgencyDecay: 99, fiveHourExp: 2 }));
       const t = mgr.getTuning();
-      expect(t.weeklyExp).toBe(0.9); // 99 > max 5 -> default
+      expect(t.urgencyDecay).toBe(0.75); // 99 > max 5 -> default
       expect(t.fiveHourExp).toBe(2); // valid -> applied
     } finally {
       rmSync(poolDir, { recursive: true, force: true });
@@ -1444,7 +1408,7 @@ describe("routing tuning", () => {
     const { poolDir, mgr } = weightedPool(["a"]);
     try {
       expect(() => mgr.setTuning({ minHeadroom: 2 })).toThrow();
-      expect(() => mgr.setTuning({ weeklyExp: -1 })).toThrow();
+      expect(() => mgr.setTuning({ fiveHourExp: -1 })).toThrow();
     } finally {
       rmSync(poolDir, { recursive: true, force: true });
     }
@@ -1453,12 +1417,12 @@ describe("routing tuning", () => {
   test("setTuning persists only explicit overrides, so untouched knobs keep seeding from config", () => {
     const { poolDir, mgr } = weightedPool(["a"]);
     try {
-      mgr.setTuning({ weeklyExp: 2 });
+      mgr.setTuning({ fiveHourExp: 2 });
       const onDisk = JSON.parse(readFileSync(join(poolDir, "tuning.json"), "utf8"));
-      expect(onDisk.weeklyExp).toBe(2);
+      expect(onDisk.fiveHourExp).toBe(2);
       expect("minHeadroom" in onDisk).toBe(false); // NOT frozen at the current default
       // A restart with a different ROUTING_MIN_HEADROOM still takes effect for the
-      // untouched minHeadroom knob, while the explicit weeklyExp override persists.
+      // untouched minHeadroom knob, while the explicit fiveHourExp override persists.
       const cfg2 = loadConfig({
         poolDir,
         accountsDir: join(poolDir, "accounts"),
@@ -1470,7 +1434,7 @@ describe("routing tuning", () => {
       const mgr2 = new AccountManager(cfg2);
       const t = mgr2.getTuning();
       expect(t.minHeadroom).toBeCloseTo(0.3, 8);
-      expect(t.weeklyExp).toBe(2);
+      expect(t.fiveHourExp).toBe(2);
     } finally {
       rmSync(poolDir, { recursive: true, force: true });
     }

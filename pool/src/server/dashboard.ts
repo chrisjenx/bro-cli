@@ -12,7 +12,6 @@ import { TUNING_BOUNDS } from "../accounts/manager.ts";
 
 /** Presentation for each tuning knob; min/max come from the shared TUNING_BOUNDS. */
 const TUNING_LABELS: Record<keyof typeof TUNING_BOUNDS, { label: string; step: string }> = {
-  weeklyExp: { label: "Weekly (7d) weight", step: "0.1" },
   fiveHourExp: { label: "5h weight", step: "0.1" },
   loadSlope: { label: "Session load", step: "0.1" },
   urgencyDecay: { label: "7d urgency decay", step: "0.05" },
@@ -409,8 +408,8 @@ function routingPanelHtml(routing) {
 
 // Editable weighted-score knobs (key/label/step/min/max), built server-side
 // from TUNING_BOUNDS so the input ranges match the server's validation. The
-// score is weight × urgency × loadFactor × 5h^fiveHourExp × weekly^weeklyExp,
-// so a larger weeklyExp makes the emptier 7d window win more decisively.
+// score is weight × urgency × loadFactor × 5h^fiveHourExp; urgency ranks by
+// soonest 7d reset, so sooner-to-expire accounts are drained first.
 var TUNING_FIELDS = ${JSON.stringify(tuningFields)};
 
 function tuningPanelHtml(tuning) {
@@ -424,7 +423,7 @@ function tuningPanelHtml(tuning) {
   }).join("");
   return '<summary>Routing tuning<span class="caret">▶</span></summary>'
     + '<div class="tuning-body">'
-    + '<div class="hint">Weighted-strategy score knobs. Higher weekly weight loads the account with the most 7d headroom first.</div>'
+    + '<div class="hint">Weighted-strategy score knobs. Accounts are drained in 7d-expiry order (soonest first); 5h headroom and session load spill new sessions to the next account.</div>'
     + '<div class="tuning-grid">' + fields + "</div>"
     + '<div class="tuning-actions"><button id="tuning-apply">Apply</button>'
     + '<span class="status" id="tuning-status"></span></div>'

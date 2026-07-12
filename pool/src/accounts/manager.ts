@@ -60,8 +60,6 @@ export function isValidWeight(n: unknown): n is number {
  * retuned without a redeploy. See scoreWeighted for how each is applied.
  */
 export interface RoutingTuning {
-  /** Exponent on the 7d ("weekly") headroom factor. Higher = weekly matters more. */
-  weeklyExp: number;
   /** Exponent on the 5h headroom factor. */
   fiveHourExp: number;
   /** Active-session load decay: 0 sessions → 1.0, 1 → 1/(1+slope), … */
@@ -78,7 +76,6 @@ export interface RoutingTuning {
  * validates independently so one bad value never rejects the rest.
  */
 export const TUNING_BOUNDS: Record<keyof RoutingTuning, { min: number; max: number }> = {
-  weeklyExp: { min: 0, max: 5 },
   fiveHourExp: { min: 0, max: 5 },
   loadSlope: { min: 0, max: 5 },
   urgencyDecay: { min: 0, max: 5 },
@@ -87,10 +84,12 @@ export const TUNING_BOUNDS: Record<keyof RoutingTuning, { min: number; max: numb
 
 /** Defaults for the tuning knobs except minHeadroom, which seeds from config (env). */
 const DEFAULT_TUNING_EXP: Omit<RoutingTuning, "minHeadroom"> = {
-  weeklyExp: 0.9,
   fiveHourExp: 1,
   loadSlope: 0.5,
-  urgencyDecay: 0.25,
+  // Soonest-to-reset account gets urgency 1.0; each later reset-rank decays by
+  // this. 0.75 tuned against loadSlope 0.5 so the drain account holds ~1 live
+  // session and spills the 2nd to the next-expiring account.
+  urgencyDecay: 0.75,
 };
 
 /** True when `n` is a finite number within `key`'s bounds. */
@@ -696,14 +695,14 @@ export class AccountManager {
 
   /**
    * Weighted placement score for every tier-pool candidate:
-   *   score = weight × urgency × loadFactor × headroom5h^fiveHourExp × weekly^weeklyExp
-   * urgency is rank-based over 7d expiry (soonest first, nulls first to keep
-   * probing unknown accounts), loadFactor decays with live pinned sessions,
-   * headroom is the same 5h gate the expiring strategy uses, and `weekly` is the
-   * remaining 7d headroom — the window the gate deliberately drains, weighted
-   * here so the emptiest weekly allowance is preferred among eligible accounts.
-   * Exponents/slopes come from getTuning(). Pure — no round-robin, no mutation —
-   * shared by pick() and routingSnapshot().
+   *   score = weight × urgency × loadFactor × gate5h^fiveHourExp
+   * urgency is rank-based over 7d expiry (soonest reset → 1.0; tied resets share
+   * a rank so their cohort is ordered by the remaining factors; nulls/unknown
+   * first to probe). loadFactor decays with live pinned sessions, gate is the 5h
+   * headroom (same gate the expiring strategy uses). The 7d/weekly *headroom* is
+   * deliberately NOT a factor: draining in reset order is the goal, so a nearly
+   * full soon-to-reset account must not be penalised for being full. Exponents/
+   * slopes come from getTuning(). Pure — shared by pick() and routingSnapshot().
    */
   private scoreWeighted(
     pool: Account[],
@@ -711,21 +710,24 @@ export class AccountManager {
     now: number,
     tuning: RoutingTuning = this.getTuning(),
   ): WeightedCandidate[] {
-    const resets = pool.map((a) => candidateExpiryReset(a.usage, family, now));
-    // Rank distinct reset values (nulls collapse to one, equal timestamps share
-    // a rank); a Map gives O(1) rank lookup instead of a linear scan per account.
-    const distinct = [...new Set(resets)].sort(compareNullableReset);
-    const rankByReset = new Map(distinct.map((r, i) => [r, i] as const));
+    // Gather each account's expiry reset + 5h gate first, then rank over the
+    // distinct reset values so tied resets share an urgency rank (a cohort the
+    // secondary factors — load, 5h headroom, weight — order among).
+    const rows = pool.map((account) => {
+      const expiryReset = candidateExpiryReset(account.usage, family, now);
+      const { gate: headroom } = partitionHeadroom(account.usage, family, now);
+      // Unknown reset (no snapshot) sorts first (−Infinity) so we probe it.
+      const rankKey = expiryReset ?? Number.NEGATIVE_INFINITY;
+      return { account, expiryReset, headroom, rankKey };
+    });
+    const distinct = [...new Set(rows.map((r) => r.rankKey))].sort((a, b) => a - b);
+    const rankByReset = new Map(distinct.map((k, i) => [k, i] as const));
 
-    return pool.map((account, i) => {
-      const expiryReset = resets[i]!;
-      const urgency = 1 / (1 + rankByReset.get(expiryReset)! * tuning.urgencyDecay);
-      // One partition pass yields both headrooms; they can't drift apart.
-      const { gate: headroom, expiry: weeklyHeadroom } = partitionHeadroom(account.usage, family, now);
+    return rows.map(({ account, expiryReset, headroom, rankKey }) => {
+      const urgency = 1 / (1 + rankByReset.get(rankKey)! * tuning.urgencyDecay);
       const loadFactor = 1 / (1 + this.sessions.activeCount(account.name, now) * tuning.loadSlope);
       const weight = this.weightFor(account.name);
-      const score =
-        weight * urgency * loadFactor * headroom ** tuning.fiveHourExp * weeklyHeadroom ** tuning.weeklyExp;
+      const score = weight * urgency * loadFactor * headroom ** tuning.fiveHourExp;
       return {
         account,
         expiryReset,
@@ -733,7 +735,6 @@ export class AccountManager {
         urgency,
         loadFactor,
         headroom,
-        weeklyHeadroom,
         score,
         viable: headroom >= tuning.minHeadroom,
       };
@@ -824,7 +825,6 @@ export class AccountManager {
         urgency: c.urgency,
         loadFactor: c.loadFactor,
         headroom: c.headroom,
-        weeklyHeadroom: c.weeklyHeadroom,
         score: c.score,
       }));
     }
@@ -1025,10 +1025,9 @@ function buildWeightedReason(
   const chosen = ranked[0]!;
   const runnerUp = ranked[1] ?? null;
   const f = (n: number) => n.toFixed(2);
-  // Post-exponent effective factor values, so the shown numbers still multiply
-  // to the score (h5 = 5h headroom, h7 = weekly/7d headroom).
+  // Post-exponent effective 5h-headroom factor, so the shown numbers still
+  // multiply to the score.
   const h5 = chosen.headroom ** tuning.fiveHourExp;
-  const h7 = chosen.weeklyHeadroom ** tuning.weeklyExp;
 
   const expiryDetail =
     chosen.expiryReset != null
@@ -1043,7 +1042,7 @@ function buildWeightedReason(
   const scoreFactor: NextPickFactor = {
     label: "Score",
     detail:
-      `${f(chosen.weight)}w × ${f(chosen.urgency)}u × ${f(chosen.loadFactor)}l × ${f(h5)}h5 × ${f(h7)}h7 = ${f(chosen.score)}` +
+      `${f(chosen.weight)}w × ${f(chosen.urgency)}u × ${f(chosen.loadFactor)}l × ${f(h5)}h5 = ${f(chosen.score)}` +
       (runnerUp ? ` (next: ${runnerUp.account.name} ${f(runnerUp.score)})` : ""),
     decisive: scoreDecisive,
   };
@@ -1112,8 +1111,6 @@ export interface WeightedFactors {
   loadFactor: number;
   /** Remaining 5h gate headroom (raw, pre-exponent). */
   headroom: number;
-  /** Remaining 7d/weekly headroom (raw, pre-exponent). */
-  weeklyHeadroom: number;
   score: number;
 }
 
