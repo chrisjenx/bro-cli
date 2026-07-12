@@ -676,10 +676,12 @@ export class AccountManager {
   ): ExpiringCandidate[] {
     const candidates: ExpiringCandidate[] = pool.map((account) => {
       const gateHeadroom = candidateGateHeadroom(account.usage, family, now);
+      const expiryReset = candidateExpiryReset(account.usage, family, now);
       return {
         account,
         gateHeadroom,
-        expiryReset: candidateExpiryReset(account.usage, family, now),
+        expiryReset,
+        rankKey: expiryRankKey(account.usage, family, now, expiryReset),
         viable: gateHeadroom >= minHeadroom,
       };
     });
@@ -715,14 +717,8 @@ export class AccountManager {
     // secondary factors — load, 5h headroom, weight — order among).
     const rows = pool.map((account) => {
       const expiryReset = candidateExpiryReset(account.usage, family, now);
-      const { gate: headroom } = partitionHeadroom(account.usage, family, now);
-      // Unknown reset (no snapshot) sorts first to probe; a spent window sorts
-      // LAST (its allowance is already burned) — both surface as a null reset.
-      const rankKey =
-        expiryReset ??
-        (weeklyWindowSpent(account.usage, family, now)
-          ? Number.POSITIVE_INFINITY
-          : Number.NEGATIVE_INFINITY);
+      const headroom = candidateGateHeadroom(account.usage, family, now);
+      const rankKey = expiryRankKey(account.usage, family, now, expiryReset);
       return { account, expiryReset, headroom, rankKey };
     });
     const distinct = [...new Set(rows.map((r) => r.rankKey))].sort((a, b) => a - b);
@@ -1129,6 +1125,7 @@ interface ExpiringCandidate {
   account: Account;
   gateHeadroom: number;
   expiryReset: number | null;
+  rankKey: number;
   viable: boolean;
 }
 
@@ -1171,6 +1168,19 @@ function candidateMinHeadroom(usage: AccountUsage, modelFamily: string | null, n
 }
 
 /**
+ * The binding windows of the longest duration — the account-wide 7d/expiry
+ * allowance (or a model-scoped equivalent for a model request). Empty when
+ * there is no window data. Single source of truth for "which window is the 7d
+ * one", shared by candidateExpiryReset and weeklyWindowSpent so they can't drift.
+ */
+function longestBindingWindows(usage: AccountUsage, modelFamily: string | null, now: number): RateLimitWindow[] {
+  const windows = bindingWindows(usage.rateLimitStatus, modelFamily, now);
+  const maxDur = Math.max(-1, ...windows.map((w) => windowDurationMs(w.key) ?? -1));
+  if (maxDur < 0) return [];
+  return windows.filter((w) => (windowDurationMs(w.key) ?? -1) === maxDur);
+}
+
+/**
  * The "expiry" window for a request is the longest-duration binding window
  * (account-wide 7d, or a model-scoped 7d-<model> when it is the longest for a
  * model request). Its reset — soonest among any duration ties, and only when in
@@ -1178,50 +1188,41 @@ function candidateMinHeadroom(usage: AccountUsage, modelFamily: string | null, n
  * roll over is spent first so its allowance isn't wasted. null when unknown.
  */
 function candidateExpiryReset(usage: AccountUsage, modelFamily: string | null, now: number): number | null {
-  const windows = bindingWindows(usage.rateLimitStatus, modelFamily, now);
-  const maxDur = Math.max(-1, ...windows.map((w) => windowDurationMs(w.key) ?? -1));
-  if (maxDur < 0) return null;
-  const resets = windows
-    .filter((w) => (windowDurationMs(w.key) ?? -1) === maxDur)
+  const resets = longestBindingWindows(usage, modelFamily, now)
     .filter((w) => w.reset != null && w.reset > now && (w.utilization == null || w.utilization < 1))
     .map((w) => w.reset!);
   return resets.length > 0 ? Math.min(...resets) : null;
 }
 
 /**
- * True when the account's longest binding window (its 7d/expiry allowance) is
- * fully consumed. candidateExpiryReset returns null for both "no data" and
- * "spent"; the weighted strategy uses this to tell them apart so an exhausted
- * account ranks LAST instead of inheriting an unprobed account's first-place
- * (max-urgency) rank. Mirrors candidateExpiryReset's window resolution.
+ * True when any of the account's longest binding windows (its 7d/expiry
+ * allowance) is fully consumed. candidateExpiryReset returns null for both "no
+ * data" and "spent"; expiryRankKey uses this to tell them apart so an exhausted
+ * account ranks LAST instead of inheriting an unprobed account's first-place rank.
  */
 function weeklyWindowSpent(usage: AccountUsage, modelFamily: string | null, now: number): boolean {
-  const windows = bindingWindows(usage.rateLimitStatus, modelFamily, now);
-  const maxDur = Math.max(-1, ...windows.map((w) => windowDurationMs(w.key) ?? -1));
-  if (maxDur < 0) return false; // no expiry window at all → unknown, not spent
-  return windows
-    .filter((w) => (windowDurationMs(w.key) ?? -1) === maxDur)
-    .every((w) => w.utilization != null && w.utilization >= 1);
+  return longestBindingWindows(usage, modelFamily, now).some((w) => w.utilization != null && w.utilization >= 1);
 }
 
 /**
- * Split an account's binding windows into the two headrooms the routing
- * strategies need, in one pass so their definitions can't drift:
- *   - `gate`: tightest binding window EXCEPT the account-wide expiry
- *     (longest-duration account-wide) window, which is deliberately excluded so
- *     we keep draining it ("pending headroom on the 5-hour window", not the
- *     7-day one). The exclusion only applies when a shorter account-wide window
- *     also exists, so a lone 5h window still gates.
- *   - `expiry`: headroom of that excluded window (the weekly/7d allowance the
- *     weighted strategy prefers to spread load across); 1 when there is no
- *     separate expiry window.
- * Both are 1 (full) when the relevant set is empty / there is no snapshot.
+ * Expiry-order ranking key shared by the weighted and expiring strategies:
+ * soonest future reset first, an unprobed account (no data) before everything
+ * so it gets probed (−Infinity), and a spent-but-still-available account LAST
+ * (+Infinity — its 7d allowance is already burned). `reset` is the account's
+ * candidateExpiryReset, passed in so callers don't recompute it.
  */
-function partitionHeadroom(
-  usage: AccountUsage,
-  modelFamily: string | null,
-  now: number,
-): { gate: number; expiry: number } {
+function expiryRankKey(usage: AccountUsage, modelFamily: string | null, now: number, reset: number | null): number {
+  if (reset != null) return reset;
+  return weeklyWindowSpent(usage, modelFamily, now) ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY;
+}
+
+/**
+ * Gate headroom for routing: the tightest binding window EXCEPT the account-wide
+ * expiry (longest-duration account-wide) window, which is excluded so we keep
+ * draining it. The exclusion only applies when a shorter account-wide window
+ * also exists, so a lone 5h window still gates. 1 (full) when there is no snapshot.
+ */
+function candidateGateHeadroom(usage: AccountUsage, modelFamily: string | null, now: number): number {
   const windows = bindingWindows(usage.rateLimitStatus, modelFamily, now);
   const accountWide = windows.filter((w) => w.model == null);
   let excluded: RateLimitWindow | null = null;
@@ -1230,15 +1231,7 @@ function partitionHeadroom(
       (windowDurationMs(w.key) ?? -1) > (windowDurationMs(a.key) ?? -1) ? w : a,
     );
   }
-  return {
-    gate: headroomOf(windows.filter((w) => w !== excluded)),
-    expiry: excluded ? headroomOf([excluded]) : 1,
-  };
-}
-
-/** Eligibility/tiebreak headroom for the expiring strategy (see partitionHeadroom). */
-function candidateGateHeadroom(usage: AccountUsage, modelFamily: string | null, now: number): number {
-  return partitionHeadroom(usage, modelFamily, now).gate;
+  return headroomOf(windows.filter((w) => w !== excluded));
 }
 
 function compareNullableReset(a: number | null, b: number | null): number {
@@ -1249,8 +1242,10 @@ function compareNullableReset(a: number | null, b: number | null): number {
 }
 
 function compareExpiringCandidates(a: ExpiringCandidate, b: ExpiringCandidate): number {
-  const reset = compareNullableReset(a.expiryReset, b.expiryReset);
-  if (reset !== 0) return reset;
+  // Soonest reset first; unknown (−Infinity) first to probe; spent (+Infinity)
+  // last. The !== guard avoids Infinity − Infinity = NaN when two candidates
+  // share the same infinite key (both unknown, or both spent).
+  if (a.rankKey !== b.rankKey) return a.rankKey - b.rankKey;
   if (a.gateHeadroom !== b.gateHeadroom) return b.gateHeadroom - a.gateHeadroom;
   if (a.account.usage.windowRequests !== b.account.usage.windowRequests) {
     return a.account.usage.windowRequests - b.account.usage.windowRequests;

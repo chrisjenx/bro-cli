@@ -1464,6 +1464,28 @@ describe("routing tuning", () => {
     }
   });
 
+  test("expiry ordering: unknown (probe) first, known-reset next, weekly-spent last", () => {
+    const { poolDir, mgr } = weightedPool(["unprobed", "known", "spent"]);
+    try {
+      const now = Date.now();
+      // unprobed: no snapshot recorded -> no window data -> ranks FIRST (probe it).
+      mgr.recordRateLimitSnapshot("known", snapshot([
+        win("5h", { utilization: 0, reset: now + 3600_000 }),
+        win("7d", { utilization: 0.5, reset: now + 5 * 86_400_000 }),
+      ]));
+      // spent: 7d fully consumed with unknown reset (stays available) -> ranks LAST.
+      mgr.recordRateLimitSnapshot("spent", snapshot([
+        win("5h", { utilization: 0, reset: now + 3600_000 }),
+        win("7d", { utilization: 1 }),
+      ]));
+      expect(mgr.pick()?.name).toBe("unprobed");
+      expect(mgr.pick(undefined, new Set(["unprobed"]))?.name).toBe("known");
+      expect(mgr.pick(undefined, new Set(["unprobed", "known"]))?.name).toBe("spent");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
   test("a tuned minHeadroom gate also applies to the expiring strategy", () => {
     const { poolDir, mgr } = tempPool(["mid", "fresh"], undefined, { routingStrategy: "expiring" });
     try {
@@ -1480,6 +1502,26 @@ describe("routing tuning", () => {
       expect(mgr.pick()?.name).toBe("mid"); // default gate 0.1 keeps mid viable
       mgr.setTuning({ minHeadroom: 0.7 }); // above mid's 0.6 headroom → mid benched
       expect(mgr.pick()?.name).toBe("fresh");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("expiring strategy demotes a weekly-spent account below one with real remaining quota", () => {
+    const { poolDir, mgr } = tempPool(["spent", "known-later"], undefined, { routingStrategy: "expiring" });
+    try {
+      const now = Date.now();
+      // spent: 7d consumed, unknown reset -> stays available but its allowance is
+      // already gone, so it must NOT be treated as the soonest-to-drain account.
+      mgr.recordRateLimitSnapshot("spent", snapshot([
+        win("5h", { utilization: 0, reset: now + 3600_000 }),
+        win("7d", { utilization: 1 }),
+      ]));
+      mgr.recordRateLimitSnapshot("known-later", snapshot([
+        win("5h", { utilization: 0, reset: now + 3600_000 }),
+        win("7d", { utilization: 0.5, reset: now + 5 * 86_400_000 }),
+      ]));
+      expect(mgr.pick()?.name).toBe("known-later");
     } finally {
       rmSync(poolDir, { recursive: true, force: true });
     }
