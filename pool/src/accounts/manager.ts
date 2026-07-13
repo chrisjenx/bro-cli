@@ -902,16 +902,7 @@ export class AccountManager {
    */
   recordUsageSnapshot(name: string, snapshot: RateLimitSnapshot): void {
     const u = this.usageFor(name);
-    const byKey = new Map<string, RateLimitWindow>();
-    for (const w of u.rateLimitStatus?.windows ?? []) {
-      if (windowDurationMs(w.key) == null) byKey.set(w.key, w); // preserve non-duration windows
-    }
-    for (const w of snapshot.windows) byKey.set(w.key, w);
-    u.rateLimitStatus = {
-      unifiedStatus: snapshot.unifiedStatus,
-      windows: sortRateLimitWindows([...byKey.values()]),
-      updatedAt: snapshot.updatedAt,
-    };
+    u.rateLimitStatus = replaceRateLimitSnapshot(u.rateLimitStatus, snapshot);
     u.lastUsageCheckAt = snapshot.updatedAt;
     u.lastUsageCheckError = null;
     // Ground truth can reveal a spent binding window before a 429 does; hard-
@@ -968,6 +959,29 @@ function mergeRateLimitSnapshot(
   for (const w of next.windows) windows.set(w.key, w); // fresh data wins per key
   return {
     unifiedStatus: next.unifiedStatus ?? prev?.unifiedStatus ?? null,
+    windows: sortRateLimitWindows([...windows.values()]),
+    updatedAt: next.updatedAt,
+  };
+}
+
+/**
+ * Like mergeRateLimitSnapshot, but treats `next` as whole-account ground truth
+ * (from /api/oauth/usage): duration-keyed windows are REPLACED wholesale, so a
+ * window `next` no longer reports (e.g. a reset 7d-opus) is dropped. Only
+ * non-duration windows (e.g. "overage") the usage endpoint doesn't cover are
+ * carried over from `prev`.
+ */
+function replaceRateLimitSnapshot(
+  prev: RateLimitSnapshot | null,
+  next: RateLimitSnapshot,
+): RateLimitSnapshot {
+  const windows = new Map<string, RateLimitWindow>();
+  for (const w of prev?.windows ?? []) {
+    if (windowDurationMs(w.key) == null) windows.set(w.key, w); // preserve non-duration windows
+  }
+  for (const w of next.windows) windows.set(w.key, w);
+  return {
+    unifiedStatus: next.unifiedStatus,
     windows: sortRateLimitWindows([...windows.values()]),
     updatedAt: next.updatedAt,
   };

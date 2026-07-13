@@ -511,10 +511,10 @@ function card(a, isNext) {
 
   const limitStatusRow = rl && rl.unifiedStatus
     ? '<span class="k">Usage status</span><span class="v">' + esc(rl.unifiedStatus) + "</span>" : "";
-  const usageErr = u.lastUsageCheckError ? '<div class="note">Usage check: ' + esc(u.lastUsageCheckError) + "</div>" : "";
-  const note = (a.unavailableReason
+  const errNote = a.unavailableReason
     ? '<div class="note ' + (a.authenticated ? "" : "err") + '">' + esc(a.unavailableReason) + "</div>"
-    : (u.lastError ? '<div class="note">Last error: ' + esc(u.lastError) + "</div>" : "")) + usageErr;
+    : (u.lastError ? '<div class="note">Last error: ' + esc(u.lastError) + "</div>" : "");
+  const usageErrNote = u.lastUsageCheckError ? '<div class="note">Usage check: ' + esc(u.lastUsageCheckError) + "</div>" : "";
   const cooldownRow = (u.rateLimitedUntil && u.rateLimitedUntil > Date.now())
     ? '<span class="k">Cooldown</span><span class="v">' + timeUntil(u.rateLimitedUntil) + "</span>" : "";
   const usageCheckRow = u.lastUsageCheckAt
@@ -539,7 +539,7 @@ function card(a, isNext) {
       \${usageCheckRow}
     </div>
     <div class="bars">\${barsHtml}</div>
-    \${note}
+    \${errNote}\${usageErrNote}
     <div class="tier-edit">Priority
       <input type="number" min="0" value="\${pr}" data-acct="\${esc(a.name)}" />
       <button data-set-priority="\${esc(a.name)}">Set</button>
