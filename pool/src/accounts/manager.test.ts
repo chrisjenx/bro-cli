@@ -1548,3 +1548,41 @@ describe("routing tuning", () => {
     }
   });
 });
+
+test("recordUsageSnapshot replaces scoped windows and preserves overage", () => {
+  const { poolDir, mgr } = tempPool(["acct"]);
+  try {
+    // Seed a stale snapshot with a scoped window + a non-duration overage window.
+    mgr.recordRateLimitSnapshot(
+      "acct",
+      snapshot([
+        win("7d-opus", { utilization: 0.9, reset: 999 }),
+        win("overage", { model: null, utilization: 0.1, reset: null }),
+      ]),
+    );
+    // Endpoint now reports only 5h + 7d (the opus window is gone).
+    mgr.recordUsageSnapshot("acct", {
+      unifiedStatus: "allowed",
+      updatedAt: 2,
+      windows: [win("5h", { utilization: 0.2, reset: 111 }), win("7d", { utilization: 0.5, reset: 222 })],
+    });
+    const rl = mgr.listAccounts().find((a) => a.name === "acct")!.usage.rateLimitStatus;
+    const keys = rl!.windows.map((w) => w.key).sort();
+    expect(keys).toEqual(["5h", "7d", "overage"]); // stale 7d-opus dropped, overage kept
+    expect(rl!.updatedAt).toBe(2);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("recordUsageCheckError sets the field without touching lastError", () => {
+  const { poolDir, mgr } = tempPool(["acct"]);
+  try {
+    mgr.recordUsageCheckError("acct", "boom");
+    const a = mgr.listAccounts().find((x) => x.name === "acct")!;
+    expect(a.usage.lastUsageCheckError).toBe("boom");
+    expect(a.usage.lastError).toBeNull();
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});

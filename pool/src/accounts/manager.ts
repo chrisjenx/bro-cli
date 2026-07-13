@@ -168,6 +168,8 @@ export class AccountManager {
       // Snapshots persisted by older pool versions used fixed 5h/7d fields.
       for (const u of Object.values(this.usage)) {
         u.rateLimitStatus = normalizeRateLimitSnapshot(u.rateLimitStatus);
+        u.lastUsageCheckAt ??= null;
+        u.lastUsageCheckError ??= null;
       }
     } catch {
       this.usage = {};
@@ -888,6 +890,37 @@ export class AccountManager {
   recordRateLimitSnapshot(name: string, snapshot: RateLimitSnapshot): void {
     const u = this.usageFor(name);
     u.rateLimitStatus = mergeRateLimitSnapshot(u.rateLimitStatus, snapshot);
+    this.saveState();
+  }
+
+  /**
+   * Replace this account's rate-limit windows with a whole-account usage
+   * snapshot from /api/oauth/usage. Unlike recordRateLimitSnapshot (which
+   * merges per-window headers), this OVERWRITES duration-keyed windows so a
+   * window the endpoint no longer reports (e.g. a reset 7d-opus) is dropped.
+   * Non-duration windows (e.g. "overage") the endpoint doesn't cover are kept.
+   */
+  recordUsageSnapshot(name: string, snapshot: RateLimitSnapshot): void {
+    const u = this.usageFor(name);
+    const byKey = new Map<string, RateLimitWindow>();
+    for (const w of u.rateLimitStatus?.windows ?? []) {
+      if (windowDurationMs(w.key) == null) byKey.set(w.key, w); // preserve non-duration windows
+    }
+    for (const w of snapshot.windows) byKey.set(w.key, w);
+    u.rateLimitStatus = {
+      unifiedStatus: snapshot.unifiedStatus,
+      windows: sortRateLimitWindows([...byKey.values()]),
+      updatedAt: snapshot.updatedAt,
+    };
+    u.lastUsageCheckAt = snapshot.updatedAt;
+    u.lastUsageCheckError = null;
+    this.saveState();
+  }
+
+  recordUsageCheckError(name: string, message: string): void {
+    const u = this.usageFor(name);
+    u.lastUsageCheckError = message.slice(0, 300);
+    u.lastUsageCheckAt = Date.now();
     this.saveState();
   }
 

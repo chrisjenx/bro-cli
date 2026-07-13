@@ -215,6 +215,11 @@ export interface AccountUsage {
    * has no HTTP access and cannot see these headers.
    */
   rateLimitStatus: RateLimitSnapshot | null;
+
+  /** When we last successfully read /api/oauth/usage for this account (epoch ms). */
+  lastUsageCheckAt: number | null;
+  /** Last usage-refresh failure message, surfaced on the dashboard; null when healthy. */
+  lastUsageCheckError: string | null;
 }
 
 /** Fully-resolved view of an account for status/routing. */
@@ -256,5 +261,7 @@ export function emptyUsage(now: number): AccountUsage {
     lastError: null,
     rateLimitedUntil: null,
     rateLimitStatus: null,
+    lastUsageCheckAt: null,
+    lastUsageCheckError: null,
   };
 }
