@@ -1,5 +1,11 @@
 import { test, expect } from "bun:test";
-import { mapUsageResponse } from "./usage.ts";
+import { mapUsageResponse, fetchUsageSnapshot } from "./usage.ts";
+import { loadConfig } from "../config.ts";
+
+function fakeMgr(): any {
+  return { getOAuthCreds: () => ({ accessToken: "tok", refreshToken: "r", expiresAt: Date.now() + 3_600_000, scopes: [] }) };
+}
+const acct: any = { name: "a" };
 
 // Trimmed from a real /api/oauth/usage capture (2026-07-12).
 const SAMPLE = {
@@ -63,4 +69,45 @@ test("marks a fully-consumed window rejected", () => {
 test("returns null for empty/garbage input", () => {
   expect(mapUsageResponse(null, 1)).toBeNull();
   expect(mapUsageResponse({}, 1)).toBeNull();
+});
+
+test("fetchUsageSnapshot sends required headers and maps a 200", async () => {
+  const calls: Request[] = [];
+  const orig = globalThis.fetch;
+  globalThis.fetch = (async (url: any, init: any) => {
+    calls.push(new Request(url, init));
+    return new Response(JSON.stringify({ five_hour: { utilization: 20, resets_at: "2026-07-13T07:00:00Z" }, limits: [] }), { status: 200, headers: { "content-type": "application/json" } });
+  }) as any;
+  try {
+    const cfg = loadConfig();
+    const snap = await fetchUsageSnapshot(acct, fakeMgr(), cfg);
+    expect(snap!.windows.find((w) => w.key === "5h")!.utilization).toBeCloseTo(0.2, 5);
+    const req = calls[0]!;
+    expect(req.url).toBe("https://api.anthropic.com/api/oauth/usage");
+    expect(req.headers.get("authorization")).toBe("Bearer tok");
+    expect(req.headers.get("anthropic-beta")).toBe("oauth-2025-04-20");
+    expect(req.headers.get("user-agent")).toBe("claude-code/2.1.207");
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test("fetchUsageSnapshot returns null on 429", async () => {
+  const orig = globalThis.fetch;
+  globalThis.fetch = (async () => new Response("rate_limit", { status: 429 })) as any;
+  try {
+    expect(await fetchUsageSnapshot(acct, fakeMgr(), loadConfig())).toBeNull();
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test("fetchUsageSnapshot returns null on non-JSON body", async () => {
+  const orig = globalThis.fetch;
+  globalThis.fetch = (async () => new Response("<html>nope", { status: 200 })) as any;
+  try {
+    expect(await fetchUsageSnapshot(acct, fakeMgr(), loadConfig())).toBeNull();
+  } finally {
+    globalThis.fetch = orig;
+  }
 });

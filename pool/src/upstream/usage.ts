@@ -6,7 +6,11 @@
 
 import type { RateLimitSnapshot, RateLimitWindow } from "../accounts/types.ts";
 import { modelFamilyOf, sortRateLimitWindows } from "../accounts/types.ts";
-import { asObject, objectProp, stringProp, numberProp } from "./shared.ts";
+import { asObject, objectProp, stringProp, numberProp, parseJson } from "./shared.ts";
+import type { Config } from "../config.ts";
+import { AccountManager } from "../accounts/manager.ts";
+import type { Account } from "../accounts/types.ts";
+import { accessTokenFor } from "./oauth-token.ts";
 
 function parseResetMs(iso: string | undefined): number | null {
   if (!iso) return null;
@@ -99,4 +103,50 @@ export function mapUsageResponse(
     windows: sortRateLimitWindows(windows),
     updatedAt: now,
   };
+}
+
+/** Origin of the Anthropic API base URL, e.g. "https://api.anthropic.com" (note: /api/oauth/usage is NOT under /v1). */
+function usageUrl(config: Config): string {
+  return new URL("/api/oauth/usage", config.anthropicApiBaseUrl).toString();
+}
+
+/**
+ * GET the account's live usage. Returns null on any failure (timeout, non-200,
+ * unparseable body) — callers treat a null as "no fresh data, keep routing".
+ */
+export async function fetchUsageSnapshot(
+  account: Account,
+  mgr: AccountManager,
+  config: Config,
+  signal?: AbortSignal,
+): Promise<RateLimitSnapshot | null> {
+  let token: string;
+  try {
+    token = await accessTokenFor(account, mgr, config, false);
+  } catch {
+    return null;
+  }
+
+  const timeout = AbortSignal.timeout(config.usageFetchTimeoutMs);
+  const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
+
+  let res: Response;
+  try {
+    res = await fetch(usageUrl(config), {
+      method: "GET",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "anthropic-beta": "oauth-2025-04-20",
+        "content-type": "application/json",
+        "user-agent": config.usageUserAgent,
+      },
+      signal: combined,
+    });
+  } catch {
+    return null;
+  }
+
+  if (!res.ok) return null;
+  const text = await res.text();
+  return mapUsageResponse(parseJson(text), Date.now());
 }
