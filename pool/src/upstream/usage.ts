@@ -155,3 +155,40 @@ export async function fetchUsageSnapshot(
   }
   return mapUsageResponse(parseJson(text), Date.now());
 }
+
+/** Per-account in-flight refreshes, so racing new sessions share one fetch. */
+const usageLocks = new Map<string, Promise<void>>();
+
+/**
+ * Refresh an account's usage if its snapshot is stale, off the request path.
+ * TTL-gated and in-flight-deduped so the self-throttling endpoint is called at
+ * most once per account per TTL window. Never throws — a failure is recorded as
+ * lastUsageCheckError and routing is unaffected. Callers should NOT await this.
+ */
+export async function maybeRefreshUsage(
+  account: Account,
+  mgr: AccountManager,
+  config: Config,
+): Promise<void> {
+  if (!config.usageRefreshEnabled) return;
+
+  const updatedAt = account.usage.rateLimitStatus?.updatedAt ?? 0;
+  if (Date.now() - updatedAt < config.usageRefreshTtlMs) return;
+
+  const existing = usageLocks.get(account.name);
+  if (existing) return existing;
+
+  const run = (async () => {
+    try {
+      const snap = await fetchUsageSnapshot(account, mgr, config);
+      if (snap) mgr.recordUsageSnapshot(account.name, snap);
+      else mgr.recordUsageCheckError(account.name, "usage refresh failed (see logs)");
+    } catch (err) {
+      mgr.recordUsageCheckError(account.name, (err as Error).message);
+    } finally {
+      usageLocks.delete(account.name);
+    }
+  })();
+  usageLocks.set(account.name, run);
+  return run;
+}

@@ -1,6 +1,7 @@
 import { test, expect } from "bun:test";
-import { mapUsageResponse, fetchUsageSnapshot } from "./usage.ts";
+import { mapUsageResponse, fetchUsageSnapshot, maybeRefreshUsage } from "./usage.ts";
 import { loadConfig } from "../config.ts";
+import type { RateLimitSnapshot } from "../accounts/types.ts";
 
 function fakeMgr(): any {
   return { getOAuthCreds: () => ({ accessToken: "tok", refreshToken: "r", expiresAt: Date.now() + 3_600_000, scopes: [] }) };
@@ -123,6 +124,74 @@ test("fetchUsageSnapshot returns null when res.text() rejects", async () => {
   })) as any;
   try {
     expect(await fetchUsageSnapshot(acct, fakeMgr(), loadConfig())).toBeNull();
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+function mgrSpy(overrides: any = {}) {
+  const recorded: RateLimitSnapshot[] = [];
+  const errors: string[] = [];
+  return {
+    recorded,
+    errors,
+    getOAuthCreds: () => ({ accessToken: "tok", refreshToken: "r", expiresAt: Date.now() + 3_600_000, scopes: [] }),
+    recordUsageSnapshot: (_n: string, s: any) => recorded.push(s),
+    recordUsageCheckError: (_n: string, m: string) => errors.push(m),
+    ...overrides,
+  } as any;
+}
+
+test("maybeRefreshUsage skips when the snapshot is fresh", async () => {
+  let fetched = 0;
+  const orig = globalThis.fetch;
+  globalThis.fetch = (async () => { fetched++; return new Response("{}", { status: 200 }); }) as any;
+  try {
+    const fresh: any = { name: "a", usage: { rateLimitStatus: { unifiedStatus: "allowed", windows: [], updatedAt: Date.now() } } };
+    await maybeRefreshUsage(fresh, mgrSpy(), loadConfig());
+    expect(fetched).toBe(0);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test("maybeRefreshUsage coalesces concurrent calls into one fetch", async () => {
+  let fetched = 0;
+  const orig = globalThis.fetch;
+  globalThis.fetch = (async () => { fetched++; await new Promise((r) => setTimeout(r, 10)); return new Response(JSON.stringify({ five_hour: { utilization: 3, resets_at: "2026-07-13T07:00:00Z" }, limits: [] }), { status: 200 }); }) as any;
+  try {
+    const stale: any = { name: "dupe", usage: { rateLimitStatus: null } };
+    const mgr = mgrSpy();
+    await Promise.all([maybeRefreshUsage(stale, mgr, loadConfig()), maybeRefreshUsage(stale, mgr, loadConfig())]);
+    expect(fetched).toBe(1);
+    expect(mgr.recorded.length).toBeGreaterThanOrEqual(1);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test("maybeRefreshUsage records an error when the fetch yields null", async () => {
+  const orig = globalThis.fetch;
+  globalThis.fetch = (async () => new Response("nope", { status: 500 })) as any;
+  try {
+    const stale: any = { name: "err", usage: { rateLimitStatus: null } };
+    const mgr = mgrSpy();
+    await maybeRefreshUsage(stale, mgr, loadConfig());
+    expect(mgr.errors.length).toBe(1);
+    expect(mgr.recorded.length).toBe(0);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test("maybeRefreshUsage is a no-op when disabled", async () => {
+  let fetched = 0;
+  const orig = globalThis.fetch;
+  globalThis.fetch = (async () => { fetched++; return new Response("{}", { status: 200 }); }) as any;
+  try {
+    const stale: any = { name: "off", usage: { rateLimitStatus: null } };
+    await maybeRefreshUsage(stale, mgrSpy(), loadConfig({ usageRefreshEnabled: false }));
+    expect(fetched).toBe(0);
   } finally {
     globalThis.fetch = orig;
   }
