@@ -17,6 +17,7 @@ import { modelFamilyOf } from "../accounts/types.ts";
 import { runWithFailover } from "./failover.ts";
 import { dashboardHtml } from "./dashboard.ts";
 import { proxyAnthropicMessages } from "../upstream/anthropic.ts";
+import { sweepUsageRefresh } from "../upstream/usage.ts";
 import { proxyCodexMessages } from "../upstream/openai-codex.ts";
 import {
   parseOpenAI,
@@ -42,6 +43,12 @@ export function startServer(config: Config): void {
 
   // Sweep idle session pins so load counts decay even when traffic stops.
   setInterval(() => mgr.pruneSessions(), 60_000);
+
+  // Ground-truth usage sweep so idle/benched accounts don't freeze at their
+  // last rate-limit snapshot (maybeRefreshUsage's TTL keeps it cheap). Run one
+  // pass at startup too, so a restarted pool heals stale state immediately.
+  setInterval(() => void sweepUsageRefresh(mgr, config), 60_000);
+  void sweepUsageRefresh(mgr, config);
 
   const server = Bun.serve({
     hostname: config.host,

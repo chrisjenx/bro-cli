@@ -206,3 +206,18 @@ export async function maybeRefreshUsage(
   usageLocks.set(account.name, run);
   return run;
 }
+
+/**
+ * Periodic ground-truth sweep: refresh usage for every authenticated Anthropic
+ * account whose snapshot is stale, regardless of whether it is being routed to.
+ * Without this, an account that 429s and then falls out of rotation (e.g. its
+ * stale spent 5h window sinks its routing score) never serves a request, so the
+ * serve-path maybeRefreshUsage call never fires and the account's status stays
+ * frozen at rate-limit-time forever. maybeRefreshUsage's own TTL/backoff gating
+ * keeps this sweep cheap: fresh accounts and recently-failed checks are skipped.
+ */
+export async function sweepUsageRefresh(mgr: AccountManager, config: Config): Promise<void> {
+  if (!config.usageRefreshEnabled) return;
+  const eligible = mgr.listAccounts().filter((a) => a.provider === "anthropic" && a.authenticated);
+  await Promise.all(eligible.map((a) => maybeRefreshUsage(a, mgr, config).catch(() => {})));
+}

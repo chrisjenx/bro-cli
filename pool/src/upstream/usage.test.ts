@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { mapUsageResponse, fetchUsageSnapshot, maybeRefreshUsage } from "./usage.ts";
+import { mapUsageResponse, fetchUsageSnapshot, maybeRefreshUsage, sweepUsageRefresh } from "./usage.ts";
 import { loadConfig } from "../config.ts";
 import type { RateLimitSnapshot } from "../accounts/types.ts";
 
@@ -252,6 +252,37 @@ test("maybeRefreshUsage backs off after a failed refresh, within the TTL", async
     fetched = 0;
     await maybeRefreshUsage(account, mgr, loadConfig());
     expect(fetched).toBe(0);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test("sweepUsageRefresh refreshes stale authenticated anthropic accounts, skips fresh/openai/logged-out", async () => {
+  const fetchedNames: string[] = [];
+  const orig = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    return new Response(JSON.stringify({ five_hour: { utilization: 3, resets_at: "2026-07-13T07:00:00Z" }, limits: [] }), { status: 200 });
+  }) as any;
+  try {
+    const stale = (name: string, extra: any = {}) => ({
+      name,
+      provider: "anthropic",
+      authenticated: true,
+      usage: { rateLimitStatus: null, lastUsageCheckAt: null },
+      ...extra,
+    });
+    const accounts = [
+      stale("idle-stale"), // should refresh: never checked, no traffic
+      stale("fresh", { usage: { rateLimitStatus: { unifiedStatus: "allowed", windows: [], updatedAt: Date.now() }, lastUsageCheckAt: Date.now() } }), // fresh -> TTL skip
+      stale("codex", { provider: "openai" }), // not an anthropic account
+      stale("logged-out", { authenticated: false }), // no creds to call with
+    ];
+    const mgr = mgrSpy({
+      listAccounts: () => accounts,
+      recordUsageSnapshot: (n: string, _s: any) => fetchedNames.push(n),
+    });
+    await sweepUsageRefresh(mgr, loadConfig());
+    expect(fetchedNames).toEqual(["idle-stale"]);
   } finally {
     globalThis.fetch = orig;
   }

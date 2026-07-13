@@ -222,6 +222,36 @@ test("expiring: a stale 5h window does not bench an account with a healthy live 
   }
 });
 
+test("expiring: a lone near-full 7d (stale 5h dropped) does not gate the account out", () => {
+  const { poolDir, mgr } = tempPool(["stale-5h-full-7d", "fresh"]);
+  try {
+    const now = Date.now();
+    // Mirrors a real deadlock: the 5h window is stale (reset in the past, so
+    // bindingWindows drops it) and the 7d is 93% used. The 7d must not become
+    // the gate just because it is the only account-wide window left — that
+    // benches exactly the soonest-expiring account the strategy should drain,
+    // and a benched account never serves, so its stale 5h is never refreshed.
+    mgr.recordRateLimitSnapshot(
+      "stale-5h-full-7d",
+      snapshot([
+        win("5h", { utilization: 1, reset: now - 9 * 60 * 60_000 }),
+        win("7d", { utilization: 0.93, reset: now + 40 * 60 * 60_000 }),
+      ]),
+    );
+    mgr.recordRateLimitSnapshot(
+      "fresh",
+      snapshot([
+        win("5h", { utilization: 0.2, reset: now + 3 * 60 * 60_000 }),
+        win("7d", { utilization: 0.1, reset: now + 5 * 86_400_000 }),
+      ]),
+    );
+
+    expect(mgr.pick()?.name).toBe("stale-5h-full-7d");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
 test("expiring: stale windows are ignored after a cold reload from usage.json", () => {
   const { poolDir, mgr } = tempPool(["stale-5h", "fresh-5h"]);
   try {
@@ -1596,6 +1626,33 @@ test("recordUsageSnapshot hard-sidelines until a spent binding window resets", (
     mgr.recordUsageSnapshot("acct", snapshot([win("5h", { utilization: 1, reset: resetAt })]));
     const u = mgr.listAccounts().find((a) => a.name === "acct")!.usage;
     expect(u.rateLimitedUntil).toBe(resetAt);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("recordUsageSnapshot clears a stale rate-limit error once nothing is blocking", () => {
+  const { poolDir, mgr } = tempPool(["acct"]);
+  try {
+    // A 429 sidelined the account; the cooldown has since expired but no
+    // request has succeeded, so lastError is still the rate-limit message.
+    mgr.markRateLimited("acct", Date.now() - 3_600_000);
+    // Ground truth now shows healthy windows -> the stale error must clear.
+    mgr.recordUsageSnapshot("acct", snapshot([win("5h", { utilization: 0.1, reset: Date.now() + 3_600_000 })]));
+    const u = mgr.listAccounts().find((a) => a.name === "acct")!.usage;
+    expect(u.lastError).toBeNull();
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("recordUsageSnapshot keeps the rate-limit error while a window still blocks", () => {
+  const { poolDir, mgr } = tempPool(["acct"]);
+  try {
+    mgr.markRateLimited("acct", Date.now() + 3_600_000);
+    mgr.recordUsageSnapshot("acct", snapshot([win("5h", { utilization: 1, reset: Date.now() + 3_600_000 })]));
+    const u = mgr.listAccounts().find((a) => a.name === "acct")!.usage;
+    expect(u.lastError).toBe("rate limited by Anthropic");
   } finally {
     rmSync(poolDir, { recursive: true, force: true });
   }

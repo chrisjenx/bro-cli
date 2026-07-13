@@ -908,9 +908,18 @@ export class AccountManager {
     // Ground truth can reveal a spent binding window before a 429 does; hard-
     // sideline the account until that window resets. Extend-only — never clears
     // an existing cooldown, since a real 429 may reset later than the window.
-    const blockingReset = blockingWindowReset(u.rateLimitStatus, Date.now());
+    const now = Date.now();
+    const blockingReset = blockingWindowReset(u.rateLimitStatus, now);
     if (blockingReset != null) {
       u.rateLimitedUntil = Math.max(u.rateLimitedUntil ?? 0, blockingReset);
+    } else if (
+      u.lastError === "rate limited by Anthropic" &&
+      (u.rateLimitedUntil == null || u.rateLimitedUntil <= now)
+    ) {
+      // Ground truth says nothing blocks and the cooldown has lapsed: the
+      // rate-limit note is stale. Only recordSuccess clears lastError otherwise,
+      // and a benched account may not serve for a long time.
+      u.lastError = null;
     }
     this.saveState();
   }
@@ -1276,17 +1285,22 @@ function expiryRankKey(usage: AccountUsage, modelFamily: string | null, now: num
 /**
  * Gate headroom for routing: the tightest binding window EXCEPT the account-wide
  * expiry (longest-duration account-wide) window, which is excluded so we keep
- * draining it. The exclusion only applies when a shorter account-wide window
- * also exists, so a lone 5h window still gates. 1 (full) when there is no snapshot.
+ * draining it. Which window is "the expiry one" is decided from the RAW
+ * snapshot (expired windows included): a stale 5h whose reset has passed still
+ * proves the 7d is the expiry window, so the 7d stays excluded even when it is
+ * the only account-wide window bindingWindows kept. Otherwise a near-full 7d
+ * would gate out exactly the soonest-expiring account — which, once benched,
+ * never serves and so never refreshes its stale 5h (a deadlock). A lone 5h
+ * (account with no 7d data at all) still gates. 1 (full) when there is no snapshot.
  */
 function candidateGateHeadroom(usage: AccountUsage, modelFamily: string | null, now: number): number {
   const windows = bindingWindows(usage.rateLimitStatus, modelFamily, now);
-  const accountWide = windows.filter((w) => w.model == null);
+  const rawAccountWide = (usage.rateLimitStatus?.windows ?? []).filter((w) => w.model == null);
+  const durations = rawAccountWide.map((w) => windowDurationMs(w.key) ?? -1);
   let excluded: RateLimitWindow | null = null;
-  if (accountWide.length >= 2) {
-    excluded = accountWide.reduce((a, w) =>
-      (windowDurationMs(w.key) ?? -1) > (windowDurationMs(a.key) ?? -1) ? w : a,
-    );
+  if (new Set(durations).size >= 2) {
+    const maxDur = Math.max(...durations);
+    excluded = windows.find((w) => w.model == null && (windowDurationMs(w.key) ?? -1) === maxDur) ?? null;
   }
   return headroomOf(windows.filter((w) => w !== excluded));
 }
