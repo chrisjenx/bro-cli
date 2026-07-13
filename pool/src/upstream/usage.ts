@@ -5,7 +5,7 @@
  */
 
 import type { RateLimitSnapshot, RateLimitWindow } from "../accounts/types.ts";
-import { MODEL_FAMILIES, modelFamilyOf, sortRateLimitWindows } from "../accounts/types.ts";
+import { MODEL_FAMILIES, modelFamilyOf, sortRateLimitWindows, windowDurationMs } from "../accounts/types.ts";
 import { asObject, objectProp, stringProp, numberProp, parseJson } from "./shared.ts";
 import type { Config } from "../config.ts";
 import { AccountManager } from "../accounts/manager.ts";
@@ -47,12 +47,20 @@ export function mapUsageResponse(
     if (percent == null || seen.has(key)) return;
     seen.add(key);
     const utilization = clamp01(percent / 100);
+    let reset = parseResetMs(resetsAt) ?? parseResetMs(fallbackResetsAt);
+    // A spent window with no usable reset would never sideline the account
+    // (spentWindowReason needs reset > now); bound it by the window's own
+    // duration so the sideline takes effect and later expires on its own.
+    if (reset == null && utilization >= 1) {
+      const dur = windowDurationMs(key);
+      if (dur != null) reset = now + dur;
+    }
     windows.push({
       key,
       model,
       status: utilization >= 1 ? "rejected" : "allowed",
       utilization,
-      reset: parseResetMs(resetsAt) ?? parseResetMs(fallbackResetsAt),
+      reset,
     });
   };
 
@@ -83,20 +91,19 @@ export function mapUsageResponse(
     }
   }
 
-  // Fallback only when limits[] produced NOTHING. A partially-mapped limits[]
-  // (e.g. session present but weekly_all absent) intentionally does not trigger
-  // per-window top-level backfill — real captures always carry weekly_all with session.
-  if (windows.length === 0) {
-    const top = (topKey: string, key: string, model: string | null): void => {
-      const obj = objectProp(json, topKey);
-      if (!obj) return;
-      push(key, model, numberProp(obj, "utilization"), stringProp(obj, "resets_at"));
-    };
-    top("five_hour", "5h", null);
-    top("seven_day", "7d", null);
-    for (const f of MODEL_FAMILIES) {
-      top(`seven_day_${f}`, `7d-${f}`, f);
-    }
+  // Backfill any account-wide window limits[] didn't yield from the top-level
+  // objects. push() dedups via `seen`, so this only fills gaps — a partial
+  // limits[] (e.g. session absent, or its percent null) no longer silently
+  // drops 5h/7d, which replace-mode would otherwise wipe from routing.
+  const top = (topKey: string, key: string, model: string | null): void => {
+    const obj = objectProp(json, topKey);
+    if (!obj) return;
+    push(key, model, numberProp(obj, "utilization"), stringProp(obj, "resets_at"));
+  };
+  top("five_hour", "5h", null);
+  top("seven_day", "7d", null);
+  for (const f of MODEL_FAMILIES) {
+    top(`seven_day_${f}`, `7d-${f}`, f);
   }
 
   if (windows.length === 0) return null;
@@ -129,11 +136,10 @@ export async function fetchUsageSnapshot(
     return null;
   }
 
-  const timeout = AbortSignal.timeout(config.usageFetchTimeoutMs);
-  const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
-
   let res: Response;
   try {
+    const timeout = AbortSignal.timeout(config.usageFetchTimeoutMs);
+    const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
     res = await fetch(usageUrl(config), {
       method: "GET",
       headers: {

@@ -72,6 +72,28 @@ test("returns null for empty/garbage input", () => {
   expect(mapUsageResponse({}, 1)).toBeNull();
 });
 
+test("backfills 5h/7d from top-level even when limits[] is partial", () => {
+  // session present but its percent is null (5h window inactive in limits[]);
+  // weekly_all fills 7d. The top-level five_hour still carries the real 5h data.
+  const snap = mapUsageResponse({
+    five_hour: { utilization: 95, resets_at: "2026-07-13T07:00:00Z" },
+    limits: [
+      { kind: "session", percent: null, resets_at: "2026-07-13T07:00:00Z", scope: null },
+      { kind: "weekly_all", percent: 40, resets_at: "2026-07-15T00:00:00Z", scope: null },
+    ],
+  }, 1)!;
+  expect(snap.windows.find((w) => w.key === "5h")!.utilization).toBeCloseTo(0.95, 5);
+  expect(snap.windows.find((w) => w.key === "7d")!.utilization).toBeCloseTo(0.4, 5);
+});
+
+test("synthesizes a duration-bounded reset for a spent window missing resets_at", () => {
+  const now = 1_000_000;
+  const snap = mapUsageResponse({ limits: [{ kind: "weekly_all", percent: 100, scope: null }] }, now)!;
+  const w = snap.windows.find((x) => x.key === "7d")!;
+  expect(w.status).toBe("rejected");
+  expect(w.reset).toBe(now + 7 * 24 * 60 * 60 * 1000); // now + windowDurationMs("7d")
+});
+
 test("fetchUsageSnapshot sends required headers and maps a 200", async () => {
   const calls: Request[] = [];
   const orig = globalThis.fetch;
@@ -126,6 +148,24 @@ test("fetchUsageSnapshot returns null when res.text() rejects", async () => {
     expect(await fetchUsageSnapshot(acct, fakeMgr(), loadConfig())).toBeNull();
   } finally {
     globalThis.fetch = orig;
+  }
+});
+
+test("fetchUsageSnapshot returns null when signal combination throws", async () => {
+  // Simulates a runtime lacking AbortSignal.any: the throw must be caught, not
+  // propagated out of the fail-closed fetch.
+  const origFetch = globalThis.fetch;
+  const origAny = (AbortSignal as any).any;
+  globalThis.fetch = (async () => new Response("{}", { status: 200 })) as any;
+  (AbortSignal as any).any = () => {
+    throw new Error("no AbortSignal.any");
+  };
+  try {
+    const snap = await fetchUsageSnapshot(acct, fakeMgr(), loadConfig(), new AbortController().signal);
+    expect(snap).toBeNull();
+  } finally {
+    globalThis.fetch = origFetch;
+    (AbortSignal as any).any = origAny;
   }
 });
 

@@ -1586,3 +1586,17 @@ test("recordUsageCheckError sets the field without touching lastError", () => {
     rmSync(poolDir, { recursive: true, force: true });
   }
 });
+
+test("recordUsageSnapshot hard-sidelines until a spent binding window resets", () => {
+  const { poolDir, mgr } = tempPool(["acct"]);
+  try {
+    const resetAt = Date.now() + 3_600_000;
+    // Ground truth shows the 5h window fully spent — sideline until it resets,
+    // before any 429 has been observed.
+    mgr.recordUsageSnapshot("acct", snapshot([win("5h", { utilization: 1, reset: resetAt })]));
+    const u = mgr.listAccounts().find((a) => a.name === "acct")!.usage;
+    expect(u.rateLimitedUntil).toBe(resetAt);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});

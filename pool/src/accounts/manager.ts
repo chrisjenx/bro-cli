@@ -914,6 +914,13 @@ export class AccountManager {
     };
     u.lastUsageCheckAt = snapshot.updatedAt;
     u.lastUsageCheckError = null;
+    // Ground truth can reveal a spent binding window before a 429 does; hard-
+    // sideline the account until that window resets. Extend-only — never clears
+    // an existing cooldown, since a real 429 may reset later than the window.
+    const blockingReset = blockingWindowReset(u.rateLimitStatus, Date.now());
+    if (blockingReset != null) {
+      u.rateLimitedUntil = Math.max(u.rateLimitedUntil ?? 0, blockingReset);
+    }
     this.saveState();
   }
 
