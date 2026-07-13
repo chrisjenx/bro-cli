@@ -111,3 +111,19 @@ test("fetchUsageSnapshot returns null on non-JSON body", async () => {
     globalThis.fetch = orig;
   }
 });
+
+test("fetchUsageSnapshot returns null when res.text() rejects", async () => {
+  const orig = globalThis.fetch;
+  globalThis.fetch = (async () => ({
+    ok: true,
+    status: 200,
+    text: async () => {
+      throw new Error("aborted mid-body");
+    },
+  })) as any;
+  try {
+    expect(await fetchUsageSnapshot(acct, fakeMgr(), loadConfig())).toBeNull();
+  } finally {
+    globalThis.fetch = orig;
+  }
+});

@@ -147,6 +147,11 @@ export async function fetchUsageSnapshot(
   }
 
   if (!res.ok) return null;
-  const text = await res.text();
+  let text: string;
+  try {
+    text = await res.text();
+  } catch {
+    return null;
+  }
   return mapUsageResponse(parseJson(text), Date.now());
 }
