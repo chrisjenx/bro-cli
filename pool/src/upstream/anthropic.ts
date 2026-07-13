@@ -26,6 +26,7 @@ import {
 } from "./shared.ts";
 import type { SseEvent } from "./shared.ts";
 import { accessTokenFor } from "./oauth-token.ts";
+import { maybeRefreshUsage } from "./usage.ts";
 
 interface ProxyHooks {
   onFailover?: (from: string, to: string) => void;
@@ -70,6 +71,10 @@ export async function proxyAnthropicMessages(
   const modelFamily = modelFamilyOf(stringProp(asObject(body), "model"));
   const first = mgr.pick(sessionKey, undefined, "anthropic", modelFamily);
   if (!first) return anthropicError(503, "overloaded_error", noAccountMessage(mgr));
+
+  // Off the hot path: refresh this account's usage for the NEXT routing decision.
+  // Fire-and-forget — the current request routes immediately on existing data.
+  void maybeRefreshUsage(first, mgr, config).catch(() => {});
 
   const bodyText = JSON.stringify(body ?? {});
   const tried = new Set<string>();

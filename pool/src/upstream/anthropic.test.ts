@@ -51,6 +51,7 @@ function tempPool(accountNames: string[]): { poolDir: string; mgr: AccountManage
     anthropicApiBaseUrl: "https://api.test",
     oauthTokenUrl: "https://oauth.test/token",
     requestTimeoutMs: 30_000,
+    usageRefreshEnabled: false,
   });
   return { poolDir, mgr: new AccountManager(config), config };
 }
