@@ -140,7 +140,7 @@ export function sortRateLimitWindows(windows: RateLimitWindow[]): RateLimitWindo
 }
 
 /** Model families we route on, matched as substrings of the requested model id. */
-const MODEL_FAMILIES = ["fable", "mythos", "opus", "sonnet", "haiku"] as const;
+export const MODEL_FAMILIES = ["fable", "mythos", "opus", "sonnet", "haiku"] as const;
 
 /**
  * Canonical model family ("fable", "opus", …) of a requested model id, used to

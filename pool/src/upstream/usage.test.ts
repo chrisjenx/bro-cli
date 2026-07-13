@@ -184,6 +184,39 @@ test("maybeRefreshUsage records an error when the fetch yields null", async () =
   }
 });
 
+test("maybeRefreshUsage backs off after a failed refresh, within the TTL", async () => {
+  let fetched = 0;
+  const orig = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    fetched++;
+    return new Response("nope", { status: 500 });
+  }) as any;
+  try {
+    const usage: any = { rateLimitStatus: null, lastUsageCheckAt: null };
+    const account: any = { name: "backoff", usage };
+    const mgr = mgrSpy({
+      recordUsageCheckError: (_n: string, m: string) => {
+        usage.lastUsageCheckError = m;
+        usage.lastUsageCheckAt = Date.now();
+      },
+      recordUsageSnapshot: (_n: string, s: any) => {
+        usage.rateLimitStatus = s;
+        usage.lastUsageCheckAt = Date.now();
+      },
+    });
+
+    await maybeRefreshUsage(account, mgr, loadConfig());
+    expect(fetched).toBe(1);
+    expect(usage.lastUsageCheckAt).not.toBeNull();
+
+    fetched = 0;
+    await maybeRefreshUsage(account, mgr, loadConfig());
+    expect(fetched).toBe(0);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
 test("maybeRefreshUsage is a no-op when disabled", async () => {
   let fetched = 0;
   const orig = globalThis.fetch;

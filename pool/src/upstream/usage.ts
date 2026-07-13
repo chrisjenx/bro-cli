@@ -5,7 +5,7 @@
  */
 
 import type { RateLimitSnapshot, RateLimitWindow } from "../accounts/types.ts";
-import { modelFamilyOf, sortRateLimitWindows } from "../accounts/types.ts";
+import { MODEL_FAMILIES, modelFamilyOf, sortRateLimitWindows } from "../accounts/types.ts";
 import { asObject, objectProp, stringProp, numberProp, parseJson } from "./shared.ts";
 import type { Config } from "../config.ts";
 import { AccountManager } from "../accounts/manager.ts";
@@ -83,7 +83,9 @@ export function mapUsageResponse(
     }
   }
 
-  // Fallback: derive from top-level objects when limits[] gave us nothing.
+  // Fallback only when limits[] produced NOTHING. A partially-mapped limits[]
+  // (e.g. session present but weekly_all absent) intentionally does not trigger
+  // per-window top-level backfill — real captures always carry weekly_all with session.
   if (windows.length === 0) {
     const top = (topKey: string, key: string, model: string | null): void => {
       const obj = objectProp(json, topKey);
@@ -92,7 +94,7 @@ export function mapUsageResponse(
     };
     top("five_hour", "5h", null);
     top("seven_day", "7d", null);
-    for (const f of ["fable", "mythos", "opus", "sonnet", "haiku"]) {
+    for (const f of MODEL_FAMILIES) {
       top(`seven_day_${f}`, `7d-${f}`, f);
     }
   }
@@ -172,8 +174,14 @@ export async function maybeRefreshUsage(
 ): Promise<void> {
   if (!config.usageRefreshEnabled) return;
 
-  const updatedAt = account.usage.rateLimitStatus?.updatedAt ?? 0;
-  if (Date.now() - updatedAt < config.usageRefreshTtlMs) return;
+  // Skip if either our headroom data is fresh (headers or a prior usage check)
+  // OR we recently attempted a check — the latter backs off a failing/429ing
+  // endpoint, since recordUsageCheckError bumps lastUsageCheckAt but not updatedAt.
+  const lastActivity = Math.max(
+    account.usage.rateLimitStatus?.updatedAt ?? 0,
+    account.usage.lastUsageCheckAt ?? 0,
+  );
+  if (Date.now() - lastActivity < config.usageRefreshTtlMs) return;
 
   const existing = usageLocks.get(account.name);
   if (existing) return existing;
