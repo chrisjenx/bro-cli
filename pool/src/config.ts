@@ -74,6 +74,14 @@ export interface Config {
   routingMinHeadroom: number;
   /** Log a line when a request fails over from one account to another. */
   logFailover: boolean;
+  /** Enable the async usage-refresh call to /api/oauth/usage at routing time. */
+  usageRefreshEnabled: boolean;
+  /** Skip a usage refresh if the account's snapshot is younger than this (ms). */
+  usageRefreshTtlMs: number;
+  /** Timeout for a single /api/oauth/usage fetch (ms). */
+  usageFetchTimeoutMs: number;
+  /** User-Agent sent to /api/oauth/usage; the wrong/absent UA hits a throttled bucket. */
+  usageUserAgent: string;
 }
 
 function intEnv(name: string, fallback: number): number {
@@ -141,6 +149,10 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
     routingStrategy: routingStrategyEnv(),
     routingMinHeadroom: clamp(floatEnv("ROUTING_MIN_HEADROOM", 0.1), 0, 1),
     logFailover: process.env.LOG_FAILOVER !== "0",
+    usageRefreshEnabled: process.env.CLAUDE_USAGE_REFRESH !== "0",
+    usageRefreshTtlMs: positiveIntEnv("USAGE_REFRESH_TTL_MS", 120_000, 1000),
+    usageFetchTimeoutMs: positiveIntEnv("USAGE_FETCH_TIMEOUT_MS", 2500, 250),
+    usageUserAgent: process.env.CLAUDE_USAGE_USER_AGENT || "claude-code/2.1.207",
     ...overrides,
   };
 

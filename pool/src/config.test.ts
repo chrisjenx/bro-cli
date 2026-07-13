@@ -37,3 +37,11 @@ describe("timeout/interval config floors", () => {
     expect(config.streamKeepAliveMs).toBe(2000);
   });
 });
+
+test("usage-refresh config defaults", () => {
+  const c = loadConfig();
+  expect(c.usageRefreshEnabled).toBe(true);
+  expect(c.usageRefreshTtlMs).toBe(120_000);
+  expect(c.usageFetchTimeoutMs).toBe(2500);
+  expect(c.usageUserAgent).toBe("claude-code/2.1.207");
+});
