@@ -511,11 +511,14 @@ function card(a, isNext) {
 
   const limitStatusRow = rl && rl.unifiedStatus
     ? '<span class="k">Usage status</span><span class="v">' + esc(rl.unifiedStatus) + "</span>" : "";
-  const note = a.unavailableReason
+  const usageErr = u.lastUsageCheckError ? '<div class="note">Usage check: ' + esc(u.lastUsageCheckError) + "</div>" : "";
+  const note = (a.unavailableReason
     ? '<div class="note ' + (a.authenticated ? "" : "err") + '">' + esc(a.unavailableReason) + "</div>"
-    : (u.lastError ? '<div class="note">Last error: ' + esc(u.lastError) + "</div>" : "");
+    : (u.lastError ? '<div class="note">Last error: ' + esc(u.lastError) + "</div>" : "")) + usageErr;
   const cooldownRow = (u.rateLimitedUntil && u.rateLimitedUntil > Date.now())
     ? '<span class="k">Cooldown</span><span class="v">' + timeUntil(u.rateLimitedUntil) + "</span>" : "";
+  const usageCheckRow = u.lastUsageCheckAt
+    ? '<span class="k">Usage checked</span><span class="v">' + ago(u.lastUsageCheckAt) + "</span>" : "";
   return \`<div class="card \${a.available ? "" : "down"}\${isNext ? " next" : ""}" id="card-\${esc(a.name)}">
     <div class="card-top">
       <span class="status"><span class="dot \${dot}"></span><span class="acct-name">\${esc(a.name)}</span></span>
@@ -533,6 +536,7 @@ function card(a, isNext) {
       <span class="k">Sessions</span><span class="v">\${fmtInt(a.activeSessions ?? 0)} active</span>
       \${limitStatusRow}
       \${cooldownRow}
+      \${usageCheckRow}
     </div>
     <div class="bars">\${barsHtml}</div>
     \${note}

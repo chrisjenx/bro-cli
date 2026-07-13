@@ -54,6 +54,8 @@ function baseAccount(overrides: Record<string, unknown> = {}) {
       lastError: null,
       rateLimitedUntil: null,
       rateLimitStatus: null,
+      lastUsageCheckAt: null,
+      lastUsageCheckError: null,
       ...((overrides.usage as Record<string, unknown>) ?? {}),
     },
     ...overrides,
@@ -124,6 +126,25 @@ test("card() assumes the reset for a rolled-over window instead of freezing a st
   expect(html).not.toContain("awaiting refresh");
   expect(html).not.toContain("97%");
   expect(html).toContain("0% · resets 4h 0m");
+});
+
+test("card() shows a usage-check error note even when there is no serving error", () => {
+  const card = loadCard();
+  const html = card(
+    baseAccount({
+      usage: { lastUsageCheckAt: Date.now(), lastUsageCheckError: "usage 429" },
+    }),
+  );
+  expect(html).toContain("usage 429");
+});
+
+test("card() shows the last usage-check time when present, and omits the row when absent", () => {
+  const card = loadCard();
+  const withCheck = card(baseAccount({ usage: { lastUsageCheckAt: Date.now() } }));
+  expect(withCheck).toContain("Usage checked");
+
+  const withoutCheck = card(baseAccount());
+  expect(withoutCheck).not.toContain("Usage checked");
 });
 
 function loadFns(): {
