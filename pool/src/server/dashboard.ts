@@ -216,6 +216,23 @@ export function dashboardHtml(): string {
   .routing-panel .why .fact { display: grid; grid-template-columns: 110px 1fr; gap: 10px; font-size: 12.5px; }
   .routing-panel .why .fk { color: var(--muted); }
   .routing-panel .why .fact.decisive .fv { color: var(--accent); font-weight: 600; }
+  .mapping-panel { display: none; background: var(--surface); border: 1px solid var(--border);
+    border-left: 3px solid var(--accent); border-radius: 12px; padding: 14px 18px; margin-bottom: 20px;
+    font-size: 13.5px; color: var(--text); box-shadow: var(--shadow); }
+  .mapping-panel h3 { margin: 0 0 10px; font-family: var(--serif); font-size: 16px; font-weight: 500; letter-spacing: -0.01em; }
+  .mapping-panel .muted { color: var(--muted); font-size: 12px; font-family: var(--sans); font-weight: 400; }
+  .mapping-panel > label { display: block; margin-bottom: 12px; font-size: 13px; }
+  .mapping-panel .map-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 8px 0; border-top: 1px solid var(--border); }
+  .mapping-panel .map-row select { font: inherit; padding: 4px 8px; border: 1px solid var(--border);
+    border-radius: 6px; background: var(--surface-2); color: var(--text); }
+  .mapping-panel .efforts { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-left: auto; }
+  .mapping-panel .efforts .tier { display: flex; align-items: center; gap: 5px; margin-bottom: 0; }
+  .mapping-panel .efforts .tier label { color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: .04em; }
+  .mapping-panel .efforts select { font-size: 12px; padding: 3px 6px; }
+  .mapping-panel #mapping-save { margin-top: 12px; background: var(--surface); color: var(--muted);
+    border: 1px solid var(--border); border-radius: 7px; padding: 6px 14px; font-size: 12.5px; cursor: pointer; }
+  .mapping-panel #mapping-save:hover { color: var(--text); border-color: var(--border-strong); }
   .tuning-panel { display: none; background: var(--surface); border: 1px solid var(--border);
     border-radius: 12px; margin-bottom: 20px; box-shadow: var(--shadow); }
   .tuning-panel > summary { list-style: none; cursor: pointer; padding: 12px 18px;
@@ -269,6 +286,7 @@ export function dashboardHtml(): string {
 </header>
 <main>
   <div class="routing-panel" id="routing-panel"></div>
+  <div class="mapping-panel" id="mapping-panel"></div>
   <details class="tuning-panel" id="tuning-panel"></details>
   <div class="banner" id="banner"></div>
   <div class="summary-tbl" id="summary" style="display:none"></div>
@@ -404,6 +422,55 @@ function routingPanelHtml(routing) {
   return '<div class="pick">Next request &rarr; <b>' + esc(routing.nextPick.account) + "</b>"
     + '<div class="summary muted" title="' + esc(r.summary) + '">' + esc(r.summary) + "</div></div>"
     + '<ul class="why">' + items + "</ul>";
+}
+
+// Cross-subscription model mapping: each Claude family (fable/opus/sonnet/haiku)
+// can be routed to a Codex/OpenAI-provider target model, with a per-source-tier
+// reasoning-effort override translated into the target's own effort values.
+var SOURCE_TIERS = ["default", "low", "medium", "high", "xhigh", "max"];
+var CODEX_EFFORTS = ["low", "medium", "high", "xhigh", "max", "none"];
+var EFFORT_LABELS = { low: "Low (Light)", xhigh: "Extra High", none: "None" };
+var FAMILIES = ["fable", "opus", "sonnet", "haiku"];
+
+function effortOptions(family, tier, selected, targetModel) {
+  var opts = '<option value="">pass-through</option>';
+  for (var i = 0; i < CODEX_EFFORTS.length; i++) {
+    var e = CODEX_EFFORTS[i];
+    if (e === "max" && targetModel.indexOf("gpt-5.5") === 0) continue; // gpt-5.5 has no max
+    opts += '<option value="' + e + '"' + (selected === e ? " selected" : "") + ">"
+      + esc(EFFORT_LABELS[e] || e.charAt(0).toUpperCase() + e.slice(1)) + "</option>";
+  }
+  return '<select data-effort-family="' + family + '" data-effort-tier="' + tier + '">' + opts + "</select>";
+}
+
+function mappingCardHtml(mapping) {
+  if (!mapping) return "";
+  var rows = "";
+  for (var i = 0; i < FAMILIES.length; i++) {
+    var fam = FAMILIES[i];
+    var row = (mapping.mappings || []).find(function (m) { return m.from === fam; }) || { from: fam, to: fam };
+    var inert = row.to === fam || (mapping.targets || []).indexOf(row.to) < 0;
+    var targetOpts = '<option value="' + fam + '"' + (inert ? " selected" : "") + ">Claude only</option>";
+    for (var t = 0; t < (mapping.targets || []).length; t++) {
+      var id = mapping.targets[t];
+      targetOpts += '<option value="' + esc(id) + '"' + (row.to === id ? " selected" : "") + ">" + esc(id) + "</option>";
+    }
+    var efforts = "";
+    for (var s = 0; s < SOURCE_TIERS.length; s++) {
+      var tier = SOURCE_TIERS[s];
+      efforts += '<span class="tier"><label>' + tier + "</label>"
+        + effortOptions(fam, tier, (row.effort || {})[tier] || "", row.to) + "</span>";
+    }
+    rows += '<div class="map-row" data-map-row="' + fam + '">'
+      + "<b>" + fam + "</b> &rarr; "
+      + '<select data-map-family="' + fam + '">' + targetOpts + "</select>"
+      + '<div class="efforts"' + (inert ? ' style="display:none"' : "") + ">" + efforts + "</div>"
+      + "</div>";
+  }
+  return '<h3>Model mapping <span class="muted">Claude families served by Codex when pooled</span></h3>'
+    + '<label><input type="checkbox" id="mapping-enabled"' + (mapping.enabled ? " checked" : "") + "> Pool Claude + Codex capacity</label>"
+    + rows
+    + '<button id="mapping-save">Save mapping</button>';
 }
 
 // Editable weighted-score knobs (key/label/step/min/max), built server-side
@@ -621,6 +688,19 @@ async function refresh() {
         panel.style.display = "none";
       }
 
+      // Skip re-rendering the mapping panel while it has focus, so a poll tick
+      // can't clobber in-progress edits (same pattern as the tuning panel below).
+      const mapPanel = document.getElementById("mapping-panel");
+      const mapEditing = mapPanel.contains(document.activeElement);
+      const mapHtml = mappingCardHtml(d.mapping);
+      if (mapHtml && !mapEditing) {
+        mapPanel.innerHTML = mapHtml;
+        mapPanel.style.display = "block";
+        wireMapping();
+      } else if (!mapHtml) {
+        mapPanel.style.display = "none";
+      }
+
       // Skip re-rendering the tuning panel while a field is focused, so a poll
       // tick can't clobber a value the user is mid-edit.
       const tuningPanel = document.getElementById("tuning-panel");
@@ -702,6 +782,36 @@ async function refresh() {
   } catch (e) {
     document.getElementById("p-updated").textContent = "offline";
   }
+}
+
+// Attach the Save handler for the mapping panel. Reads each family's target
+// select plus its per-tier effort selects, POSTs the full replacement set to
+// /api/mappings, then refreshes so the server's normalized state comes back.
+function wireMapping() {
+  const saveBtn = document.getElementById("mapping-save");
+  if (!saveBtn) return;
+  saveBtn.addEventListener("click", async () => {
+    const mappings = [];
+    document.querySelectorAll("[data-map-row]").forEach((rowEl) => {
+      const fam = rowEl.getAttribute("data-map-row");
+      const to = rowEl.querySelector("[data-map-family]").value;
+      const effort = {};
+      rowEl.querySelectorAll("[data-effort-family]").forEach((sel) => {
+        if (sel.value) effort[sel.getAttribute("data-effort-tier")] = sel.value;
+      });
+      const entry = { from: fam, to };
+      if (Object.keys(effort).length) entry.effort = effort;
+      mappings.push(entry);
+    });
+    try {
+      await fetch("/api/mappings", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ enabled: document.getElementById("mapping-enabled").checked, mappings }),
+      });
+      refresh();
+    } catch (e) { /* transient; next poll will reconcile */ }
+  });
 }
 
 // Attach the Apply handler for the routing-tuning panel. Reads every changed

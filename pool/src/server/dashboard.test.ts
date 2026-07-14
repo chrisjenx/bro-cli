@@ -1,4 +1,4 @@
-import { test, expect } from "bun:test";
+import { test, expect, describe } from "bun:test";
 import { dashboardHtml } from "./dashboard.ts";
 
 /**
@@ -324,4 +324,15 @@ test("card() weight editor defaults to 1 when weight is missing (older /api/stat
   const html = card({ ...baseAccount(), priority: 100 }, false);
   expect(html).toContain('data-set-weight="acct"');
   expect(html).toContain('value="1"');
+});
+
+describe("model mapping card", () => {
+  test("dashboard ships the mapping panel and save wiring", () => {
+    const html = dashboardHtml();
+    expect(html).toContain('id="mapping-panel"');
+    expect(html).toContain('id="mapping-enabled"');
+    expect(html).toContain('id="mapping-save"');
+    expect(html).toContain("/api/mappings");
+    expect(html).toContain("mappingCardHtml");
+  });
 });
