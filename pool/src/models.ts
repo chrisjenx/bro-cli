@@ -137,11 +137,19 @@ export const DEFAULT_MAPPINGS: ModelMapping[] = [
   { from: "haiku", to: "gpt-5.4-mini" },
 ];
 
-/** Merges mapping rows over the bundled defaults (on-disk/posted families shadow),
- * so a partial set behaves identically in memory and after a restart. */
+/** Overlays `rows` onto `base`: a row replaces the `base` row for the same
+ * family, families not in `rows` keep their `base` value. Used both to fill a
+ * partial on-disk set from defaults and to apply a partial edit over the live
+ * set without disturbing families the edit didn't mention. */
+export function mergeMappingsOver(base: ModelMapping[], rows: ModelMapping[]): ModelMapping[] {
+  const overridden = new Set(rows.map((m) => m.from));
+  return [...base.filter((m) => !overridden.has(m.from)), ...rows];
+}
+
+/** Fills any family missing from `rows` with its bundled default, so a partial
+ * on-disk set behaves identically in memory and after a restart. */
 export function mergeMappingsOverDefaults(rows: ModelMapping[]): ModelMapping[] {
-  const families = new Set(rows.map((m) => m.from));
-  return [...DEFAULT_MAPPINGS.filter((m) => !families.has(m.from)), ...rows];
+  return mergeMappingsOver(DEFAULT_MAPPINGS, rows);
 }
 
 export function loadModelConfig(modelsFile: string): ModelConfig {

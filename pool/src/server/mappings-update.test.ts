@@ -64,15 +64,15 @@ describe("handleMappingsUpdate", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  test("partial POST merges over defaults so memory and disk agree (no restart divergence)", () => {
+  test("partial POST keeps unlisted families and stays in sync with disk (no restart divergence)", () => {
     const { state, file, dir } = freshState();
     const res = handleMappingsUpdate(state, file, {
       mappings: [{ from: "fable", to: "gpt-5.6-luna" }],
     });
     expect(res.status).toBe(200);
 
-    // The posted family wins; the families left unlisted in the POST keep
-    // their default rows immediately in memory, not only after a reload.
+    // The posted family wins; families left unlisted in the POST keep the value
+    // they already had (here still the defaults) immediately in memory.
     expect(state.config.mappings.find((m) => m.from === "fable")!.to).toBe("gpt-5.6-luna");
     expect(state.config.mappings.find((m) => m.from === "opus")!.to).toBe("gpt-5.6-terra");
     expect(state.config.mappings.find((m) => m.from === "sonnet")!.to).toBe("gpt-5.6-luna");
@@ -81,6 +81,27 @@ describe("handleMappingsUpdate", () => {
 
     // Memory and disk must agree: reloading from the persisted file yields the
     // exact same mapping set (same rows, same order) as what's already in state.
+    expect(loadModelConfig(file).mappings).toEqual(state.config.mappings);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("partial POST preserves a previously-customized family instead of resetting it", () => {
+    const { state, file, dir } = freshState();
+    // Customize opus and a non-default family away from the bundled defaults.
+    expect(handleMappingsUpdate(state, file, {
+      mappings: [{ from: "opus", to: "gpt-5.6-sol" }, { from: "mythos", to: "gpt-5.6-sol" }],
+    }).status).toBe(200);
+    expect(state.config.mappings.find((m) => m.from === "opus")!.to).toBe("gpt-5.6-sol");
+
+    // A later partial POST that only names fable must NOT clobber opus back to
+    // its default, and must not drop the mythos row the dashboard never renders.
+    expect(handleMappingsUpdate(state, file, {
+      mappings: [{ from: "fable", to: "gpt-5.6-luna" }],
+    }).status).toBe(200);
+
+    expect(state.config.mappings.find((m) => m.from === "fable")!.to).toBe("gpt-5.6-luna");
+    expect(state.config.mappings.find((m) => m.from === "opus")!.to).toBe("gpt-5.6-sol");
+    expect(state.config.mappings.find((m) => m.from === "mythos")?.to).toBe("gpt-5.6-sol");
     expect(loadModelConfig(file).mappings).toEqual(state.config.mappings);
     rmSync(dir, { recursive: true, force: true });
   });

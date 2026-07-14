@@ -18,7 +18,7 @@ import {
   isSourceEffortTier,
   isCodexEffort,
   mappingFor,
-  mergeMappingsOverDefaults,
+  mergeMappingsOver,
   type ModelRoute,
   type ModelConfig,
   type ModelMapping,
@@ -462,10 +462,12 @@ export function handleMappingsUpdate(state: MappingState, modelsFile: string, bo
     }
   }
   if (b.enabled !== undefined) state.config.mappingEnabled = b.enabled;
-  // Merge posted rows over the defaults the same way loadModelConfig does, so a
-  // partial POST (e.g. only "fable") behaves identically in memory and after a
-  // restart instead of dropping the unlisted families until reload.
-  if (mappings !== undefined) state.config.mappings = mergeMappingsOverDefaults(mappings);
+  // Overlay posted rows onto the LIVE set, not onto the defaults: a partial
+  // POST (e.g. only "fable") must update the named families and leave every
+  // other family — including customized ones and families the dashboard can't
+  // render — untouched. The full resolved set is persisted, so a reload sees
+  // exactly the same rows (loadModelConfig only fills genuinely-missing ones).
+  if (mappings !== undefined) state.config.mappings = mergeMappingsOver(state.config.mappings, mappings);
   saveModelConfig(modelsFile, state.config);
   return json({ ok: true, mappingEnabled: state.config.mappingEnabled, mappings: state.config.mappings });
 }

@@ -9,6 +9,7 @@
  */
 
 import { TUNING_BOUNDS } from "../accounts/manager.ts";
+import { MODEL_FAMILIES } from "../accounts/types.ts";
 import { SOURCE_EFFORT_TIERS, CODEX_EFFORTS } from "../models.ts";
 
 /** Presentation for each tuning knob; min/max come from the shared TUNING_BOUNDS. */
@@ -441,7 +442,10 @@ function readEfforts(container) {
   });
   return out;
 }
-var FAMILIES = ["fable", "opus", "sonnet", "haiku"];
+// Injected from MODEL_FAMILIES so the card renders (and round-trips) every
+// family the router recognizes — a hardcoded list silently drops mappings for
+// families it omits when Save posts the full set.
+var FAMILIES = ${JSON.stringify(MODEL_FAMILIES)};
 
 function effortOptions(family, tier, selected, targetModel) {
   var opts = '<option value="">pass-through</option>';
