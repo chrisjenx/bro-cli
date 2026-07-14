@@ -2,8 +2,7 @@
 // No I/O, no network — everything here is fixture-tested.
 
 import {
-  SOURCE_EFFORT_TIERS,
-  CODEX_EFFORTS,
+  isSourceEffortTier,
   type SourceEffortTier,
   type CodexEffort,
   type EffortMap,
@@ -16,13 +15,7 @@ import {
 export function deriveEffortTier(body: Record<string, unknown>): SourceEffortTier {
   const oc = body.output_config as Record<string, unknown> | undefined;
   const effort = oc?.effort;
-  if (
-    typeof effort === "string" &&
-    effort !== "default" &&
-    (SOURCE_EFFORT_TIERS as readonly string[]).includes(effort)
-  ) {
-    return effort as SourceEffortTier;
-  }
+  if (effort !== "default" && isSourceEffortTier(effort)) return effort;
   const thinking = body.thinking as Record<string, unknown> | undefined;
   if (thinking?.type === "enabled" && typeof thinking.budget_tokens === "number") {
     const budget = thinking.budget_tokens;
@@ -34,8 +27,9 @@ export function deriveEffortTier(body: Record<string, unknown>): SourceEffortTie
 /** Mapping override wins; otherwise tiers pass through 1:1 and "default" stays
  * unset so Codex applies its own server default (medium). */
 export function codexEffortFor(tier: SourceEffortTier, effortMap?: EffortMap): CodexEffort | undefined {
+  // effortMap values are already CodexEffort (sanitized on load, validated on POST).
   const explicit = effortMap?.[tier];
-  if (explicit && (CODEX_EFFORTS as readonly string[]).includes(explicit)) return explicit;
+  if (explicit) return explicit;
   return tier === "default" ? undefined : (tier as CodexEffort);
 }
 

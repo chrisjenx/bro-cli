@@ -15,10 +15,10 @@ import {
   resolveModel,
   saveModelConfig,
   isModelMapping,
+  isSourceEffortTier,
+  isCodexEffort,
   mappingFor,
-  SOURCE_EFFORT_TIERS,
-  CODEX_EFFORTS,
-  DEFAULT_MAPPINGS,
+  mergeMappingsOverDefaults,
   type ModelRoute,
   type ModelConfig,
   type ModelMapping,
@@ -462,16 +462,10 @@ export function handleMappingsUpdate(state: MappingState, modelsFile: string, bo
     }
   }
   if (b.enabled !== undefined) state.config.mappingEnabled = b.enabled;
-  if (mappings !== undefined) {
-    // Merge posted rows over the defaults the same way loadModelConfig does,
-    // so a partial POST (e.g. only "fable") behaves identically in memory and
-    // after a restart instead of dropping the unlisted families until reload.
-    const postedFamilies = new Set(mappings.map((m) => m.from));
-    state.config.mappings = [
-      ...DEFAULT_MAPPINGS.filter((m) => !postedFamilies.has(m.from)),
-      ...mappings,
-    ];
-  }
+  // Merge posted rows over the defaults the same way loadModelConfig does, so a
+  // partial POST (e.g. only "fable") behaves identically in memory and after a
+  // restart instead of dropping the unlisted families until reload.
+  if (mappings !== undefined) state.config.mappings = mergeMappingsOverDefaults(mappings);
   saveModelConfig(modelsFile, state.config);
   return json({ ok: true, mappingEnabled: state.config.mappingEnabled, mappings: state.config.mappings });
 }
@@ -491,10 +485,8 @@ function validateMapping(raw: unknown, table: ModelRoute[]): string | null {
   if (m.effort !== undefined) {
     if (typeof m.effort !== "object" || m.effort === null) return "effort must be an object";
     for (const [k, v] of Object.entries(m.effort)) {
-      if (!(SOURCE_EFFORT_TIERS as readonly string[]).includes(k)) return `unknown effort tier '${k}'`;
-      if (typeof v !== "string" || !(CODEX_EFFORTS as readonly string[]).includes(v)) {
-        return `invalid effort value '${String(v)}' for tier '${k}'`;
-      }
+      if (!isSourceEffortTier(k)) return `unknown effort tier '${k}'`;
+      if (!isCodexEffort(v)) return `invalid effort value '${String(v)}' for tier '${k}'`;
     }
   }
   return null;

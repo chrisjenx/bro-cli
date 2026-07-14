@@ -14,6 +14,15 @@ export type CodexEffort = (typeof CODEX_EFFORTS)[number];
 
 export type EffortMap = Partial<Record<SourceEffortTier, CodexEffort>>;
 
+/** Membership guards — the single source of truth for tier validation, so the
+ * rule can only change in one place (mirrors isValidPriority/isValidWeight). */
+export function isSourceEffortTier(v: unknown): v is SourceEffortTier {
+  return typeof v === "string" && (SOURCE_EFFORT_TIERS as readonly string[]).includes(v);
+}
+export function isCodexEffort(v: unknown): v is CodexEffort {
+  return typeof v === "string" && (CODEX_EFFORTS as readonly string[]).includes(v);
+}
+
 export interface ModelRoute {
   id: string;
   provider: Provider;
@@ -35,20 +44,26 @@ export const DEFAULT_MODEL_TABLE: ModelRoute[] = [
   openai("gpt-5.5"), openai("gpt-5.4"), openai("gpt-5.4-mini"),
 ];
 
-export function loadModelTable(modelsFile: string): ModelRoute[] {
-  let fromFile: ModelRoute[] = [];
-  if (existsSync(modelsFile)) {
-    try {
-      const parsed = JSON.parse(readFileSync(modelsFile, "utf8")) as { models?: unknown };
-      if (Array.isArray(parsed.models)) {
-        fromFile = parsed.models.filter(isModelRoute);
-      }
-    } catch {
-      // fall through to defaults
-    }
+/** Reads and parses <modelsFile> once, or null when absent/unparseable. */
+function parseModelsFile(modelsFile: string): Record<string, unknown> | null {
+  if (!existsSync(modelsFile)) return null;
+  try {
+    return JSON.parse(readFileSync(modelsFile, "utf8")) as Record<string, unknown>;
+  } catch {
+    console.warn(`${modelsFile}: failed to parse; using default model mapping config`);
+    return null;
   }
+}
+
+/** Merges on-disk model routes over the bundled defaults (on-disk ids shadow). */
+function mergeModelTable(parsed: Record<string, unknown> | null): ModelRoute[] {
+  const fromFile = Array.isArray(parsed?.models) ? parsed!.models.filter(isModelRoute) : [];
   const ids = new Set(fromFile.map((m) => m.id));
   return [...DEFAULT_MODEL_TABLE.filter((m) => !ids.has(m.id)), ...fromFile];
+}
+
+export function loadModelTable(modelsFile: string): ModelRoute[] {
+  return mergeModelTable(parseModelsFile(modelsFile));
 }
 
 export function saveModelTable(modelsFile: string, models: ModelRoute[]): void {
@@ -122,35 +137,35 @@ export const DEFAULT_MAPPINGS: ModelMapping[] = [
   { from: "haiku", to: "gpt-5.4-mini" },
 ];
 
+/** Merges mapping rows over the bundled defaults (on-disk/posted families shadow),
+ * so a partial set behaves identically in memory and after a restart. */
+export function mergeMappingsOverDefaults(rows: ModelMapping[]): ModelMapping[] {
+  const families = new Set(rows.map((m) => m.from));
+  return [...DEFAULT_MAPPINGS.filter((m) => !families.has(m.from)), ...rows];
+}
+
 export function loadModelConfig(modelsFile: string): ModelConfig {
-  const models = loadModelTable(modelsFile);
+  const parsed = parseModelsFile(modelsFile);
+  const models = mergeModelTable(parsed);
   let mappingEnabled = false;
   let fromFile: ModelMapping[] = [];
-  if (existsSync(modelsFile)) {
-    try {
-      const parsed = JSON.parse(readFileSync(modelsFile, "utf8")) as Record<string, unknown>;
-      if (parsed.mappingEnabled !== undefined) {
-        if (typeof parsed.mappingEnabled === "boolean") {
-          mappingEnabled = parsed.mappingEnabled;
-        } else {
-          console.warn(`${modelsFile}: "mappingEnabled" is not a boolean; ignoring (mapping stays off)`);
-        }
+  if (parsed) {
+    if (parsed.mappingEnabled !== undefined) {
+      if (typeof parsed.mappingEnabled === "boolean") {
+        mappingEnabled = parsed.mappingEnabled;
+      } else {
+        console.warn(`${modelsFile}: "mappingEnabled" is not a boolean; ignoring (mapping stays off)`);
       }
-      if (parsed.mappings !== undefined) {
-        if (Array.isArray(parsed.mappings)) {
-          fromFile = parsed.mappings.filter(isModelMapping).map(sanitizeMapping);
-        } else {
-          console.warn(`${modelsFile}: "mappings" is not an array; ignoring (using defaults)`);
-        }
+    }
+    if (parsed.mappings !== undefined) {
+      if (Array.isArray(parsed.mappings)) {
+        fromFile = parsed.mappings.filter(isModelMapping).map(sanitizeMapping);
+      } else {
+        console.warn(`${modelsFile}: "mappings" is not an array; ignoring (using defaults)`);
       }
-    } catch {
-      console.warn(`${modelsFile}: failed to parse; using default model mapping config`);
-      // fall through to defaults (mapping off)
     }
   }
-  const families = new Set(fromFile.map((m) => m.from));
-  const mappings = [...DEFAULT_MAPPINGS.filter((m) => !families.has(m.from)), ...fromFile];
-  return { models, mappingEnabled, mappings };
+  return { models, mappingEnabled, mappings: mergeMappingsOverDefaults(fromFile) };
 }
 
 export function saveModelConfig(modelsFile: string, cfg: ModelConfig): void {
@@ -170,13 +185,7 @@ function sanitizeMapping(m: ModelMapping): ModelMapping {
   if (!m.effort || typeof m.effort !== "object") return { from: m.from, to: m.to };
   const effort: EffortMap = {};
   for (const [k, val] of Object.entries(m.effort)) {
-    if (
-      (SOURCE_EFFORT_TIERS as readonly string[]).includes(k) &&
-      typeof val === "string" &&
-      (CODEX_EFFORTS as readonly string[]).includes(val)
-    ) {
-      effort[k as SourceEffortTier] = val as CodexEffort;
-    }
+    if (isSourceEffortTier(k) && isCodexEffort(val)) effort[k] = val;
   }
   return Object.keys(effort).length ? { from: m.from, to: m.to, effort } : { from: m.from, to: m.to };
 }

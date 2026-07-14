@@ -655,10 +655,13 @@ export class AccountManager {
    */
   pickProvider(sessionKey: string | undefined, candidates: ProviderCandidate[]): ProviderCandidate | null {
     const now = Date.now();
+    // List once — the account set is identical for every candidate, only the
+    // provider/family filter differs (listAccounts() reads creds/usage per account).
+    const all = this.listAccounts();
     const usable = candidates
       .map((c) => ({
         c,
-        accounts: this.listAccounts().filter((a) => this.usableFor(a, c.provider, c.modelFamily, now)),
+        accounts: all.filter((a) => this.usableFor(a, c.provider, c.modelFamily, now)),
       }))
       .filter((e) => e.accounts.length > 0);
     if (usable.length === 0) return null;

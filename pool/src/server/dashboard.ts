@@ -9,6 +9,7 @@
  */
 
 import { TUNING_BOUNDS } from "../accounts/manager.ts";
+import { SOURCE_EFFORT_TIERS, CODEX_EFFORTS } from "../models.ts";
 
 /** Presentation for each tuning knob; min/max come from the shared TUNING_BOUNDS. */
 const TUNING_LABELS: Record<keyof typeof TUNING_BOUNDS, { label: string; step: string }> = {
@@ -205,10 +206,10 @@ export function dashboardHtml(): string {
   .tier-meta { font-size: 12px; color: var(--muted); font-family: var(--sans); }
   .tier-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 18px; }
   .badge.next { background: var(--accent-soft); color: var(--accent); border-color: transparent; font-weight: 600; }
-  .routing-panel { display: none; background: var(--surface); border: 1px solid var(--border);
+  .routing-panel, .mapping-panel { display: none; background: var(--surface); border: 1px solid var(--border);
     border-left: 3px solid var(--accent); border-radius: 12px; padding: 14px 18px; margin-bottom: 20px;
-    font-size: 13.5px; color: var(--text); box-shadow: var(--shadow);
-    gap: 28px; align-items: flex-start; flex-wrap: wrap; }
+    font-size: 13.5px; color: var(--text); box-shadow: var(--shadow); }
+  .routing-panel { gap: 28px; align-items: flex-start; flex-wrap: wrap; }
   .routing-panel .muted { color: var(--muted); }
   .routing-panel .pick b { font-family: var(--serif); font-size: 16px; font-weight: 600; }
   .routing-panel .summary { font-size: 12px; margin-top: 2px; }
@@ -216,9 +217,6 @@ export function dashboardHtml(): string {
   .routing-panel .why .fact { display: grid; grid-template-columns: 110px 1fr; gap: 10px; font-size: 12.5px; }
   .routing-panel .why .fk { color: var(--muted); }
   .routing-panel .why .fact.decisive .fv { color: var(--accent); font-weight: 600; }
-  .mapping-panel { display: none; background: var(--surface); border: 1px solid var(--border);
-    border-left: 3px solid var(--accent); border-radius: 12px; padding: 14px 18px; margin-bottom: 20px;
-    font-size: 13.5px; color: var(--text); box-shadow: var(--shadow); }
   .mapping-panel h3 { margin: 0 0 10px; font-family: var(--serif); font-size: 16px; font-weight: 500; letter-spacing: -0.01em; }
   .mapping-panel .muted { color: var(--muted); font-size: 12px; font-family: var(--sans); font-weight: 400; }
   .mapping-panel > label { display: block; margin-bottom: 12px; font-size: 13px; }
@@ -427,9 +425,22 @@ function routingPanelHtml(routing) {
 // Cross-subscription model mapping: each Claude family (fable/opus/sonnet/haiku)
 // can be routed to a Codex/OpenAI-provider target model, with a per-source-tier
 // reasoning-effort override translated into the target's own effort values.
-var SOURCE_TIERS = ["default", "low", "medium", "high", "xhigh", "max"];
-var CODEX_EFFORTS = ["low", "medium", "high", "xhigh", "max", "none"];
+// Injected from models.ts so the client offer set can't drift from the server's
+// canonical tiers/efforts (same pattern as TUNING_FIELDS below).
+var SOURCE_TIERS = ${JSON.stringify(SOURCE_EFFORT_TIERS)};
+var CODEX_EFFORTS = ${JSON.stringify(CODEX_EFFORTS)};
 var EFFORT_LABELS = { low: "Low (Light)", xhigh: "Extra High", none: "None" };
+
+// Read each tier's <select> in a container into a { tier: value } object,
+// skipping pass-through ("") selections. Shared by the save and target-change
+// handlers in wireMapping().
+function readEfforts(container) {
+  var out = {};
+  container.querySelectorAll("[data-effort-tier]").forEach(function (s) {
+    if (s.value) out[s.getAttribute("data-effort-tier")] = s.value;
+  });
+  return out;
+}
 var FAMILIES = ["fable", "opus", "sonnet", "haiku"];
 
 function effortOptions(family, tier, selected, targetModel) {
@@ -810,11 +821,7 @@ function wireMapping() {
       const fam = rowEl.getAttribute("data-map-row");
       const to = sel.value;
       const effortsDiv = rowEl.querySelector(".efforts");
-      const current = {};
-      effortsDiv.querySelectorAll("[data-effort-tier]").forEach((s) => {
-        if (s.value) current[s.getAttribute("data-effort-tier")] = s.value;
-      });
-      effortsDiv.innerHTML = effortsHtml(fam, current, to);
+      effortsDiv.innerHTML = effortsHtml(fam, readEfforts(effortsDiv), to);
       effortsDiv.style.display = to === fam ? "none" : "";
     });
   });
@@ -824,10 +831,7 @@ function wireMapping() {
     document.querySelectorAll("[data-map-row]").forEach((rowEl) => {
       const fam = rowEl.getAttribute("data-map-row");
       const to = rowEl.querySelector("[data-map-family]").value;
-      const effort = {};
-      rowEl.querySelectorAll("[data-effort-family]").forEach((sel) => {
-        if (sel.value) effort[sel.getAttribute("data-effort-tier")] = sel.value;
-      });
+      const effort = readEfforts(rowEl);
       const entry = { from: fam, to };
       if (Object.keys(effort).length) entry.effort = effort;
       mappings.push(entry);
