@@ -5,7 +5,7 @@ import { tmpdir } from "os";
 import { loadConfig } from "../config.ts";
 import { AccountManager } from "../accounts/manager.ts";
 import { OPENAI_CREDS_FILENAME } from "../accounts/types.ts";
-import { parseCodexRateLimitSnapshot, proxyCodexMessages, resetAtFromCodexHeaders } from "./openai-codex.ts";
+import { describeCodexError, parseCodexRateLimitSnapshot, proxyCodexMessages, resetAtFromCodexHeaders } from "./openai-codex.ts";
 
 function tempOpenAIPool(accountNames: string[]): { poolDir: string; mgr: AccountManager } {
   const poolDir = mkdtempSync(join(tmpdir(), "cmp-codex-"));
@@ -109,7 +109,53 @@ const sse = [
   "",
 ].join("\n");
 
+describe("describeCodexError", () => {
+  test("surfaces the backend `detail` with context instead of raw JSON", () => {
+    const msg = describeCodexError(400, JSON.stringify({ detail: "Unsupported parameter: max_output_tokens" }), "work");
+    expect(msg).toContain("Codex backend rejected the request (HTTP 400)");
+    expect(msg).toContain("Unsupported parameter: max_output_tokens");
+    expect(msg).toContain('account "work"');
+    // The raw JSON envelope must not leak through.
+    expect(msg).not.toContain('{"detail"');
+  });
+
+  test("falls back to error.message, then raw body, then a bare status", () => {
+    expect(describeCodexError(400, JSON.stringify({ error: { message: "bad request" } }), "a")).toContain("bad request");
+    expect(describeCodexError(500, "gateway exploded", "a")).toContain("gateway exploded");
+    expect(describeCodexError(503, "", "a")).toBe('Codex backend rejected the request (HTTP 503) [account "a"]');
+  });
+});
+
 describe("proxyCodexMessages", () => {
+  test("a backend 400 is terminal with a legible message, not a raw-JSON passthrough", async () => {
+    const { poolDir, mgr } = tempOpenAIPool(["gpt1", "gpt2"]);
+    try {
+      const config = loadConfig({ poolDir, accountsDir: join(poolDir, "accounts"), usageFile: join(poolDir, "usage.json") });
+      let calls = 0;
+      const fakeFetch = (async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) => {
+        calls += 1;
+        return new Response(JSON.stringify({ detail: "Unsupported parameter: max_output_tokens" }), { status: 400 });
+      }) as typeof fetch;
+      const res = await proxyCodexMessages(
+        { model: "gpt", messages: [{ role: "user", content: "hi" }] },
+        mgr,
+        config,
+        new AbortController().signal,
+        { id: "gpt", provider: "openai", upstreamModel: "gpt-5.2-codex" },
+        {},
+        fakeFetch,
+      );
+      expect(res.status).toBe(400);
+      // Request-shape 400 is deterministic: it must NOT burn the second account.
+      expect(calls).toBe(1);
+      const body = (await res.json()) as { error: { message: string } };
+      expect(body.error.message).toContain("Codex backend rejected the request (HTTP 400)");
+      expect(body.error.message).toContain("Unsupported parameter: max_output_tokens");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
   test("non-stream request returns a folded Anthropic message and records usage", async () => {
     const { poolDir, mgr } = tempOpenAIPool(["gpt1"]);
     try {

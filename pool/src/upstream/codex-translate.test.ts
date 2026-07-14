@@ -45,22 +45,19 @@ describe("anthropicToCodexRequest", () => {
     expect(out.include).toEqual(["reasoning.encrypted_content"]);
   });
 
-  test("maps max_tokens to max_output_tokens", () => {
-    const out = anthropicToCodexRequest(
-      { max_tokens: 4096, messages: [{ role: "user", content: "hi" }] },
-      "gpt-5.2-codex",
-    );
-    expect(out.max_output_tokens).toBe(4096);
-  });
-
-  test("clamps max_tokens below the Responses API minimum of 16", () => {
-    // Claude Code sends max_tokens: 1 probe requests; the Responses API 400s
-    // on max_output_tokens < 16.
-    const out = anthropicToCodexRequest(
-      { max_tokens: 1, messages: [{ role: "user", content: "hi" }] },
-      "gpt-5.2-codex",
-    );
-    expect(out.max_output_tokens).toBe(16);
+  test("never sends an output-token cap: the ChatGPT Codex backend rejects max_output_tokens", () => {
+    // The ChatGPT Codex backend 400s with "Unsupported parameter:
+    // max_output_tokens", and the reference Codex CLI's ResponsesApiRequest
+    // carries no output-length field — the backend caps output itself. So we
+    // drop it regardless of the caller's max_tokens (a normal value or a
+    // Claude Code max_tokens:1 probe).
+    for (const max_tokens of [4096, 1]) {
+      const out = anthropicToCodexRequest(
+        { max_tokens, messages: [{ role: "user", content: "hi" }] },
+        "gpt-5.2-codex",
+      );
+      expect("max_output_tokens" in out).toBe(false);
+    }
   });
 
   test("adjacent text blocks stay joined with a newline in a single part", () => {

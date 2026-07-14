@@ -144,9 +144,12 @@ export function anthropicToCodexRequest(
     // Codex CLI (codex-rs/core/src/client.rs always sends this include).
     include: ["reasoning.encrypted_content"],
   };
-  // Clamp: the Responses API 400s on max_output_tokens < 16, and Claude Code
-  // routinely sends max_tokens: 1 probe requests.
-  if (typeof body.max_tokens === "number") out.max_output_tokens = Math.max(16, body.max_tokens);
+  // Deliberately no output-token cap. The ChatGPT Codex backend rejects
+  // `max_output_tokens` outright ("400 Unsupported parameter: max_output_tokens"),
+  // and the reference Codex CLI's ResponsesApiRequest carries no output-length
+  // field — the backend bounds output itself. Since Claude Code always sends
+  // max_tokens, forwarding it here 400s every Codex-routed request. Do not
+  // re-add it.
   const effort = clampEffortForModel(codexEffortFor(deriveEffortTier(body), effortMap), upstreamModel);
   if (effort) out.reasoning = { effort };
   const tools = (body.tools as Array<Record<string, unknown>> | undefined) ?? [];

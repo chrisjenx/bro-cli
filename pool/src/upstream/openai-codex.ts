@@ -15,7 +15,7 @@ import type { ModelRoute } from "../models.ts";
 import { refreshOpenAIToken } from "../accounts/openai-oauth.ts";
 import { anthropicToCodexRequest, CodexToAnthropicStream } from "./codex-translate.ts";
 import { CODEX_RESPONSES_URL, CODEX_ORIGINATOR, CODEX_ACCOUNT_ID_HEADER, CODEX_RATE_LIMIT_HEADERS } from "./codex-constants.ts";
-import { anthropicError, makeAbort, SseParser, isRateLimit, retryAfterMs } from "./shared.ts";
+import { anthropicError, makeAbort, SseParser, isRateLimit, retryAfterMs, parseJson, stringProp, objectProp } from "./shared.ts";
 
 interface ProxyHooks {
   onFailover?: (from: string, to: string) => void;
@@ -178,7 +178,11 @@ async function tryCodexAccount(
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     abortCleanup();
-    const message = text.slice(0, 500) || `Codex backend returned HTTP ${res.status}`;
+    // A non-OK that isn't auth (401/403) or rate limit (429) is a request-shape
+    // or backend rejection — deterministic across accounts, so it's terminal
+    // rather than a failover trigger. Render the backend's own reason into one
+    // legible line instead of passing the raw JSON body through to the client.
+    const message = describeCodexError(res.status, text, account.name);
     mgr.recordError(account.name, message);
     return { kind: "terminal", response: anthropicError(res.status, "api_error", message) };
   }
@@ -536,6 +540,25 @@ export function resetAtFromCodexHeaders(headers: Headers): number | undefined {
     if (Number.isFinite(n)) return n * 1000;
   }
   return retryAfterMs(headers);
+}
+
+/**
+ * Renders a Codex backend non-OK response body into one legible line for the
+ * caller. The backend reports the cause in `detail` (a string, e.g. "Unsupported
+ * parameter: max_output_tokens") or, for OpenAI-style errors, `error.message`;
+ * fall back to the raw body, then a bare status. Prefixed so the client can tell
+ * a Codex-backend rejection apart from a pool/native error and see which pooled
+ * account it hit.
+ */
+export function describeCodexError(status: number, bodyText: string, accountName: string): string {
+  const parsed = parseJson(bodyText);
+  const detail =
+    stringProp(parsed, "detail") ??
+    stringProp(objectProp(parsed, "error"), "message") ??
+    stringProp(parsed, "message") ??
+    (bodyText.trim() ? bodyText.trim().slice(0, 300) : "");
+  const cause = detail ? `: ${detail}` : "";
+  return `Codex backend rejected the request (HTTP ${status})${cause} [account "${accountName}"]`;
 }
 
 function noOpenAIAccountMessage(mgr: AccountManager): string {
