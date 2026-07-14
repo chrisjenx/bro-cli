@@ -204,37 +204,102 @@ async function ensureServer(bun, port, baseUrl) {
   }
 }
 
-// Stop the (detached) server: by recorded pid, else by whatever holds the port.
-async function killProxy(port) {
-  let killed = false;
-  let pid = 0;
-  try {
-    pid = Number.parseInt(fs.readFileSync(PROXY_PID, 'utf8'), 10);
-  } catch {}
-  if (pid) {
+// The server drains in-flight streams for up to 10 minutes after SIGTERM
+// (pool/src/server/shutdown.ts); wait a little longer before giving up.
+const DRAIN_WAIT_MS = 11 * 60 * 1000;
+
+// Poll until `pid` no longer exists. Resolves true once it has exited,
+// false if it is still alive after `timeoutMs`.
+export async function waitForExit(pid, timeoutMs, pollMs = 200) {
+  const start = Date.now();
+  for (;;) {
     try {
-      process.kill(pid);
-      killed = true;
+      process.kill(pid, 0);
+    } catch {
+      return true;
+    }
+    if (Date.now() - start >= timeoutMs) return false;
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+}
+
+// In-flight request count from the server, if it is still answering.
+async function pendingRequests(port) {
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 1500);
+    const res = await fetch(`http://127.0.0.1:${port}/health`, {
+      signal: ctrl.signal,
+      headers: { connection: 'close' }
+    });
+    clearTimeout(t);
+    const body = await res.json();
+    return Number.isFinite(body.pending) ? body.pending : null;
+  } catch {
+    return null;
+  }
+}
+
+// Stop the (detached) server: by recorded pid, else by whatever holds the port.
+// SIGTERM asks the server to drain in-flight streams; wait for the process to
+// actually exit so we never cut a response off mid-stream, and SIGKILL only if
+// the drain window is exhausted.
+async function killProxy(port) {
+  const pids = new Set();
+  try {
+    const pid = Number.parseInt(fs.readFileSync(PROXY_PID, 'utf8'), 10);
+    if (pid) pids.add(pid);
+  } catch {}
+  // Also whatever is LISTENING on the port (macOS/Linux) — covers a stale or
+  // missing pid file. -sTCP:LISTEN is essential: a bare `lsof -ti tcp:<port>`
+  // also matches the Claude sessions *connected* to the pool.
+  try {
+    const out = execFileSync('lsof', ['-ti', `tcp:${port}`, '-sTCP:LISTEN'], { stdio: ['ignore', 'pipe', 'ignore'] })
+      .toString()
+      .trim();
+    for (const p of out.split(/\s+/).filter(Boolean)) pids.add(Number.parseInt(p, 10));
+  } catch {}
+
+  const pending = await pendingRequests(port);
+  const signaled = [];
+  for (const pid of pids) {
+    try {
+      process.kill(pid); // SIGTERM — the server drains before exiting
+      signaled.push(pid);
     } catch {}
   }
-  if (!killed) {
-    // Fallback: whatever is bound to the port (macOS/Linux).
-    try {
-      const out = execFileSync('lsof', ['-ti', `tcp:${port}`], { stdio: ['ignore', 'pipe', 'ignore'] })
-        .toString()
-        .trim();
-      for (const p of out.split(/\s+/).filter(Boolean)) {
-        try {
-          process.kill(Number.parseInt(p, 10));
-          killed = true;
-        } catch {}
+  if (signaled.length === 0) return false;
+
+  if (pending > 0) {
+    console.log(
+      `Waiting for ${pending} in-flight request${pending === 1 ? '' : 's'} to finish ` +
+        C.dim(`(up to ${Math.round(DRAIN_WAIT_MS / 60000)}m — Ctrl-C to stop waiting; the server keeps draining)`)
+    );
+  }
+  for (const pid of signaled) {
+    // Once draining starts the server refuses new connections, so /health can't
+    // report a live count — tick elapsed time instead so the wait doesn't look hung.
+    const start = Date.now();
+    let exited = false;
+    while (!exited && Date.now() - start < DRAIN_WAIT_MS) {
+      exited = await waitForExit(pid, Math.min(15_000, DRAIN_WAIT_MS - (Date.now() - start)));
+      if (!exited) {
+        const s = Math.round((Date.now() - start) / 1000);
+        console.log(C.dim(`  still draining… ${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s elapsed`));
       }
-    } catch {}
+    }
+    if (!exited) {
+      console.log(C.amber(`Drain window exhausted — force-killing pid ${pid}.`));
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {}
+      await waitForExit(pid, 5000);
+    }
   }
   try {
     fs.rmSync(PROXY_PID);
   } catch {}
-  return killed;
+  return true;
 }
 
 // --- status panel ----------------------------------------------------------
@@ -344,6 +409,24 @@ export async function poolDown() {
   return 0;
 }
 
+// `bro pool restart` — drain + stop, then start again, holding the terminal
+// until the server is healthy. Leaves the settings.json override untouched.
+export async function poolRestart() {
+  const port = poolPort();
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const bun = findBun();
+  if (await healthy(port)) {
+    console.log('Restarting the pool — stopping the server (in-flight requests drain first)…');
+    await killProxy(port);
+  } else {
+    console.log('Pool server not running — starting it.');
+  }
+  await ensureServer(bun, port, baseUrl);
+  printStatus(await fetchStatus(port), baseUrl);
+  console.log('  ' + C.green('Pool restarted.') + '\n');
+  return 0;
+}
+
 // `bro pool status` — server health + whether the global override is active.
 export async function poolStatus() {
   const port = poolPort();
@@ -371,8 +454,9 @@ export async function runPoolCommand(args = []) {
   const sub = args[0];
   if (sub === 'up') return poolUp();
   if (sub === 'down') return poolDown();
+  if (sub === 'restart') return poolRestart();
   if (sub === 'status') return poolStatus();
-  console.log('Usage: bro pool <up|down|status>');
+  console.log('Usage: bro pool <up|down|restart|status>');
   return sub ? 1 : 0;
 }
 

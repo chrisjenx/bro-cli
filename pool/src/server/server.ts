@@ -32,6 +32,7 @@ import {
   type AnthropicRequest,
 } from "../adapters/anthropic.ts";
 import { anthropicError } from "../upstream/shared.ts";
+import { installGracefulShutdown } from "./shutdown.ts";
 
 const APPEND_SYSTEM_PROMPT =
   "You are being used as an API model endpoint. Respond directly to the user's request. " +
@@ -54,7 +55,7 @@ export function startServer(config: Config): void {
     hostname: config.host,
     port: config.port,
     idleTimeout: 255, // allow long-running generations
-    async fetch(req) {
+    async fetch(req, srv) {
       const url = new URL(req.url);
       const path = url.pathname;
 
@@ -67,6 +68,8 @@ export function startServer(config: Config): void {
           status: "ok",
           accounts: accounts.length,
           available: accounts.filter((a) => a.available).length,
+          // Don't count this health check itself as in-flight work.
+          pending: Math.max(0, srv.pendingRequests - 1),
         });
       }
       if (req.method === "GET" && path === "/api/status") {
@@ -131,6 +134,8 @@ export function startServer(config: Config): void {
       return json({ error: "not found" }, 404);
     },
   });
+
+  installGracefulShutdown(server);
 
   const accounts = mgr.listAccounts();
   const available = accounts.filter((a) => a.available).length;
