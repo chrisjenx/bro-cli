@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import { loadModelTable, resolveModel, DEFAULT_MODEL_TABLE, loadModelConfig, saveModelConfig, DEFAULT_MAPPINGS, type ModelConfig } from "./models.ts";
+import { loadModelTable, resolveModel, DEFAULT_MODEL_TABLE, loadModelConfig, saveModelConfig, DEFAULT_MAPPINGS, type ModelConfig, mappingFor, type ModelMapping } from "./models.ts";
 
 describe("model table", () => {
   test("unknown model id falls through to anthropic pass-through", () => {
@@ -108,5 +108,40 @@ describe("saveModelConfig", () => {
     expect(reread.mappings).toEqual(cfg.mappings);
     expect(JSON.parse(readFileSync(file, "utf8")).models.length).toBe(cfg.models.length);
     rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+function cfgWith(mappings: ModelMapping[], enabled = true): ModelConfig {
+  return { models: DEFAULT_MODEL_TABLE, mappingEnabled: enabled, mappings };
+}
+
+describe("mappingFor", () => {
+  const base = [{ from: "fable", to: "gpt-5.6-sol", effort: { max: "xhigh" as const } }];
+
+  test("maps a family alias and a full model id to the openai route", () => {
+    const cfg = cfgWith(base);
+    for (const id of ["fable", "claude-fable-5"]) {
+      const route = mappingFor(cfg, id)!;
+      expect(route.provider).toBe("openai");
+      expect(route.upstreamModel).toBe("gpt-5.6-sol");
+      expect(route.effortMap).toEqual({ max: "xhigh" });
+      expect(route.id).toBe(id);
+    }
+  });
+
+  test("disabled flag, unknown family, and missing row return null", () => {
+    expect(mappingFor(cfgWith(base, false), "fable")).toBeNull();
+    expect(mappingFor(cfgWith(base), "gpt-5.5")).toBeNull();
+    expect(mappingFor(cfgWith(base), "sonnet")).toBeNull();
+  });
+
+  test("inert rows return null: identity target and anthropic target", () => {
+    expect(mappingFor(cfgWith([{ from: "fable", to: "fable" }]), "fable")).toBeNull();
+    expect(mappingFor(cfgWith([{ from: "opus", to: "claude-opus-4-8" }]), "opus")).toBeNull();
+  });
+
+  test("target that is a family alias of gpt (bare gpt-5.6) resolves through the table", () => {
+    const route = mappingFor(cfgWith([{ from: "haiku", to: "gpt-5.6" }]), "haiku")!;
+    expect(route.upstreamModel).toBe("gpt-5.6-sol"); // table maps gpt-5.6 -> sol
   });
 });

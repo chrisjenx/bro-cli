@@ -2,6 +2,7 @@
 import { existsSync, readFileSync, writeFileSync } from "fs";
 import type { Provider } from "./accounts/types.ts";
 import type { AccountManager } from "./accounts/manager.ts";
+import { modelFamilyOf } from "./accounts/types.ts";
 
 export const SOURCE_EFFORT_TIERS = ["default", "low", "medium", "high", "xhigh", "max"] as const;
 export type SourceEffortTier = (typeof SOURCE_EFFORT_TIERS)[number];
@@ -59,6 +60,20 @@ export function resolveModel(table: ModelRoute[], modelId: string): ModelRoute {
     table.find((m) => m.id === modelId) ??
     { id: modelId, provider: "anthropic", upstreamModel: modelId }
   );
+}
+
+/** Mapped openai route for a Claude-family request, or null when mapping is
+ * disabled, the model has no family, the row is missing/inert, or the target
+ * doesn't resolve to an openai route. */
+export function mappingFor(cfg: ModelConfig, modelId: string): ModelRoute | null {
+  if (!cfg.mappingEnabled) return null;
+  const family = modelFamilyOf(modelId);
+  if (!family) return null;
+  const row = cfg.mappings.find((m) => m.from === family);
+  if (!row || row.to === row.from) return null;
+  const target = resolveModel(cfg.models, row.to);
+  if (target.provider !== "openai") return null;
+  return { id: modelId, provider: "openai", upstreamModel: target.upstreamModel, effortMap: row.effort };
 }
 
 /**
