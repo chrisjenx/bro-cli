@@ -1657,3 +1657,106 @@ test("recordUsageSnapshot keeps the rate-limit error while a window still blocks
     rmSync(poolDir, { recursive: true, force: true });
   }
 });
+
+describe("pickProvider", () => {
+  // One anthropic account + one openai account, mirroring the "provider-aware
+  // pick" describe block's fixture-construction calls.
+  function crossProviderPool() {
+    const { poolDir, mgr } = tempPool([]);
+    mgr.create("claude1");
+    writeFileSync(
+      join(mgr.configDirFor("claude1"), ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "at" } }),
+    );
+    mgr.create("gpt1");
+    writeFileSync(join(mgr.configDirFor("gpt1"), OPENAI_CREDS_FILENAME), JSON.stringify({ accessToken: "at" }));
+    return { poolDir, mgr };
+  }
+
+  const candidates = [
+    { provider: "anthropic" as const, modelFamily: "fable" },
+    { provider: "openai" as const, modelFamily: null },
+  ];
+
+  test("returns null when no provider has a usable account", () => {
+    const { poolDir, mgr } = crossProviderPool();
+    try {
+      mgr.markRateLimited("claude1", Date.now() + 60 * 60_000);
+      mgr.markRateLimited("gpt1", Date.now() + 60 * 60_000);
+
+      expect(mgr.pickProvider(undefined, candidates)).toBeNull();
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("returns the only provider with usable accounts", () => {
+    const { poolDir, mgr } = crossProviderPool();
+    try {
+      mgr.markRateLimited("claude1", Date.now() + 60 * 60_000);
+
+      const pick = mgr.pickProvider(undefined, candidates);
+      expect(pick?.provider).toBe("openai");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("prefers the provider with more headroom when both usable", () => {
+    const { poolDir, mgr } = crossProviderPool();
+    try {
+      // anthropic at 10% headroom, openai at 90% -> openai wins.
+      mgr.recordRateLimitSnapshot("claude1", snapshot([win("5h", { utilization: 0.9 })]));
+      mgr.recordRateLimitSnapshot("gpt1", snapshot([win("5h", { utilization: 0.1 })]));
+      expect(mgr.pickProvider(undefined, candidates)?.provider).toBe("openai");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("prefers the provider with more headroom in the other direction too", () => {
+    const { poolDir, mgr } = crossProviderPool();
+    try {
+      // anthropic at 90% headroom, openai at 10% -> anthropic wins.
+      mgr.recordRateLimitSnapshot("claude1", snapshot([win("5h", { utilization: 0.1 })]));
+      mgr.recordRateLimitSnapshot("gpt1", snapshot([win("5h", { utilization: 0.9 })]));
+      expect(mgr.pickProvider(undefined, candidates)?.provider).toBe("anthropic");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("sticky: a session pinned to a provider stays there while usable, then moves once sidelined", () => {
+    const { poolDir, mgr } = crossProviderPool();
+    try {
+      mgr.setAffinity("s1", "claude1", "anthropic");
+      // Give openai far more headroom -- the pin should still win.
+      mgr.recordRateLimitSnapshot("claude1", snapshot([win("5h", { utilization: 0.9 })]));
+      mgr.recordRateLimitSnapshot("gpt1", snapshot([win("5h", { utilization: 0.1 })]));
+
+      expect(mgr.pickProvider("s1", candidates)?.provider).toBe("anthropic");
+
+      // Sideline the pinned anthropic account -> the session must move to openai.
+      mgr.markRateLimited("claude1", Date.now() + 60 * 60_000);
+      expect(mgr.pickProvider("s1", candidates)?.provider).toBe("openai");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("ties keep candidate order (anthropic listed first wins)", () => {
+    const { poolDir, mgr } = crossProviderPool();
+    try {
+      // Identical headroom on both sides -> the earlier candidate (anthropic) wins.
+      mgr.recordRateLimitSnapshot("claude1", snapshot([win("5h", { utilization: 0.5 })]));
+      mgr.recordRateLimitSnapshot("gpt1", snapshot([win("5h", { utilization: 0.5 })]));
+      expect(mgr.pickProvider(undefined, candidates)?.provider).toBe("anthropic");
+
+      // Flip the candidate order -> openai (now listed first) wins the tie.
+      const flipped = [candidates[1]!, candidates[0]!];
+      expect(mgr.pickProvider(undefined, flipped)?.provider).toBe("openai");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+});

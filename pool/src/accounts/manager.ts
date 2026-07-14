@@ -135,6 +135,12 @@ export interface KeychainOps {
   delete: typeof deleteKeychainCreds;
 }
 
+/** A model-family request that a given provider is able to serve, for pickProvider(). */
+export interface ProviderCandidate {
+  provider: Provider;
+  modelFamily: string | null;
+}
+
 const defaultKeychainOps: KeychainOps = { read: readKeychainCreds, delete: deleteKeychainCreds };
 
 export class AccountManager {
@@ -629,6 +635,48 @@ export class AccountManager {
           : this.pickByWeighted(tierPool, family, now);
     if (sessionKey) this.sessions.touch(provider, sessionKey, best.name, now);
     return best;
+  }
+
+  /**
+   * Chooses which provider should serve a request that can be satisfied by more
+   * than one subscription (model mapping). Intra-provider account selection
+   * stays with pick()/the configured strategy; this only decides the provider:
+   *   1. no candidate with a usable account -> null
+   *   2. exactly one -> that candidate
+   *   3. sticky: a session already pinned to a candidate's provider stays there
+   *      while the pinned account is usable (thinking blocks don't round-trip
+   *      across providers, so mid-conversation moves lose reasoning context)
+   *   4. otherwise the candidate whose best account has the most headroom;
+   *      ties keep candidate order (callers list anthropic first).
+   */
+  pickProvider(sessionKey: string | undefined, candidates: ProviderCandidate[]): ProviderCandidate | null {
+    const now = Date.now();
+    const usable = candidates
+      .map((c) => ({
+        c,
+        accounts: this.listAccounts().filter((a) => this.usableFor(a, c.provider, c.modelFamily, now)),
+      }))
+      .filter((e) => e.accounts.length > 0);
+    if (usable.length === 0) return null;
+    if (usable.length === 1) return usable[0]!.c;
+
+    if (sessionKey) {
+      for (const e of usable) {
+        const pinned = this.sessions.get(e.c.provider, sessionKey, now);
+        if (pinned && e.accounts.some((a) => a.name === pinned)) return e.c;
+      }
+    }
+
+    let best = usable[0]!;
+    let bestHeadroom = maxHeadroom(best.accounts, best.c.modelFamily, now);
+    for (const e of usable.slice(1)) {
+      const h = maxHeadroom(e.accounts, e.c.modelFamily, now);
+      if (h > bestHeadroom) {
+        best = e;
+        bestHeadroom = h;
+      }
+    }
+    return best.c;
   }
 
   private pickByHeadroom(available: Account[], family: string | null, now: number): Account {
@@ -1216,6 +1264,13 @@ function viableFirst<T extends { viable: boolean }>(candidates: T[]): T[] {
  */
 function headroomFraction(usage: AccountUsage, modelFamily: string | null, now: number): number {
   return candidateMinHeadroom(usage, modelFamily, now);
+}
+
+/** The most headroom any of these accounts has for `family`, used by pickProvider(). */
+function maxHeadroom(accounts: Account[], family: string | null, now: number): number {
+  let best = 0;
+  for (const a of accounts) best = Math.max(best, headroomFraction(a.usage, family, now));
+  return best;
 }
 
 /**
