@@ -566,7 +566,7 @@ function bytesStream(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
   });
 }
 
-function extractSessionKey(body: unknown): string | undefined {
+export function extractSessionKey(body: unknown): string | undefined {
   const metadata = objectProp(asObject(body), "metadata");
   const userId = stringProp(metadata, "user_id");
   return userId || undefined;

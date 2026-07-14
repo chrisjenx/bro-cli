@@ -27,7 +27,7 @@ import type { Account } from "../accounts/types.ts";
 import { modelFamilyOf, MODEL_FAMILIES } from "../accounts/types.ts";
 import { runWithFailover } from "./failover.ts";
 import { dashboardHtml } from "./dashboard.ts";
-import { proxyAnthropicMessages } from "../upstream/anthropic.ts";
+import { proxyAnthropicMessages, extractSessionKey } from "../upstream/anthropic.ts";
 import { sweepUsageRefresh } from "../upstream/usage.ts";
 import { proxyCodexMessages } from "../upstream/openai-codex.ts";
 import {
@@ -156,7 +156,7 @@ export function startServer(config: Config): void {
 
         return path === "/v1/chat/completions"
           ? handleOpenAI(body as OpenAIChatRequest, mgr, config, req.signal, modelTable)
-          : handleAnthropic(body, req.headers, mgr, config, req.signal, modelTable);
+          : handleAnthropic(body, req.headers, mgr, config, req.signal, modelTable, mappingState);
       }
 
       return json({ error: "not found" }, 404);
@@ -300,6 +300,25 @@ export function nonOauthOpenAIBackendError(route: ModelRoute, backend: Config["b
   );
 }
 
+export const CROSS_PROVIDER_RETRY_STATUSES: ReadonlySet<number> = new Set([429, 503, 529]);
+
+/**
+ * Which provider serves a mapped Claude-family request first. Anthropic is
+ * listed first so ties keep Claude subscriptions primary. Codex accounts have
+ * no per-family windows, so the openai candidate uses a null family.
+ */
+export function chooseMappedService(
+  mgr: AccountManager,
+  sessionKey: string | undefined,
+  modelFamily: string | null,
+): "anthropic" | "openai" | null {
+  const pick = mgr.pickProvider(sessionKey, [
+    { provider: "anthropic", modelFamily },
+    { provider: "openai", modelFamily: null },
+  ]);
+  return pick?.provider ?? null;
+}
+
 async function handleAnthropic(
   body: unknown,
   headers: Headers,
@@ -307,6 +326,7 @@ async function handleAnthropic(
   config: Config,
   signal: AbortSignal,
   modelTable: ModelRoute[],
+  mappingState: MappingState,
 ): Promise<Response> {
   const route = routeForRequest(modelTable, body);
   const backendErr = nonOauthOpenAIBackendError(route, config.backend);
@@ -316,6 +336,41 @@ async function handleAnthropic(
     if (route.provider === "openai") {
       return proxyCodexMessages(body, mgr, config, signal, route, failoverHooks(config));
     }
+
+    const requestedModel =
+      typeof (body as Record<string, unknown>)?.model === "string"
+        ? String((body as Record<string, unknown>).model)
+        : "";
+    const mapped = mappingFor(mappingState.config, requestedModel);
+    if (mapped) {
+      const sessionKey = extractSessionKey(body);
+      const family = modelFamilyOf(requestedModel);
+      const first = chooseMappedService(mgr, sessionKey, family);
+      const hooks = failoverHooks(config);
+
+      const serve = (svc: "anthropic" | "openai") =>
+        svc === "openai"
+          ? proxyCodexMessages(body, mgr, config, signal, mapped, hooks)
+          : proxyAnthropicMessages(body, headers, mgr, config, signal, hooks);
+
+      if (!first) {
+        // Neither provider usable; let the anthropic path produce its 503.
+        return proxyAnthropicMessages(body, headers, mgr, config, signal, hooks);
+      }
+      const res = await serve(first);
+      // Cross-provider fallback: the proxies only return these statuses when
+      // every same-provider account was exhausted before any bytes streamed,
+      // so retrying the whole request on the other subscription is safe.
+      if (CROSS_PROVIDER_RETRY_STATUSES.has(res.status)) {
+        const other = first === "anthropic" ? "openai" : "anthropic";
+        hooks.onFailover?.(`${first} pool`, `${other} pool`);
+        const retry = await serve(other);
+        // Prefer whichever answer isn't an exhaustion error.
+        return CROSS_PROVIDER_RETRY_STATUSES.has(retry.status) ? res : retry;
+      }
+      return res;
+    }
+
     return proxyAnthropicMessages(body, headers, mgr, config, signal, failoverHooks(config));
   }
 

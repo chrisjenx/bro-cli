@@ -53,7 +53,7 @@ export async function proxyCodexMessages(
   const sessionKey =
     metadata && typeof metadata.user_id === "string" && metadata.user_id ? metadata.user_id : undefined;
   const streamRequested = anthropicBody.stream === true;
-  const codexBody = anthropicToCodexRequest(anthropicBody, route.upstreamModel);
+  const codexBody = anthropicToCodexRequest(anthropicBody, route.upstreamModel, route.effortMap);
 
   let account = mgr.pick(sessionKey, undefined, "openai");
   if (!account) return anthropicError(503, "overloaded_error", noOpenAIAccountMessage(mgr));
