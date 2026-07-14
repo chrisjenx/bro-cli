@@ -608,6 +608,11 @@ describe("deriveEffortTier", () => {
     expect(deriveEffortTier({ thinking: { type: "enabled", budget_tokens: 32768 } })).toBe("xhigh");
   });
 
+  test("bucket boundaries land in the higher tier (< is exclusive on the lower bound)", () => {
+    expect(deriveEffortTier({ thinking: { type: "enabled", budget_tokens: 8192 } })).toBe("medium");
+    expect(deriveEffortTier({ thinking: { type: "enabled", budget_tokens: 16384 } })).toBe("high");
+  });
+
   test("no signal and junk values yield default", () => {
     expect(deriveEffortTier({})).toBe("default");
     expect(deriveEffortTier({ output_config: { effort: "ultra" } })).toBe("default");
@@ -647,5 +652,13 @@ describe("anthropicToCodexRequest reasoning.effort", () => {
   test("legacy thinking budget still buckets (existing behavior preserved)", () => {
     const out = anthropicToCodexRequest({ ...msg, thinking: { type: "enabled", budget_tokens: 10000 } }, "gpt-5.6-sol");
     expect(out.reasoning).toEqual({ effort: "medium" });
+  });
+  test("mapping override applies before the per-model clamp: high->max, clamped to xhigh on gpt-5.5", () => {
+    const out = anthropicToCodexRequest(
+      { ...msg, output_config: { effort: "high" } },
+      "gpt-5.5",
+      { high: "max" },
+    );
+    expect(out.reasoning).toEqual({ effort: "xhigh" });
   });
 });

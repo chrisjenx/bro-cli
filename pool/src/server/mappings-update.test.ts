@@ -54,4 +54,34 @@ describe("handleMappingsUpdate", () => {
     ).toBe(400);
     rmSync(dir, { recursive: true, force: true });
   });
+
+  test("non-boolean enabled rejected", async () => {
+    const { state, file, dir } = freshState();
+    const res = handleMappingsUpdate(state, file, { enabled: "yes" });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { message: string } };
+    expect(body.error.message).toContain("boolean");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("partial POST merges over defaults so memory and disk agree (no restart divergence)", () => {
+    const { state, file, dir } = freshState();
+    const res = handleMappingsUpdate(state, file, {
+      mappings: [{ from: "fable", to: "gpt-5.6-luna" }],
+    });
+    expect(res.status).toBe(200);
+
+    // The posted family wins; the families left unlisted in the POST keep
+    // their default rows immediately in memory, not only after a reload.
+    expect(state.config.mappings.find((m) => m.from === "fable")!.to).toBe("gpt-5.6-luna");
+    expect(state.config.mappings.find((m) => m.from === "opus")!.to).toBe("gpt-5.6-terra");
+    expect(state.config.mappings.find((m) => m.from === "sonnet")!.to).toBe("gpt-5.6-luna");
+    expect(state.config.mappings.find((m) => m.from === "haiku")!.to).toBe("gpt-5.4-mini");
+    expect(state.config.mappings.map((m) => m.from).sort()).toEqual(["fable", "haiku", "opus", "sonnet"]);
+
+    // Memory and disk must agree: reloading from the persisted file yields the
+    // exact same mapping set (same rows, same order) as what's already in state.
+    expect(loadModelConfig(file).mappings).toEqual(state.config.mappings);
+    rmSync(dir, { recursive: true, force: true });
+  });
 });

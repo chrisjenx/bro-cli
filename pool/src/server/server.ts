@@ -18,6 +18,7 @@ import {
   mappingFor,
   SOURCE_EFFORT_TIERS,
   CODEX_EFFORTS,
+  DEFAULT_MAPPINGS,
   type ModelRoute,
   type ModelConfig,
   type ModelMapping,
@@ -354,10 +355,9 @@ async function handleAnthropic(
       return proxyCodexMessages(body, mgr, config, signal, route, failoverHooks(config));
     }
 
-    const requestedModel =
-      typeof (body as Record<string, unknown>)?.model === "string"
-        ? String((body as Record<string, unknown>).model)
-        : "";
+    // resolveModel() always sets route.id to the requested model id, so this
+    // avoids re-extracting body.model a second time.
+    const requestedModel = route.id;
     const mapped = mappingFor(mappingState.config, requestedModel);
     if (mapped) {
       const sessionKey = extractSessionKey(body);
@@ -462,7 +462,16 @@ export function handleMappingsUpdate(state: MappingState, modelsFile: string, bo
     }
   }
   if (b.enabled !== undefined) state.config.mappingEnabled = b.enabled;
-  if (mappings !== undefined) state.config.mappings = mappings;
+  if (mappings !== undefined) {
+    // Merge posted rows over the defaults the same way loadModelConfig does,
+    // so a partial POST (e.g. only "fable") behaves identically in memory and
+    // after a restart instead of dropping the unlisted families until reload.
+    const postedFamilies = new Set(mappings.map((m) => m.from));
+    state.config.mappings = [
+      ...DEFAULT_MAPPINGS.filter((m) => !postedFamilies.has(m.from)),
+      ...mappings,
+    ];
+  }
   saveModelConfig(modelsFile, state.config);
   return json({ ok: true, mappingEnabled: state.config.mappingEnabled, mappings: state.config.mappings });
 }

@@ -129,9 +129,22 @@ export function loadModelConfig(modelsFile: string): ModelConfig {
   if (existsSync(modelsFile)) {
     try {
       const parsed = JSON.parse(readFileSync(modelsFile, "utf8")) as Record<string, unknown>;
-      if (typeof parsed.mappingEnabled === "boolean") mappingEnabled = parsed.mappingEnabled;
-      if (Array.isArray(parsed.mappings)) fromFile = parsed.mappings.filter(isModelMapping).map(sanitizeMapping);
+      if (parsed.mappingEnabled !== undefined) {
+        if (typeof parsed.mappingEnabled === "boolean") {
+          mappingEnabled = parsed.mappingEnabled;
+        } else {
+          console.warn(`${modelsFile}: "mappingEnabled" is not a boolean; ignoring (mapping stays off)`);
+        }
+      }
+      if (parsed.mappings !== undefined) {
+        if (Array.isArray(parsed.mappings)) {
+          fromFile = parsed.mappings.filter(isModelMapping).map(sanitizeMapping);
+        } else {
+          console.warn(`${modelsFile}: "mappings" is not an array; ignoring (using defaults)`);
+        }
+      }
     } catch {
+      console.warn(`${modelsFile}: failed to parse; using default model mapping config`);
       // fall through to defaults (mapping off)
     }
   }
