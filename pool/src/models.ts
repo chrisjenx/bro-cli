@@ -3,10 +3,22 @@ import { existsSync, readFileSync, writeFileSync } from "fs";
 import type { Provider } from "./accounts/types.ts";
 import type { AccountManager } from "./accounts/manager.ts";
 
+export const SOURCE_EFFORT_TIERS = ["default", "low", "medium", "high", "xhigh", "max"] as const;
+export type SourceEffortTier = (typeof SOURCE_EFFORT_TIERS)[number];
+
+/** Codex Responses API reasoning.effort values (gpt-5.6). "ultra" is a
+ * Codex-app-only delegated mode, not an API value — never emitted here. */
+export const CODEX_EFFORTS = ["none", "low", "medium", "high", "xhigh", "max"] as const;
+export type CodexEffort = (typeof CODEX_EFFORTS)[number];
+
+export type EffortMap = Partial<Record<SourceEffortTier, CodexEffort>>;
+
 export interface ModelRoute {
   id: string;
   provider: Provider;
   upstreamModel: string;
+  /** Attached at request time for mapped routes; never persisted. */
+  effortMap?: EffortMap;
 }
 
 const claude = (id: string): ModelRoute => ({ id, provider: "anthropic", upstreamModel: id });
@@ -70,6 +82,75 @@ export async function updateOpenAIModels(mgr: AccountManager, table: ModelRoute[
       "Edit models.json manually to add/remove OpenAI model ids.",
   );
   return table;
+}
+
+export interface ModelMapping {
+  /** Claude model family this row applies to ("fable" | "opus" | "sonnet" | "haiku"). */
+  from: string;
+  /** Target model id. A Claude-family target (or to === from) marks the row inert:
+   * that family stays Anthropic-only. */
+  to: string;
+  /** Source tier → Codex effort overrides. Omitted tiers pass through 1:1. */
+  effort?: EffortMap;
+}
+
+export interface ModelConfig {
+  models: ModelRoute[];
+  mappingEnabled: boolean;
+  mappings: ModelMapping[];
+}
+
+export const DEFAULT_MAPPINGS: ModelMapping[] = [
+  { from: "fable", to: "gpt-5.6-sol" },
+  { from: "opus", to: "gpt-5.6-terra" },
+  { from: "sonnet", to: "gpt-5.6-luna" },
+  { from: "haiku", to: "gpt-5.4-mini" },
+];
+
+export function loadModelConfig(modelsFile: string): ModelConfig {
+  const models = loadModelTable(modelsFile);
+  let mappingEnabled = false;
+  let fromFile: ModelMapping[] = [];
+  if (existsSync(modelsFile)) {
+    try {
+      const parsed = JSON.parse(readFileSync(modelsFile, "utf8")) as Record<string, unknown>;
+      if (typeof parsed.mappingEnabled === "boolean") mappingEnabled = parsed.mappingEnabled;
+      if (Array.isArray(parsed.mappings)) fromFile = parsed.mappings.filter(isModelMapping).map(sanitizeMapping);
+    } catch {
+      // fall through to defaults (mapping off)
+    }
+  }
+  const families = new Set(fromFile.map((m) => m.from));
+  const mappings = [...DEFAULT_MAPPINGS.filter((m) => !families.has(m.from)), ...fromFile];
+  return { models, mappingEnabled, mappings };
+}
+
+export function saveModelConfig(modelsFile: string, cfg: ModelConfig): void {
+  writeFileSync(
+    modelsFile,
+    JSON.stringify({ models: cfg.models, mappingEnabled: cfg.mappingEnabled, mappings: cfg.mappings }, null, 2),
+  );
+}
+
+export function isModelMapping(v: unknown): v is ModelMapping {
+  const o = v as Record<string, unknown>;
+  return v != null && typeof o.from === "string" && typeof o.to === "string";
+}
+
+/** Drops effort entries whose key/value aren't recognized tiers. */
+function sanitizeMapping(m: ModelMapping): ModelMapping {
+  if (!m.effort || typeof m.effort !== "object") return { from: m.from, to: m.to };
+  const effort: EffortMap = {};
+  for (const [k, val] of Object.entries(m.effort)) {
+    if (
+      (SOURCE_EFFORT_TIERS as readonly string[]).includes(k) &&
+      typeof val === "string" &&
+      (CODEX_EFFORTS as readonly string[]).includes(val)
+    ) {
+      effort[k as SourceEffortTier] = val as CodexEffort;
+    }
+  }
+  return Object.keys(effort).length ? { from: m.from, to: m.to, effort } : { from: m.from, to: m.to };
 }
 
 function isModelRoute(v: unknown): v is ModelRoute {

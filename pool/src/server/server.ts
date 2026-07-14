@@ -10,7 +10,7 @@
 
 import type { Config } from "../config.ts";
 import { AccountManager, isValidPriority, isValidWeight, TUNING_BOUNDS, type RoutingTuning } from "../accounts/manager.ts";
-import { loadModelTable, resolveModel, type ModelRoute } from "../models.ts";
+import { loadModelConfig, resolveModel, type ModelRoute } from "../models.ts";
 import { runClaude } from "../subprocess/claude.ts";
 import type { Account } from "../accounts/types.ts";
 import { modelFamilyOf } from "../accounts/types.ts";
@@ -40,7 +40,8 @@ const APPEND_SYSTEM_PROMPT =
 
 export function startServer(config: Config): void {
   const mgr = new AccountManager(config);
-  const modelTable = loadModelTable(config.modelsFile);
+  const modelConfig = loadModelConfig(config.modelsFile);
+  const modelTable = modelConfig.models;
 
   // Sweep idle session pins so load counts decay even when traffic stops.
   setInterval(() => mgr.pruneSessions(), 60_000);
