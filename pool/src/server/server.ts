@@ -10,10 +10,21 @@
 
 import type { Config } from "../config.ts";
 import { AccountManager, isValidPriority, isValidWeight, TUNING_BOUNDS, type RoutingTuning } from "../accounts/manager.ts";
-import { loadModelConfig, resolveModel, type ModelRoute } from "../models.ts";
+import {
+  loadModelConfig,
+  resolveModel,
+  saveModelConfig,
+  isModelMapping,
+  mappingFor,
+  SOURCE_EFFORT_TIERS,
+  CODEX_EFFORTS,
+  type ModelRoute,
+  type ModelConfig,
+  type ModelMapping,
+} from "../models.ts";
 import { runClaude } from "../subprocess/claude.ts";
 import type { Account } from "../accounts/types.ts";
-import { modelFamilyOf } from "../accounts/types.ts";
+import { modelFamilyOf, MODEL_FAMILIES } from "../accounts/types.ts";
 import { runWithFailover } from "./failover.ts";
 import { dashboardHtml } from "./dashboard.ts";
 import { proxyAnthropicMessages } from "../upstream/anthropic.ts";
@@ -42,6 +53,7 @@ export function startServer(config: Config): void {
   const mgr = new AccountManager(config);
   const modelConfig = loadModelConfig(config.modelsFile);
   const modelTable = modelConfig.models;
+  const mappingState: MappingState = { config: modelConfig };
 
   // Sweep idle session pins so load counts decay even when traffic stops.
   setInterval(() => mgr.pruneSessions(), 60_000);
@@ -78,6 +90,11 @@ export function startServer(config: Config): void {
           accounts: mgr.listAccounts(),
           routing: mgr.routingSnapshot(),
           tuning: mgr.getTuning(),
+          mapping: {
+            enabled: mappingState.config.mappingEnabled,
+            mappings: mappingState.config.mappings,
+            targets: modelTable.filter((m) => m.provider === "openai").map((m) => m.id),
+          },
           usageWindowMs: config.usageWindowMs,
           now: Date.now(),
         });
@@ -101,6 +118,16 @@ export function startServer(config: Config): void {
           return json({ error: { message: "Invalid JSON body" } }, 400);
         }
         return handleTuningUpdate(mgr, body);
+      }
+      if (path === "/api/mappings") {
+        if (req.method !== "POST") return json({ error: "method not allowed" }, 405);
+        let body: unknown;
+        try {
+          body = await req.json();
+        } catch {
+          return json({ error: { message: "Invalid JSON body" } }, 400);
+        }
+        return handleMappingsUpdate(mappingState, config.modelsFile, body);
       }
       if (req.method === "GET" && (path === "/v1/models" || path === "/models")) {
         return json({
@@ -179,6 +206,12 @@ export function startServer(config: Config): void {
   } else {
     console.log("");
   }
+}
+
+// ---- types ------------------------------------------------------------------
+
+export interface MappingState {
+  config: ModelConfig;
 }
 
 // ---- request handlers ----------------------------------------------------
@@ -338,6 +371,60 @@ function failoverHooks(config: Config) {
 }
 
 // ---- helpers -------------------------------------------------------------
+
+/**
+ * Apply a dashboard model-mapping edit (master switch and/or full mapping set).
+ * Validates every row before applying anything, persists to models.json, and
+ * hot-applies via the shared MappingState (no pool restart).
+ * Unauthenticated by design, matching the other dashboard routes.
+ */
+export function handleMappingsUpdate(state: MappingState, modelsFile: string, body: unknown): Response {
+  const b = (body ?? {}) as { enabled?: unknown; mappings?: unknown };
+  if (b.enabled === undefined && b.mappings === undefined) {
+    return json({ error: { message: "provide enabled and/or mappings" } }, 400);
+  }
+  if (b.enabled !== undefined && typeof b.enabled !== "boolean") {
+    return json({ error: { message: "enabled must be a boolean" } }, 400);
+  }
+  let mappings: ModelMapping[] | undefined;
+  if (b.mappings !== undefined) {
+    if (!Array.isArray(b.mappings)) return json({ error: { message: "mappings must be an array" } }, 400);
+    mappings = [];
+    for (const raw of b.mappings) {
+      const err = validateMapping(raw, state.config.models);
+      if (err) return json({ error: { message: err } }, 400);
+      mappings.push(raw as ModelMapping);
+    }
+  }
+  if (b.enabled !== undefined) state.config.mappingEnabled = b.enabled;
+  if (mappings !== undefined) state.config.mappings = mappings;
+  saveModelConfig(modelsFile, state.config);
+  return json({ ok: true, mappingEnabled: state.config.mappingEnabled, mappings: state.config.mappings });
+}
+
+/** Returns an error message, or null when the row is valid. */
+function validateMapping(raw: unknown, table: ModelRoute[]): string | null {
+  if (!isModelMapping(raw)) return "each mapping needs string 'from' and 'to'";
+  const m = raw as ModelMapping;
+  if (!(MODEL_FAMILIES as readonly string[]).includes(m.from)) {
+    return `unknown family '${m.from}' (expected one of ${MODEL_FAMILIES.join(", ")})`;
+  }
+  // An anthropic-routed target (incl. to === from) is a valid Claude-only opt-out;
+  // an id that isn't in the table at all and doesn't look like a claude model is a typo.
+  const inTable = table.some((r) => r.id === m.to);
+  const claudeFamily = modelFamilyOf(m.to) !== null;
+  if (!inTable && !claudeFamily) return `unknown target model '${m.to}'`;
+  if (m.effort !== undefined) {
+    if (typeof m.effort !== "object" || m.effort === null) return "effort must be an object";
+    for (const [k, v] of Object.entries(m.effort)) {
+      if (!(SOURCE_EFFORT_TIERS as readonly string[]).includes(k)) return `unknown effort tier '${k}'`;
+      if (typeof v !== "string" || !(CODEX_EFFORTS as readonly string[]).includes(v)) {
+        return `invalid effort value '${String(v)}' for tier '${k}'`;
+      }
+    }
+  }
+  return null;
+}
 
 /**
  * Apply a dashboard routing edit (priority and/or weight). Validates the
