@@ -326,6 +326,27 @@ test("card() weight editor defaults to 1 when weight is missing (older /api/stat
   expect(html).toContain('value="1"');
 });
 
+function loadMappingCard(): (mapping: unknown) => string {
+  const html = dashboardHtml();
+  const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+  if (!script) throw new Error("dashboard <script> block not found");
+  const stubbed = script
+    .replace(/^refresh\(\);$/m, "")
+    .replace(/^setInterval\(refresh, 4000\);$/m, "");
+  const noopEl = { addEventListener() {}, setAttribute() {}, getAttribute() { return null; }, textContent: "", style: {} };
+  const doc = { getElementById: () => noopEl, querySelectorAll: () => [], documentElement: noopEl };
+  const factory = new Function("document", "localStorage", "matchMedia", `${stubbed}\nreturn mappingCardHtml;`);
+  return factory(doc, { getItem: () => null, setItem() {} }, () => ({ matches: false }));
+}
+
+// Each family (fable/opus/sonnet/haiku) renders as its own <div class="map-row"
+// ... <div class="efforts">...</div></div> block with no other nested divs, so
+// a non-greedy match up to the first "</div></div>" isolates one row's markup.
+function mapRow(html: string, family: string): string {
+  const re = new RegExp(`<div class="map-row" data-map-row="${family}">[\\s\\S]*?</div></div>`);
+  return html.match(re)?.[0] ?? "";
+}
+
 describe("model mapping card", () => {
   test("dashboard ships the mapping panel and save wiring", () => {
     const html = dashboardHtml();
@@ -334,5 +355,83 @@ describe("model mapping card", () => {
     expect(html).toContain('id="mapping-save"');
     expect(html).toContain("/api/mappings");
     expect(html).toContain("mappingCardHtml");
+  });
+
+  test("mappingCardHtml marks fable→fable and an off-target mapping as inert (Claude only, efforts hidden)", () => {
+    const mappingCardHtml = loadMappingCard();
+    const html = mappingCardHtml({
+      enabled: true,
+      targets: ["gpt-5.6-sol", "gpt-5.5"],
+      // opus is mapped to a target that isn't in `targets` anymore (e.g. a
+      // model that was removed from the pool) — must fall back to inert too.
+      mappings: [{ from: "opus", to: "gpt-9.9-ghost" }],
+    });
+
+    const fableRow = mapRow(html, "fable");
+    expect(fableRow).toContain('<option value="fable" selected>Claude only</option>');
+    expect(fableRow).toContain('<div class="efforts" style="display:none">');
+
+    const opusRow = mapRow(html, "opus");
+    expect(opusRow).toContain('<option value="opus" selected>Claude only</option>');
+    expect(opusRow).toContain('<div class="efforts" style="display:none">');
+  });
+
+  test("mappingCardHtml selects an active target, shows its efforts, and reflects an effort override", () => {
+    const mappingCardHtml = loadMappingCard();
+    const html = mappingCardHtml({
+      enabled: true,
+      targets: ["gpt-5.6-sol", "gpt-5.5"],
+      mappings: [{ from: "fable", to: "gpt-5.6-sol", effort: { max: "xhigh" } }],
+    });
+
+    const fableRow = mapRow(html, "fable");
+    expect(fableRow).toContain('<option value="gpt-5.6-sol" selected>gpt-5.6-sol</option>');
+    expect(fableRow).not.toContain("display:none");
+
+    const maxSelect = fableRow.match(
+      /<select data-effort-family="fable" data-effort-tier="max">[\s\S]*?<\/select>/,
+    )?.[0] ?? "";
+    expect(maxSelect).toContain('<option value="xhigh" selected>Extra High</option>');
+  });
+
+  test("gpt-5.5 targets omit the max effort tier; gpt-5.6-sol targets keep it", () => {
+    const mappingCardHtml = loadMappingCard();
+    const html = mappingCardHtml({
+      enabled: true,
+      targets: ["gpt-5.6-sol", "gpt-5.5"],
+      mappings: [
+        { from: "fable", to: "gpt-5.6-sol" },
+        { from: "opus", to: "gpt-5.5" },
+      ],
+    });
+
+    const fableRow = mapRow(html, "fable");
+    const opusRow = mapRow(html, "opus");
+    expect(fableRow).toContain('<option value="max">Max</option>');
+    expect(opusRow).not.toContain('<option value="max">Max</option>');
+  });
+
+  test("mappingCardHtml HTML-escapes target ids from mapping.targets", () => {
+    const mappingCardHtml = loadMappingCard();
+    const html = mappingCardHtml({
+      enabled: true,
+      targets: ["<script>alert(1)</script>"],
+      mappings: [],
+    });
+    expect(html).not.toContain("<script>alert(1)</script>");
+    expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
+  });
+
+  test('mappingCardHtml never renders the word "ultra"', () => {
+    const mappingCardHtml = loadMappingCard();
+    const html = mappingCardHtml({
+      enabled: true,
+      targets: ["gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra"],
+      mappings: [
+        { from: "fable", to: "gpt-5.6-sol", effort: { max: "xhigh", high: "high" } },
+        { from: "opus", to: "gpt-5.5" },
+      ],
+    });
+    expect(html.toLowerCase()).not.toContain("ultra");
   });
 });
