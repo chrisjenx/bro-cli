@@ -74,9 +74,16 @@ export class SessionLedger {
 
   /** Account this session is pinned to, or null when unknown or idle-expired. */
   get(provider: Provider, sessionKey: string, now: number = Date.now()): string | null {
+    return this.getEntry(provider, sessionKey, now)?.account ?? null;
+  }
+
+  /** Live pin entry (account + lastSeenAt) for this session, or null when
+   * unknown or idle-expired. Callers comparing pins across providers use
+   * lastSeenAt to prefer the most-recently-served one. */
+  getEntry(provider: Provider, sessionKey: string, now: number = Date.now()): SessionEntry | null {
     const e = this.entries.get(this.key(provider, sessionKey));
     if (!e || !this.isLive(e, now)) return null;
-    return e.account;
+    return e;
   }
 
   /** Create or refresh a pin and persist it. */

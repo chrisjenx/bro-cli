@@ -632,10 +632,16 @@ describe("codexEffortFor", () => {
 });
 
 describe("clampEffortForModel", () => {
-  test("gpt-5.5 has no max; others untouched", () => {
-    expect(clampEffortForModel("max", "gpt-5.5")).toBe("xhigh");
+  test("only gpt-5.6* keeps max; every earlier model clamps to xhigh", () => {
     expect(clampEffortForModel("max", "gpt-5.6-sol")).toBe("max");
-    expect(clampEffortForModel(undefined, "gpt-5.5")).toBeUndefined();
+    expect(clampEffortForModel("max", "gpt-5.6-luna")).toBe("max");
+    // gpt-5.5, gpt-5.4, and gpt-5.4-mini all top out at xhigh (no max).
+    expect(clampEffortForModel("max", "gpt-5.5")).toBe("xhigh");
+    expect(clampEffortForModel("max", "gpt-5.4")).toBe("xhigh");
+    expect(clampEffortForModel("max", "gpt-5.4-mini")).toBe("xhigh");
+    // Non-max efforts and undefined pass through untouched on any model.
+    expect(clampEffortForModel("high", "gpt-5.4-mini")).toBe("high");
+    expect(clampEffortForModel(undefined, "gpt-5.4")).toBeUndefined();
   });
 });
 
@@ -659,6 +665,12 @@ describe("anthropicToCodexRequest reasoning.effort", () => {
       "gpt-5.5",
       { high: "max" },
     );
+    expect(out.reasoning).toEqual({ effort: "xhigh" });
+  });
+  test("pass-through max on the default haiku->gpt-5.4-mini target clamps to xhigh (5.4-mini has no max)", () => {
+    // No effort map: source tier "max" passes through 1:1, then the per-model
+    // clamp saves it from a 400 on a model that tops out at xhigh.
+    const out = anthropicToCodexRequest({ ...msg, output_config: { effort: "max" } }, "gpt-5.4-mini");
     expect(out.reasoning).toEqual({ effort: "xhigh" });
   });
 });

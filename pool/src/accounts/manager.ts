@@ -645,7 +645,11 @@ export class AccountManager {
    *   2. exactly one -> that candidate
    *   3. sticky: a session already pinned to a candidate's provider stays there
    *      while the pinned account is usable (thinking blocks don't round-trip
-   *      across providers, so mid-conversation moves lose reasoning context)
+   *      across providers, so mid-conversation moves lose reasoning context).
+   *      When both providers hold a live pin — e.g. right after a cross-provider
+   *      failover — the most-recently-served one wins, so a recovered primary
+   *      doesn't snap the session back and discard the current provider's
+   *      reasoning context.
    *   4. otherwise the candidate whose best account has the most headroom;
    *      ties keep candidate order (callers list anthropic first).
    */
@@ -661,16 +665,27 @@ export class AccountManager {
     if (usable.length === 1) return usable[0]!.c;
 
     if (sessionKey) {
+      let pinnedBest: { c: ProviderCandidate; lastSeenAt: number } | null = null;
       for (const e of usable) {
-        const pinned = this.sessions.get(e.c.provider, sessionKey, now);
-        if (pinned && e.accounts.some((a) => a.name === pinned)) return e.c;
+        const entry = this.sessions.getEntry(e.c.provider, sessionKey, now);
+        if (entry && e.accounts.some((a) => a.name === entry.account)) {
+          // Strict > keeps candidate order on ties (anthropic listed first).
+          if (!pinnedBest || entry.lastSeenAt > pinnedBest.lastSeenAt) {
+            pinnedBest = { c: e.c, lastSeenAt: entry.lastSeenAt };
+          }
+        }
       }
+      if (pinnedBest) return pinnedBest.c;
     }
 
+    // Compare on the tier pick() will actually spend: only the highest-priority
+    // (lowest-number) usable tier per provider serves requests, so scoring a
+    // provider on a reserved backup tier's headroom would pick a provider whose
+    // serving tier is actually more constrained.
     let best = usable[0]!;
-    let bestHeadroom = maxHeadroom(best.accounts, best.c.modelFamily, now);
+    let bestHeadroom = maxHeadroom(activeTier(best.accounts), best.c.modelFamily, now);
     for (const e of usable.slice(1)) {
-      const h = maxHeadroom(e.accounts, e.c.modelFamily, now);
+      const h = maxHeadroom(activeTier(e.accounts), e.c.modelFamily, now);
       if (h > bestHeadroom) {
         best = e;
         bestHeadroom = h;
@@ -883,8 +898,8 @@ export class AccountManager {
   }
 
   /** Pin a session to the account that actually served it (post-failover). */
-  setAffinity(sessionKey: string, accountName: string, provider: Provider = "anthropic"): void {
-    this.sessions.touch(provider, sessionKey, accountName);
+  setAffinity(sessionKey: string, accountName: string, provider: Provider = "anthropic", now: number = Date.now()): void {
+    this.sessions.touch(provider, sessionKey, accountName, now);
   }
 
   /** Expire idle session pins; called periodically by the server. */
@@ -1271,6 +1286,15 @@ function maxHeadroom(accounts: Account[], family: string | null, now: number): n
   let best = 0;
   for (const a of accounts) best = Math.max(best, headroomFraction(a.usage, family, now));
   return best;
+}
+
+/** The highest-priority (lowest-number) tier within a set of accounts — the tier
+ * pick() actually spends, mirrored here so pickProvider() scores providers on
+ * the accounts that will serve rather than on reserved backups. */
+function activeTier(accounts: Account[]): Account[] {
+  if (accounts.length === 0) return accounts;
+  const minPriority = Math.min(...accounts.map((a) => a.priority));
+  return accounts.filter((a) => a.priority === minPriority);
 }
 
 /**

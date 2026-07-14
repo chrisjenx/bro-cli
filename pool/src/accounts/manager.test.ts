@@ -1759,4 +1759,50 @@ describe("pickProvider", () => {
       rmSync(poolDir, { recursive: true, force: true });
     }
   });
+
+  test("headroom compares only the active (highest-priority) tier per provider", () => {
+    const { poolDir, mgr } = crossProviderPool();
+    try {
+      // Add a reserved anthropic backup with lots of headroom behind a low-headroom
+      // primary. pick() would serve the primary, so the provider must be scored on
+      // the primary, not the idle backup.
+      mgr.create("claude2");
+      writeFileSync(
+        join(mgr.configDirFor("claude2"), ".credentials.json"),
+        JSON.stringify({ claudeAiOauth: { accessToken: "at" } }),
+      );
+      mgr.setPriority("claude1", 1); // active tier, nearly full
+      mgr.setPriority("claude2", 2); // reserved backup, wide open
+      mgr.recordRateLimitSnapshot("claude1", snapshot([win("5h", { utilization: 0.9 })])); // 0.1 headroom
+      mgr.recordRateLimitSnapshot("claude2", snapshot([win("5h", { utilization: 0.05 })])); // 0.95 headroom
+      mgr.recordRateLimitSnapshot("gpt1", snapshot([win("5h", { utilization: 0.5 })])); // 0.5 headroom
+
+      // Active-tier anthropic headroom (0.1) loses to openai (0.5), even though the
+      // backup tier (0.95) would win a naive all-accounts comparison.
+      expect(mgr.pickProvider(undefined, candidates)?.provider).toBe("openai");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("when both providers hold a live pin, the most-recently-served one wins", () => {
+    const { poolDir, mgr } = crossProviderPool();
+    try {
+      const t0 = Date.now();
+      // Both accounts usable; both pinned to the same session, openai touched later.
+      mgr.recordRateLimitSnapshot("claude1", snapshot([win("5h", { utilization: 0.1 })]));
+      mgr.recordRateLimitSnapshot("gpt1", snapshot([win("5h", { utilization: 0.1 })]));
+      mgr.setAffinity("s1", "claude1", "anthropic", t0 - 5000);
+      mgr.setAffinity("s1", "gpt1", "openai", t0 - 100);
+      // Post-failover shape: anthropic recovered but openai served most recently.
+      expect(mgr.pickProvider("s1", candidates)?.provider).toBe("openai");
+
+      // Reverse the recency -> the anthropic pin wins, proving it's timestamp-driven
+      // and not a fixed openai bias.
+      mgr.setAffinity("s1", "claude1", "anthropic", t0 - 50);
+      expect(mgr.pickProvider("s1", candidates)?.provider).toBe("anthropic");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
 });

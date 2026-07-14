@@ -394,21 +394,25 @@ describe("model mapping card", () => {
     expect(maxSelect).toContain('<option value="xhigh" selected>Extra High</option>');
   });
 
-  test("gpt-5.5 targets omit the max effort tier; gpt-5.6-sol targets keep it", () => {
+  test("only gpt-5.6* targets keep the max effort tier; earlier models omit it", () => {
     const mappingCardHtml = loadMappingCard();
     const html = mappingCardHtml({
       enabled: true,
-      targets: ["gpt-5.6-sol", "gpt-5.5"],
+      targets: ["gpt-5.6-sol", "gpt-5.5", "gpt-5.4-mini"],
       mappings: [
         { from: "fable", to: "gpt-5.6-sol" },
         { from: "opus", to: "gpt-5.5" },
+        // gpt-5.4-mini is the built-in haiku default and has no max.
+        { from: "haiku", to: "gpt-5.4-mini" },
       ],
     });
 
     const fableRow = mapRow(html, "fable");
     const opusRow = mapRow(html, "opus");
+    const haikuRow = mapRow(html, "haiku");
     expect(fableRow).toContain('<option value="max">Max</option>');
     expect(opusRow).not.toContain('<option value="max">Max</option>');
+    expect(haikuRow).not.toContain('<option value="max">Max</option>');
   });
 
   test("mappingCardHtml HTML-escapes target ids from mapping.targets", () => {

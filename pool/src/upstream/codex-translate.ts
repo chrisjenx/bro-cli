@@ -39,9 +39,11 @@ export function codexEffortFor(tier: SourceEffortTier, effortMap?: EffortMap): C
   return tier === "default" ? undefined : (tier as CodexEffort);
 }
 
-/** gpt-5.5 supports only low..xhigh — clamp max down rather than 400 upstream. */
+/** Only gpt-5.6* exposes the `max` reasoning effort; every earlier Codex model
+ * (gpt-5.5, gpt-5.4, gpt-5.4-mini) tops out at xhigh and 400s on `max`. Clamp
+ * down rather than fail upstream — xhigh is supported everywhere `max` is asked. */
 export function clampEffortForModel(effort: CodexEffort | undefined, upstreamModel: string): CodexEffort | undefined {
-  if (effort === "max" && upstreamModel.startsWith("gpt-5.5")) return "xhigh";
+  if (effort === "max" && !upstreamModel.startsWith("gpt-5.6")) return "xhigh";
   return effort;
 }
 

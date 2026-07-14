@@ -436,11 +436,26 @@ function effortOptions(family, tier, selected, targetModel) {
   var opts = '<option value="">pass-through</option>';
   for (var i = 0; i < CODEX_EFFORTS.length; i++) {
     var e = CODEX_EFFORTS[i];
-    if (e === "max" && targetModel.indexOf("gpt-5.5") === 0) continue; // gpt-5.5 has no max
+    // Only gpt-5.6* exposes max; earlier targets (gpt-5.5, gpt-5.4*) 400 on it,
+    // so the server clamps max->xhigh — mirror that here instead of offering it.
+    if (e === "max" && targetModel.indexOf("gpt-5.6") !== 0) continue;
     opts += '<option value="' + e + '"' + (selected === e ? " selected" : "") + ">"
       + esc(EFFORT_LABELS[e] || e.charAt(0).toUpperCase() + e.slice(1)) + "</option>";
   }
   return '<select data-effort-family="' + family + '" data-effort-tier="' + tier + '">' + opts + "</select>";
+}
+
+// Inner HTML of a family row's .efforts container (one labelled select per
+// source tier). Shared by the initial render and the target-change handler so
+// switching targets re-filters the offered efforts (e.g. drops max off 5.4/5.5).
+function effortsHtml(family, effort, targetModel) {
+  var out = "";
+  for (var s = 0; s < SOURCE_TIERS.length; s++) {
+    var tier = SOURCE_TIERS[s];
+    out += '<span class="tier"><label>' + tier + "</label>"
+      + effortOptions(family, tier, (effort || {})[tier] || "", targetModel) + "</span>";
+  }
+  return out;
 }
 
 function mappingCardHtml(mapping) {
@@ -455,16 +470,10 @@ function mappingCardHtml(mapping) {
       var id = mapping.targets[t];
       targetOpts += '<option value="' + esc(id) + '"' + (row.to === id ? " selected" : "") + ">" + esc(id) + "</option>";
     }
-    var efforts = "";
-    for (var s = 0; s < SOURCE_TIERS.length; s++) {
-      var tier = SOURCE_TIERS[s];
-      efforts += '<span class="tier"><label>' + tier + "</label>"
-        + effortOptions(fam, tier, (row.effort || {})[tier] || "", row.to) + "</span>";
-    }
     rows += '<div class="map-row" data-map-row="' + fam + '">'
       + "<b>" + fam + "</b> &rarr; "
       + '<select data-map-family="' + fam + '">' + targetOpts + "</select>"
-      + '<div class="efforts"' + (inert ? ' style="display:none"' : "") + ">" + efforts + "</div>"
+      + '<div class="efforts"' + (inert ? ' style="display:none"' : "") + ">" + effortsHtml(fam, row.effort, row.to) + "</div>"
       + "</div>";
   }
   return '<h3>Model mapping <span class="muted">Claude families served by Codex when pooled</span></h3>'
@@ -790,6 +799,26 @@ async function refresh() {
 function wireMapping() {
   const saveBtn = document.getElementById("mapping-save");
   if (!saveBtn) return;
+
+  // Changing a family's target re-renders its effort selects so the offered
+  // options and visibility stay honest (hide efforts for "Claude only", and
+  // drop the max option on targets that don't support it) without waiting for a
+  // full poll re-render (which is skipped while the panel has focus).
+  document.querySelectorAll("[data-map-family]").forEach((sel) => {
+    sel.addEventListener("change", () => {
+      const rowEl = sel.closest("[data-map-row]");
+      const fam = rowEl.getAttribute("data-map-row");
+      const to = sel.value;
+      const effortsDiv = rowEl.querySelector(".efforts");
+      const current = {};
+      effortsDiv.querySelectorAll("[data-effort-tier]").forEach((s) => {
+        if (s.value) current[s.getAttribute("data-effort-tier")] = s.value;
+      });
+      effortsDiv.innerHTML = effortsHtml(fam, current, to);
+      effortsDiv.style.display = to === fam ? "none" : "";
+    });
+  });
+
   saveBtn.addEventListener("click", async () => {
     const mappings = [];
     document.querySelectorAll("[data-map-row]").forEach((rowEl) => {
