@@ -1,9 +1,54 @@
 // Pure protocol translation between Anthropic Messages API and Codex Responses API.
 // No I/O, no network — everything here is fixture-tested.
 
+import {
+  SOURCE_EFFORT_TIERS,
+  CODEX_EFFORTS,
+  type SourceEffortTier,
+  type CodexEffort,
+  type EffortMap,
+} from "../models.ts";
+
+/** Source effort tier of an Anthropic request. Precedence: output_config.effort
+ * (what Claude Code sends with adaptive thinking) > legacy thinking.budget_tokens
+ * bucketing (think ~4k → low, megathink ~10k → medium, ultrathink ~32k → high,
+ * above → xhigh) > "default" (no signal). */
+export function deriveEffortTier(body: Record<string, unknown>): SourceEffortTier {
+  const oc = body.output_config as Record<string, unknown> | undefined;
+  const effort = oc?.effort;
+  if (
+    typeof effort === "string" &&
+    effort !== "default" &&
+    (SOURCE_EFFORT_TIERS as readonly string[]).includes(effort)
+  ) {
+    return effort as SourceEffortTier;
+  }
+  const thinking = body.thinking as Record<string, unknown> | undefined;
+  if (thinking?.type === "enabled" && typeof thinking.budget_tokens === "number") {
+    const budget = thinking.budget_tokens;
+    return budget < 8192 ? "low" : budget < 16384 ? "medium" : budget < 32768 ? "high" : "xhigh";
+  }
+  return "default";
+}
+
+/** Mapping override wins; otherwise tiers pass through 1:1 and "default" stays
+ * unset so Codex applies its own server default (medium). */
+export function codexEffortFor(tier: SourceEffortTier, effortMap?: EffortMap): CodexEffort | undefined {
+  const explicit = effortMap?.[tier];
+  if (explicit && (CODEX_EFFORTS as readonly string[]).includes(explicit)) return explicit;
+  return tier === "default" ? undefined : (tier as CodexEffort);
+}
+
+/** gpt-5.5 supports only low..xhigh — clamp max down rather than 400 upstream. */
+export function clampEffortForModel(effort: CodexEffort | undefined, upstreamModel: string): CodexEffort | undefined {
+  if (effort === "max" && upstreamModel.startsWith("gpt-5.5")) return "xhigh";
+  return effort;
+}
+
 export function anthropicToCodexRequest(
   body: Record<string, unknown>,
   upstreamModel: string,
+  effortMap?: EffortMap,
 ): Record<string, unknown> {
   const input: Array<Record<string, unknown>> = [];
   for (const m of (body.messages as Array<Record<string, unknown>> | undefined) ?? []) {
@@ -106,14 +151,8 @@ export function anthropicToCodexRequest(
   // Clamp: the Responses API 400s on max_output_tokens < 16, and Claude Code
   // routinely sends max_tokens: 1 probe requests.
   if (typeof body.max_tokens === "number") out.max_output_tokens = Math.max(16, body.max_tokens);
-  const thinking = body.thinking as Record<string, unknown> | undefined;
-  if (thinking?.type === "enabled" && typeof thinking.budget_tokens === "number") {
-    // Claude Code budget tiers → Responses effort: think (~4k) → low,
-    // megathink (~10k) → medium, ultrathink (~32k) → high. Left unset when the
-    // caller didn't ask for thinking so the server default applies.
-    const budget = thinking.budget_tokens;
-    out.reasoning = { effort: budget < 8192 ? "low" : budget < 16384 ? "medium" : "high" };
-  }
+  const effort = clampEffortForModel(codexEffortFor(deriveEffortTier(body), effortMap), upstreamModel);
+  if (effort) out.reasoning = { effort };
   const tools = (body.tools as Array<Record<string, unknown>> | undefined) ?? [];
   if (tools.length) {
     out.tools = tools

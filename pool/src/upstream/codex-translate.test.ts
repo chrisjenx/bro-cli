@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { anthropicToCodexRequest, CodexToAnthropicStream, stripCodexThinking } from "./codex-translate.ts";
+import { anthropicToCodexRequest, CodexToAnthropicStream, stripCodexThinking, deriveEffortTier, codexEffortFor, clampEffortForModel } from "./codex-translate.ts";
 
 const parse = (frame: string) => JSON.parse(frame.split("\ndata: ")[1]!.trim());
 
@@ -590,5 +590,62 @@ describe("CodexToAnthropicStream", () => {
     expect(types.filter((t) => t === "error")).toHaveLength(1);
     expect(types).not.toContain("message_stop");
     expect(types).not.toContain("message_delta");
+  });
+});
+
+describe("deriveEffortTier", () => {
+  test("output_config.effort wins over thinking budget", () => {
+    expect(
+      deriveEffortTier({ output_config: { effort: "xhigh" }, thinking: { type: "enabled", budget_tokens: 4000 } }),
+    ).toBe("xhigh");
+    expect(deriveEffortTier({ output_config: { effort: "max" } })).toBe("max");
+  });
+
+  test("legacy budget buckets when effort absent", () => {
+    expect(deriveEffortTier({ thinking: { type: "enabled", budget_tokens: 4000 } })).toBe("low");
+    expect(deriveEffortTier({ thinking: { type: "enabled", budget_tokens: 10000 } })).toBe("medium");
+    expect(deriveEffortTier({ thinking: { type: "enabled", budget_tokens: 20000 } })).toBe("high");
+    expect(deriveEffortTier({ thinking: { type: "enabled", budget_tokens: 32768 } })).toBe("xhigh");
+  });
+
+  test("no signal and junk values yield default", () => {
+    expect(deriveEffortTier({})).toBe("default");
+    expect(deriveEffortTier({ output_config: { effort: "ultra" } })).toBe("default");
+  });
+});
+
+describe("codexEffortFor", () => {
+  test("explicit mapping entry wins", () => {
+    expect(codexEffortFor("medium", { medium: "high" })).toBe("high");
+    expect(codexEffortFor("default", { default: "low" })).toBe("low");
+  });
+  test("pass-through defaults: tiers map 1:1, default stays unset", () => {
+    expect(codexEffortFor("low")).toBe("low");
+    expect(codexEffortFor("max")).toBe("max");
+    expect(codexEffortFor("default")).toBeUndefined();
+  });
+});
+
+describe("clampEffortForModel", () => {
+  test("gpt-5.5 has no max; others untouched", () => {
+    expect(clampEffortForModel("max", "gpt-5.5")).toBe("xhigh");
+    expect(clampEffortForModel("max", "gpt-5.6-sol")).toBe("max");
+    expect(clampEffortForModel(undefined, "gpt-5.5")).toBeUndefined();
+  });
+});
+
+describe("anthropicToCodexRequest reasoning.effort", () => {
+  const msg = { messages: [{ role: "user", content: "hi" }] };
+  test("output_config.effort flows through with mapping override", () => {
+    const out = anthropicToCodexRequest({ ...msg, output_config: { effort: "medium" } }, "gpt-5.6-sol", { medium: "high" });
+    expect(out.reasoning).toEqual({ effort: "high" });
+  });
+  test("no effort signal leaves reasoning unset", () => {
+    const out = anthropicToCodexRequest({ ...msg }, "gpt-5.6-sol");
+    expect(out.reasoning).toBeUndefined();
+  });
+  test("legacy thinking budget still buckets (existing behavior preserved)", () => {
+    const out = anthropicToCodexRequest({ ...msg, thinking: { type: "enabled", budget_tokens: 10000 } }, "gpt-5.6-sol");
+    expect(out.reasoning).toEqual({ effort: "medium" });
   });
 });
