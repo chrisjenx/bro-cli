@@ -25,7 +25,7 @@ import {
 import { runClaude } from "../subprocess/claude.ts";
 import type { Account } from "../accounts/types.ts";
 import { modelFamilyOf, MODEL_FAMILIES } from "../accounts/types.ts";
-import { runWithFailover } from "./failover.ts";
+import { runWithFailover, type FailoverHooks } from "./failover.ts";
 import { dashboardHtml } from "./dashboard.ts";
 import { proxyAnthropicMessages, extractSessionKey } from "../upstream/anthropic.ts";
 import { sweepUsageRefresh } from "../upstream/usage.ts";
@@ -319,6 +319,23 @@ export function chooseMappedService(
   return pick?.provider ?? null;
 }
 
+/** Serves a mapped request on `first`, retrying once on the other provider when
+ * the first attempt reports whole-pool exhaustion (429/503/529 — the proxies
+ * return these only before any bytes stream). A retry that also exhausts
+ * returns the FIRST response so the caller sees the primary provider's error. */
+export async function serveWithCrossProviderFallback(
+  first: "anthropic" | "openai",
+  serve: (svc: "anthropic" | "openai") => Promise<Response>,
+  hooks: FailoverHooks,
+): Promise<Response> {
+  const res = await serve(first);
+  if (!CROSS_PROVIDER_RETRY_STATUSES.has(res.status)) return res;
+  const other = first === "anthropic" ? "openai" : "anthropic";
+  hooks.onFailover?.(`${first} pool`, `${other} pool`);
+  const retry = await serve(other);
+  return CROSS_PROVIDER_RETRY_STATUSES.has(retry.status) ? res : retry;
+}
+
 async function handleAnthropic(
   body: unknown,
   headers: Headers,
@@ -357,18 +374,11 @@ async function handleAnthropic(
         // Neither provider usable; let the anthropic path produce its 503.
         return proxyAnthropicMessages(body, headers, mgr, config, signal, hooks);
       }
-      const res = await serve(first);
-      // Cross-provider fallback: the proxies only return these statuses when
-      // every same-provider account was exhausted before any bytes streamed,
-      // so retrying the whole request on the other subscription is safe.
-      if (CROSS_PROVIDER_RETRY_STATUSES.has(res.status)) {
-        const other = first === "anthropic" ? "openai" : "anthropic";
-        hooks.onFailover?.(`${first} pool`, `${other} pool`);
-        const retry = await serve(other);
-        // Prefer whichever answer isn't an exhaustion error.
-        return CROSS_PROVIDER_RETRY_STATUSES.has(retry.status) ? res : retry;
-      }
-      return res;
+      // Cross-provider fallback: the proxies only return exhaustion statuses
+      // when every same-provider account was exhausted before any bytes
+      // streamed, so retrying the whole request on the other subscription is
+      // safe.
+      return serveWithCrossProviderFallback(first, serve, hooks);
     }
 
     return proxyAnthropicMessages(body, headers, mgr, config, signal, failoverHooks(config));

@@ -9,7 +9,8 @@ import type { RateLimitSnapshot, RateLimitWindow } from "../accounts/types.ts";
 import { OPENAI_CREDS_FILENAME } from "../accounts/types.ts";
 import { AccountManager } from "../accounts/manager.ts";
 import { loadConfig } from "../config.ts";
-import { chooseMappedService, CROSS_PROVIDER_RETRY_STATUSES } from "./server.ts";
+import { chooseMappedService, CROSS_PROVIDER_RETRY_STATUSES, serveWithCrossProviderFallback } from "./server.ts";
+import type { FailoverHooks } from "./failover.ts";
 
 /**
  * handleOpenAI/handleAnthropic in server.ts (the CLI-subprocess backend path)
@@ -131,5 +132,91 @@ describe("CROSS_PROVIDER_RETRY_STATUSES", () => {
   test("covers exhaustion statuses only", () => {
     expect([...CROSS_PROVIDER_RETRY_STATUSES].sort()).toEqual([429, 503, 529]);
     expect(CROSS_PROVIDER_RETRY_STATUSES.has(400)).toBe(false);
+  });
+});
+
+describe("serveWithCrossProviderFallback", () => {
+  /** Records which providers were served, in order. */
+  function trackingHooks(calls: Array<[string, string]>): FailoverHooks {
+    return { onFailover: (from, to) => calls.push([from, to]) };
+  }
+
+  test("first succeeds -> returned as-is, other provider never called, no onFailover", async () => {
+    const called: Array<"anthropic" | "openai"> = [];
+    const failoverCalls: Array<[string, string]> = [];
+    const first200 = new Response("ok", { status: 200, headers: { "X-Marker": "first" } });
+    const serve = async (svc: "anthropic" | "openai") => {
+      called.push(svc);
+      return svc === "anthropic" ? first200 : new Response("should not be called", { status: 200 });
+    };
+
+    const res = await serveWithCrossProviderFallback("anthropic", serve, trackingHooks(failoverCalls));
+
+    expect(res).toBe(first200);
+    expect(called).toEqual(["anthropic"]);
+    expect(failoverCalls).toEqual([]);
+  });
+
+  test("first exhausts (503) -> onFailover fires anthropic->openai, retry's 200 is returned", async () => {
+    const called: Array<"anthropic" | "openai"> = [];
+    const failoverCalls: Array<[string, string]> = [];
+    const retry200 = new Response("ok", { status: 200, headers: { "X-Marker": "retry" } });
+    const serve = async (svc: "anthropic" | "openai") => {
+      called.push(svc);
+      return svc === "anthropic" ? new Response("busy", { status: 503 }) : retry200;
+    };
+
+    const res = await serveWithCrossProviderFallback("anthropic", serve, trackingHooks(failoverCalls));
+
+    expect(res).toBe(retry200);
+    expect(called).toEqual(["anthropic", "openai"]);
+    expect(failoverCalls).toEqual([["anthropic pool", "openai pool"]]);
+  });
+
+  test("both exhaust (503 then 429) -> the FIRST response object is returned", async () => {
+    const failoverCalls: Array<[string, string]> = [];
+    const first503 = new Response("busy", { status: 503, headers: { "X-Marker": "first" } });
+    const retry429 = new Response("busy too", { status: 429, headers: { "X-Marker": "retry" } });
+    const serve = async (svc: "anthropic" | "openai") => (svc === "anthropic" ? first503 : retry429);
+
+    const res = await serveWithCrossProviderFallback("anthropic", serve, trackingHooks(failoverCalls));
+
+    // Identity check, not just status: the caller must see the primary
+    // provider's own response object, not merely "a 503".
+    expect(res).toBe(first503);
+    expect(res).not.toBe(retry429);
+    expect(res.headers.get("X-Marker")).toBe("first");
+  });
+
+  test("non-retry error (400) from first -> returned as-is, no retry", async () => {
+    const called: Array<"anthropic" | "openai"> = [];
+    const failoverCalls: Array<[string, string]> = [];
+    const first400 = new Response("bad request", { status: 400 });
+    const serve = async (svc: "anthropic" | "openai") => {
+      called.push(svc);
+      return svc === "anthropic" ? first400 : new Response("should not be called", { status: 200 });
+    };
+
+    const res = await serveWithCrossProviderFallback("anthropic", serve, trackingHooks(failoverCalls));
+
+    expect(res).toBe(first400);
+    expect(called).toEqual(["anthropic"]);
+    expect(failoverCalls).toEqual([]);
+  });
+
+  test("symmetric: first=openai retries onto anthropic", async () => {
+    const called: Array<"anthropic" | "openai"> = [];
+    const failoverCalls: Array<[string, string]> = [];
+    const retry200 = new Response("ok", { status: 200, headers: { "X-Marker": "retry" } });
+    const serve = async (svc: "anthropic" | "openai") => {
+      called.push(svc);
+      return svc === "openai" ? new Response("busy", { status: 529 }) : retry200;
+    };
+
+    const res = await serveWithCrossProviderFallback("openai", serve, trackingHooks(failoverCalls));
+
+    expect(res).toBe(retry200);
+    expect(called).toEqual(["openai", "anthropic"]);
+    expect(failoverCalls).toEqual([["openai pool", "anthropic pool"]]);
   });
 });
