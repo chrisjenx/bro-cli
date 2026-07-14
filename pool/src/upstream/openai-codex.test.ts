@@ -124,6 +124,13 @@ describe("describeCodexError", () => {
     expect(describeCodexError(500, "gateway exploded", "a")).toContain("gateway exploded");
     expect(describeCodexError(503, "", "a")).toBe('Codex backend rejected the request (HTTP 503) [account "a"]');
   });
+
+  test("caps a structured backend detail before returning or persisting it", () => {
+    const oversizedDetail = "x".repeat(1_000);
+    const msg = describeCodexError(400, JSON.stringify({ detail: oversizedDetail }), "a");
+    expect(msg).toContain("x".repeat(300));
+    expect(msg).not.toContain("x".repeat(301));
+  });
 });
 
 describe("proxyCodexMessages", () => {

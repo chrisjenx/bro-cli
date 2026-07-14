@@ -438,4 +438,186 @@ describe("model mapping card", () => {
     });
     expect(html.toLowerCase()).not.toContain("ultra");
   });
+
+  test("mappingCardHtml renders a collapsible summary header (works inside a <details>)", () => {
+    const mappingCardHtml = loadMappingCard();
+    const html = mappingCardHtml({ enabled: false, targets: [], mappings: [] });
+    // A <details> child needs a <summary>; the old <h3> heading would not toggle.
+    expect(html).toContain("<summary>");
+    expect(html).toContain("Model mapping");
+    expect(html).toContain('class="caret"');
+    expect(html).not.toContain("<h3>");
+    // Body content stays intact (enable toggle + save button live in the body).
+    expect(html).toContain('id="mapping-enabled"');
+    expect(html).toContain('id="mapping-save"');
+  });
+});
+
+describe("collapsible settings group", () => {
+  test("mapping + tuning are wrapped in one collapsible Settings group", () => {
+    const html = dashboardHtml();
+    // A single outer <details> holds the config panels.
+    expect(html).toMatch(/<details class="settings-group" id="settings-group">/);
+    expect(html).toContain('class="settings-body"');
+    // Both config panels are themselves nested <details> (independently collapsible).
+    expect(html).toMatch(/<details class="mapping-panel" id="mapping-panel">/);
+    expect(html).toMatch(/<details class="tuning-panel" id="tuning-panel">/);
+    // The live "next pick" panel stays a plain, always-visible div.
+    expect(html).toMatch(/<div class="routing-panel" id="routing-panel">/);
+  });
+
+  test("open state persists in localStorage and edits are guarded from poll clobber", () => {
+    const html = dashboardHtml();
+    // Collapse state persisted per panel under the cmp-open- key namespace.
+    expect(html).toContain("cmp-open-");
+    // The 4s poll must not overwrite a panel the user is mid-editing.
+    expect(html).toContain("settingsDirty");
+    // Poll interval is unchanged (still on its own line for the test harness).
+    expect(html).toContain("setInterval(refresh, 4000)");
+  });
+});
+
+/**
+ * Behavioural checks for the client runtime itself: the collapse-persistence
+ * init IIFE and the renderSettings anti-clobber guard. There's no browser here,
+ * so we evaluate the real dashboard <script> against a controllable fake DOM
+ * (per-id elements with open/style/innerHTML + an event registry, a Map-backed
+ * localStorage) and exercise the actual code paths — not a reimplementation.
+ */
+describe("settings runtime: collapse persistence + anti-clobber", () => {
+  function loadRuntime(
+    presetStore?: Record<string, string>,
+    fetchImpl: unknown = async () => new Response("{}"),
+  ) {
+    const html = dashboardHtml();
+    const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+    if (!script) throw new Error("dashboard <script> block not found");
+    const stubbed = script
+      .replace(/^refresh\(\);$/m, "")
+      .replace(/^setInterval\(refresh, 4000\);$/m, "");
+    const els: Record<string, any> = {};
+    const makeEl = (id: string) => {
+      const listeners: Record<string, Array<(e: unknown) => void>> = {};
+      return {
+        id, open: false, innerHTML: "", style: {} as Record<string, string>,
+        addEventListener(type: string, fn: (e: unknown) => void) { (listeners[type] ||= []).push(fn); },
+        setAttribute() {}, getAttribute() { return null; }, textContent: "",
+        contains(node: any) { return !!node && node.__ownerId === id; },
+        fire(type: string) { (listeners[type] || []).forEach((fn) => fn({})); },
+      };
+    };
+    const document = {
+      getElementById: (id: string) => (els[id] ||= makeEl(id)),
+      querySelectorAll: () => [] as unknown[],
+      documentElement: makeEl("html"),
+      activeElement: null as any,
+    };
+    const store = new Map<string, string>(Object.entries(presetStore || {}));
+    const localStorage = {
+      getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+      setItem: (k: string, v: string) => { store.set(k, String(v)); },
+    };
+    const factory = new Function(
+      "document", "localStorage", "matchMedia", "fetch",
+      `${stubbed}\nreturn {
+        refresh,
+        renderSettings,
+        finishSettingsSave: typeof finishSettingsSave === "undefined" ? undefined : finishSettingsSave,
+        getDirty: () => settingsDirty,
+      };`,
+    );
+    const api = factory(document, localStorage, () => ({ matches: false }), fetchImpl);
+    return { api, els, store, document };
+  }
+
+  test("restores each panel's open state from localStorage (collapsed by default)", () => {
+    const { els } = loadRuntime({ "cmp-open-settings-group": "1" });
+    expect(els["settings-group"].open).toBe(true);   // restored from storage
+    expect(els["mapping-panel"].open).toBe(false);    // default: collapsed
+    expect(els["tuning-panel"].open).toBe(false);
+  });
+
+  test("persists a panel's open state on toggle", () => {
+    const { els, store } = loadRuntime();
+    els["mapping-panel"].open = true;
+    els["mapping-panel"].fire("toggle");
+    expect(store.get("cmp-open-mapping-panel")).toBe("1");
+    els["mapping-panel"].open = false;
+    els["mapping-panel"].fire("toggle");
+    expect(store.get("cmp-open-mapping-panel")).toBe("0");
+  });
+
+  test("renderSettings hides an empty panel and shows/wires one with content", () => {
+    const { api, els } = loadRuntime();
+    expect(api.renderSettings("mapping-panel", "", {}, () => {})).toBe(false);
+    expect(els["mapping-panel"].style.display).toBe("none");
+    let wired = 0;
+    expect(api.renderSettings("mapping-panel", "<summary>M</summary>", { v: 1 }, () => wired++)).toBe(true);
+    expect(els["mapping-panel"].style.display).toBe("block");
+    expect(els["mapping-panel"].innerHTML).toContain("<summary>M</summary>");
+    expect(wired).toBe(1);
+  });
+
+  test("a dirty panel is never re-rendered by a poll — in-progress edits survive", () => {
+    const { api, els } = loadRuntime();
+    api.renderSettings("mapping-panel", "<summary>original</summary>", { v: 1 }, () => {});
+    // User edits: a change event bubbles to the panel and flips its dirty flag.
+    els["mapping-panel"].fire("change");
+    expect(api.getDirty()["mapping-panel"]).toBe(true);
+    // A later poll brings NEW server data — the guard must leave the DOM alone.
+    let wired = 0;
+    api.renderSettings("mapping-panel", "<summary>server</summary>", { v: 2 }, () => wired++);
+    expect(els["mapping-panel"].innerHTML).toContain("original");
+    expect(els["mapping-panel"].innerHTML).not.toContain("server");
+    expect(wired).toBe(0);
+  });
+
+  test("a focused panel is not re-rendered (protects an open native <select>)", () => {
+    const { api, els, document } = loadRuntime();
+    api.renderSettings("tuning-panel", "<summary>a</summary>", { v: 1 }, () => {});
+    document.activeElement = { __ownerId: "tuning-panel" };
+    api.renderSettings("tuning-panel", "<summary>b</summary>", { v: 2 }, () => {});
+    expect(els["tuning-panel"].innerHTML).toContain("a");
+    expect(els["tuning-panel"].innerHTML).not.toContain("b");
+  });
+
+  test("unchanged data is a no-op re-render (no 4s flicker or re-wire)", () => {
+    const { api } = loadRuntime();
+    let wired = 0;
+    const data = { v: 1 };
+    api.renderSettings("mapping-panel", "<summary>x</summary>", data, () => wired++);
+    api.renderSettings("mapping-panel", "<summary>x</summary>", data, () => wired++);
+    expect(wired).toBe(1);
+  });
+
+  test("a rejected settings update keeps the form dirty and reports rejection", () => {
+    const { api, els, document } = loadRuntime();
+    api.renderSettings("mapping-panel", "<summary>draft</summary>", { v: 1 }, () => {});
+    els["mapping-panel"].fire("change");
+    const status = document.getElementById("mapping-status");
+
+    expect(api.finishSettingsSave).toBeTypeOf("function");
+    expect(api.finishSettingsSave("mapping-panel", { ok: false }, status)).toBe(false);
+    expect(api.getDirty()["mapping-panel"]).toBe(true);
+    expect(status.textContent).toBe("rejected");
+  });
+
+  test("an account priority edit survives a status poll until it is explicitly saved", async () => {
+    const status = {
+      accounts: [baseAccount()],
+      routing: { tiers: [], nextPick: null, activeTier: null },
+      tuning: { fiveHourExp: 1, loadSlope: 1, urgencyDecay: 0.5, minHeadroom: 0.1 },
+      mapping: { enabled: false, targets: [], mappings: [] },
+      usageWindowMs: 18_000_000,
+    };
+    const fetchImpl = async () => ({ json: async () => status });
+    const { api, document } = loadRuntime(undefined, fetchImpl);
+    const grid = document.getElementById("grid");
+    grid.innerHTML = "priority draft";
+    grid.fire("input");
+
+    await api.refresh();
+
+    expect(grid.innerHTML).toBe("priority draft");
+  });
 });

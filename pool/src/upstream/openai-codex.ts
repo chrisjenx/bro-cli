@@ -557,7 +557,7 @@ export function describeCodexError(status: number, bodyText: string, accountName
     stringProp(objectProp(parsed, "error"), "message") ??
     stringProp(parsed, "message") ??
     (bodyText.trim() ? bodyText.trim().slice(0, 300) : "");
-  const cause = detail ? `: ${detail}` : "";
+  const cause = detail ? `: ${detail.slice(0, 300)}` : "";
   return `Codex backend rejected the request (HTTP ${status})${cause} [account "${accountName}"]`;
 }
 

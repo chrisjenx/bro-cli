@@ -207,10 +207,11 @@ export function dashboardHtml(): string {
   .tier-meta { font-size: 12px; color: var(--muted); font-family: var(--sans); }
   .tier-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 18px; }
   .badge.next { background: var(--accent-soft); color: var(--accent); border-color: transparent; font-weight: 600; }
-  .routing-panel, .mapping-panel { display: none; background: var(--surface); border: 1px solid var(--border);
+  /* Live "next pick" panel: standalone card, always visible (not settings). */
+  .routing-panel { display: none; background: var(--surface); border: 1px solid var(--border);
     border-left: 3px solid var(--accent); border-radius: 12px; padding: 14px 18px; margin-bottom: 20px;
-    font-size: 13.5px; color: var(--text); box-shadow: var(--shadow); }
-  .routing-panel { gap: 28px; align-items: flex-start; flex-wrap: wrap; }
+    font-size: 13.5px; color: var(--text); box-shadow: var(--shadow);
+    gap: 28px; align-items: flex-start; flex-wrap: wrap; }
   .routing-panel .muted { color: var(--muted); }
   .routing-panel .pick b { font-family: var(--serif); font-size: 16px; font-weight: 600; }
   .routing-panel .summary { font-size: 12px; margin-top: 2px; }
@@ -218,9 +219,38 @@ export function dashboardHtml(): string {
   .routing-panel .why .fact { display: grid; grid-template-columns: 110px 1fr; gap: 10px; font-size: 12.5px; }
   .routing-panel .why .fk { color: var(--muted); }
   .routing-panel .why .fact.decisive .fv { color: var(--accent); font-weight: 600; }
-  .mapping-panel h3 { margin: 0 0 10px; font-family: var(--serif); font-size: 16px; font-weight: 500; letter-spacing: -0.01em; }
+
+  /* Settings group: one collapsible card wrapping the config disclosures
+     (Model mapping, Routing tuning). Collapsed by default; open state persists
+     in localStorage. Both nested panels always live inside this group. */
+  .settings-group { display: none; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; margin-bottom: 20px; box-shadow: var(--shadow); }
+  .settings-group > summary { list-style: none; cursor: pointer; padding: 12px 18px;
+    display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600;
+    letter-spacing: -0.01em; color: var(--text); user-select: none; }
+  .settings-group > summary::-webkit-details-marker { display: none; }
+  .settings-group > summary::before { content: "⚙"; color: var(--muted); font-weight: 400; }
+  .settings-group > summary .caret { margin-left: auto; color: var(--muted); font-size: 11px;
+    transition: transform .15s ease; }
+  .settings-group[open] > summary { border-bottom: 1px solid var(--border); }
+  .settings-group[open] > summary .caret { transform: rotate(90deg); }
+  .settings-body { padding: 2px 18px 12px; }
+
+  /* Nested config disclosures — flat (no card chrome), hairline-separated. */
+  .mapping-panel, .tuning-panel { display: none; font-size: 13.5px; color: var(--text); }
+  .settings-body > details + details { border-top: 1px solid var(--border); }
+  .mapping-panel > summary, .tuning-panel > summary { list-style: none; cursor: pointer;
+    padding: 12px 0; display: flex; align-items: center; gap: 8px; font-size: 13.5px;
+    font-weight: 600; letter-spacing: -0.01em; color: var(--text); user-select: none; }
+  .mapping-panel > summary::-webkit-details-marker,
+  .tuning-panel > summary::-webkit-details-marker { display: none; }
+  .mapping-panel > summary .caret, .tuning-panel > summary .caret { margin-left: auto;
+    color: var(--muted); font-size: 11px; transition: transform .15s ease; }
+  .mapping-panel[open] > summary .caret, .tuning-panel[open] > summary .caret { transform: rotate(90deg); }
+
   .mapping-panel .muted { color: var(--muted); font-size: 12px; font-family: var(--sans); font-weight: 400; }
-  .mapping-panel > label { display: block; margin-bottom: 12px; font-size: 13px; }
+  .mapping-panel .hint { color: var(--muted); font-size: 12px; margin: 0 0 12px; }
+  .mapping-panel .mapping-body > label { display: block; margin-bottom: 12px; font-size: 13px; }
   .mapping-panel .map-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
     padding: 8px 0; border-top: 1px solid var(--border); }
   .mapping-panel .map-row select { font: inherit; padding: 4px 8px; border: 1px solid var(--border);
@@ -232,18 +262,7 @@ export function dashboardHtml(): string {
   .mapping-panel #mapping-save { margin-top: 12px; background: var(--surface); color: var(--muted);
     border: 1px solid var(--border); border-radius: 7px; padding: 6px 14px; font-size: 12.5px; cursor: pointer; }
   .mapping-panel #mapping-save:hover { color: var(--text); border-color: var(--border-strong); }
-  .tuning-panel { display: none; background: var(--surface); border: 1px solid var(--border);
-    border-radius: 12px; margin-bottom: 20px; box-shadow: var(--shadow); }
-  .tuning-panel > summary { list-style: none; cursor: pointer; padding: 12px 18px;
-    display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600;
-    letter-spacing: -0.01em; color: var(--text); user-select: none; }
-  .tuning-panel > summary::-webkit-details-marker { display: none; }
-  .tuning-panel > summary::before { content: "⚙"; color: var(--muted); font-weight: 400; }
-  .tuning-panel > summary .caret { margin-left: auto; color: var(--muted); font-size: 11px;
-    transition: transform .15s ease; }
-  .tuning-panel[open] > summary { border-bottom: 1px solid var(--border); }
-  .tuning-panel[open] > summary .caret { transform: rotate(90deg); }
-  .tuning-panel .tuning-body { padding: 13px 18px 15px; }
+  .tuning-panel .tuning-body { padding: 2px 0 12px; }
   .tuning-panel .hint { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
   .tuning-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px 18px; }
   .tuning-field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
@@ -255,7 +274,7 @@ export function dashboardHtml(): string {
   .tuning-actions button { background: var(--surface); color: var(--muted); border: 1px solid var(--border);
     border-radius: 7px; padding: 5px 14px; font-size: 12px; cursor: pointer; }
   .tuning-actions button:hover { color: var(--text); border-color: var(--border-strong); }
-  .tuning-actions .status { font-size: 12px; color: var(--muted); }
+  .mapping-panel .status, .tuning-actions .status { font-size: 12px; color: var(--muted); margin-left: 10px; }
   .tier-edit { margin-top: 14px; padding-top: 13px; border-top: 1px solid var(--border);
     display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); }
   .tier-edit input { width: 60px; font: inherit; padding: 4px 6px; border: 1px solid var(--border);
@@ -285,8 +304,13 @@ export function dashboardHtml(): string {
 </header>
 <main>
   <div class="routing-panel" id="routing-panel"></div>
-  <div class="mapping-panel" id="mapping-panel"></div>
-  <details class="tuning-panel" id="tuning-panel"></details>
+  <details class="settings-group" id="settings-group">
+    <summary>Settings<span class="caret">▶</span></summary>
+    <div class="settings-body">
+      <details class="mapping-panel" id="mapping-panel"></details>
+      <details class="tuning-panel" id="tuning-panel"></details>
+    </div>
+  </details>
   <div class="banner" id="banner"></div>
   <div class="summary-tbl" id="summary" style="display:none"></div>
   <div class="grid" id="grid"></div>
@@ -352,6 +376,39 @@ export function dashboardHtml(): string {
     document.documentElement.setAttribute("data-theme", next);
     localStorage.setItem("cmp-theme", next);
   });
+})();
+
+// Settings forms (Model mapping, Routing tuning) are user-editable, so the 4s
+// poll must never overwrite an edit in progress. Each panel tracks a "dirty"
+// flag (touched since its last render) and the JSON of the data last rendered;
+// renderSettings() consults both. A one-time delegated input/change listener
+// (wired below) sets dirty; Save clears it and forces a fresh render.
+var settingsDirty = { "mapping-panel": false, "tuning-panel": false };
+var settingsRendered = { "mapping-panel": null, "tuning-panel": null };
+var accountSettingsDirty = false;
+
+// Collapsible panels: restore each disclosure's open state (collapsed by
+// default) and persist it on toggle; wire the per-panel dirty flag.
+(function () {
+  ["settings-group", "mapping-panel", "tuning-panel"].forEach(function (id) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (localStorage.getItem("cmp-open-" + id) === "1") el.open = true;
+    el.addEventListener("toggle", function () {
+      localStorage.setItem("cmp-open-" + id, el.open ? "1" : "0");
+    });
+  });
+  ["mapping-panel", "tuning-panel"].forEach(function (id) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const mark = function () { settingsDirty[id] = true; };
+    el.addEventListener("input", mark);
+    el.addEventListener("change", mark);
+  });
+  const grid = document.getElementById("grid");
+  const markAccountSettings = function () { accountSettingsDirty = true; };
+  grid.addEventListener("input", markAccountSettings);
+  grid.addEventListener("change", markAccountSettings);
 })();
 
 const fmtInt = (n) => (n ?? 0).toLocaleString();
@@ -491,10 +548,14 @@ function mappingCardHtml(mapping) {
       + '<div class="efforts"' + (inert ? ' style="display:none"' : "") + ">" + effortsHtml(fam, row.effort, row.to) + "</div>"
       + "</div>";
   }
-  return '<h3>Model mapping <span class="muted">Claude families served by Codex when pooled</span></h3>'
+  return '<summary>Model mapping<span class="caret">▶</span></summary>'
+    + '<div class="mapping-body">'
+    + '<div class="hint">Claude families served by Codex when pooled.</div>'
     + '<label><input type="checkbox" id="mapping-enabled"' + (mapping.enabled ? " checked" : "") + "> Pool Claude + Codex capacity</label>"
     + rows
-    + '<button id="mapping-save">Save mapping</button>';
+    + '<button id="mapping-save">Save mapping</button>'
+    + '<span class="status" id="mapping-status"></span>'
+    + "</div>";
 }
 
 // Editable weighted-score knobs (key/label/step/min/max), built server-side
@@ -655,6 +716,40 @@ document.querySelectorAll("[data-copy]").forEach((btn) => {
   });
 });
 
+// Render one settings panel from its data, returning whether it has content (so
+// the caller can show/hide the enclosing Settings group). Leaves the DOM alone —
+// never clobbering an edit — while the panel is dirty or focused, and skips a
+// no-op re-render when the data is unchanged (avoids 4s flicker and re-wiring).
+function renderSettings(id, html, data, wire) {
+  const panel = document.getElementById(id);
+  if (!html) { panel.style.display = "none"; settingsRendered[id] = null; return false; }
+  if (!settingsDirty[id] && !panel.contains(document.activeElement)) {
+    const key = JSON.stringify(data);
+    if (key !== settingsRendered[id]) {
+      panel.style.display = "block";
+      panel.innerHTML = html;
+      settingsRendered[id] = key;
+      settingsDirty[id] = false;
+      wire();
+    }
+  }
+  return true;
+}
+
+// A settings form becomes clean only after its POST succeeds. On rejection keep
+// its draft intact so the user can correct it instead of the poll restoring the
+// last server value over the form.
+function finishSettingsSave(id, res, status) {
+  if (!res.ok) {
+    if (status) status.textContent = "rejected";
+    return false;
+  }
+  if (status) status.textContent = "saved";
+  settingsDirty[id] = false;
+  settingsRendered[id] = null;
+  return true;
+}
+
 async function refresh() {
   try {
     const r = await fetch("/api/status");
@@ -664,6 +759,7 @@ async function refresh() {
     const banner = document.getElementById("banner");
     const accounts = d.accounts || [];
     const avail = accounts.filter((a) => a.available).length;
+    let accountCardsRendered = false;
 
     if (accounts.length === 0) {
       grid.innerHTML = "";
@@ -684,19 +780,22 @@ async function refresh() {
               : [],
           )
         : [{ priority: null, accounts: accounts.map((a) => a.name), available: avail }];
-      grid.innerHTML = groups.map((t) => {
-        const cardsHtml = t.accounts
-          .map((n) => byName[n])
-          .filter(Boolean)
-          .map((a) => card(a, a.name === nextAcct))
-          .join("");
-        const head = t.priority == null
-          ? ""
-          : '<div class="tier-head' + (t.available === 0 ? " dim" : "") + '">' + esc(tierLabel(t.priority))
-            + ' <span class="tier-meta">' + t.available + " available"
-            + (t.priority === routing.activeTier ? " · active" : "") + "</span></div>";
-        return '<section class="tier">' + head + '<div class="tier-grid">' + cardsHtml + "</div></section>";
-      }).join("");
+      if (!accountSettingsDirty && !grid.contains(document.activeElement)) {
+        grid.innerHTML = groups.map((t) => {
+          const cardsHtml = t.accounts
+            .map((n) => byName[n])
+            .filter(Boolean)
+            .map((a) => card(a, a.name === nextAcct))
+            .join("");
+          const head = t.priority == null
+            ? ""
+            : '<div class="tier-head' + (t.available === 0 ? " dim" : "") + '">' + esc(tierLabel(t.priority))
+              + ' <span class="tier-meta">' + t.available + " available"
+              + (t.priority === routing.activeTier ? " · active" : "") + "</span></div>";
+          return '<section class="tier">' + head + '<div class="tier-grid">' + cardsHtml + "</div></section>";
+        }).join("");
+        accountCardsRendered = true;
+      }
 
       const summary = document.getElementById("summary");
       const ordered = groups.flatMap((t) => t.accounts).map((n) => byName[n]).filter(Boolean);
@@ -712,31 +811,13 @@ async function refresh() {
         panel.style.display = "none";
       }
 
-      // Skip re-rendering the mapping panel while it has focus, so a poll tick
-      // can't clobber in-progress edits (same pattern as the tuning panel below).
-      const mapPanel = document.getElementById("mapping-panel");
-      const mapEditing = mapPanel.contains(document.activeElement);
-      const mapHtml = mappingCardHtml(d.mapping);
-      if (mapHtml && !mapEditing) {
-        mapPanel.innerHTML = mapHtml;
-        mapPanel.style.display = "block";
-        wireMapping();
-      } else if (!mapHtml) {
-        mapPanel.style.display = "none";
-      }
-
-      // Skip re-rendering the tuning panel while a field is focused, so a poll
-      // tick can't clobber a value the user is mid-edit.
-      const tuningPanel = document.getElementById("tuning-panel");
-      const editing = tuningPanel.contains(document.activeElement);
-      const tuningHtml = tuningPanelHtml(d.tuning);
-      if (tuningHtml && !editing) {
-        tuningPanel.innerHTML = tuningHtml;
-        tuningPanel.style.display = "block";
-        wireTuning();
-      } else if (!tuningHtml) {
-        tuningPanel.style.display = "none";
-      }
+      // Settings forms are user-editable; renderSettings only rewrites them when
+      // safe (not mid-edit, and the data actually changed), so a poll tick can
+      // never clobber in-progress edits. Show the Settings group iff either
+      // config panel has content.
+      const mapVisible = renderSettings("mapping-panel", mappingCardHtml(d.mapping), d.mapping, wireMapping);
+      const tuneVisible = renderSettings("tuning-panel", tuningPanelHtml(d.tuning), d.tuning, wireTuning);
+      document.getElementById("settings-group").style.display = (mapVisible || tuneVisible) ? "block" : "none";
 
       if (avail === 0) {
         const anyAuthed = accounts.some((a) => a.authenticated);
@@ -754,39 +835,41 @@ async function refresh() {
     document.getElementById("p-window").innerHTML = "window <b>" + Math.round((d.usageWindowMs || 0) / 3600000) + "h</b>";
     document.getElementById("p-updated").textContent = "updated " + new Date().toLocaleTimeString();
 
-    document.querySelectorAll("[data-set-priority]").forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        const name = btn.getAttribute("data-set-priority");
-        const input = document.querySelector('input[data-acct="' + (window.CSS ? CSS.escape(name) : name) + '"]');
-        const priority = parseInt(input.value, 10);
-        if (!Number.isInteger(priority) || priority < 0) return;
-        try {
-          await fetch("/api/routing", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ account: name, priority }),
-          });
-          refresh();
-        } catch (e) { /* transient; next poll will reconcile */ }
+    if (accountCardsRendered) {
+      document.querySelectorAll("[data-set-priority]").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const name = btn.getAttribute("data-set-priority");
+          const input = document.querySelector('input[data-acct="' + (window.CSS ? CSS.escape(name) : name) + '"]');
+          const priority = parseInt(input.value, 10);
+          if (!Number.isInteger(priority) || priority < 0) return;
+          try {
+            const res = await fetch("/api/routing", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ account: name, priority }),
+            });
+            if (res.ok) { accountSettingsDirty = false; refresh(); }
+          } catch (e) { /* transient; retain the draft until the user retries */ }
+        });
       });
-    });
 
-    document.querySelectorAll("[data-set-weight]").forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        const name = btn.getAttribute("data-set-weight");
-        const input = document.querySelector('input[data-weight-acct="' + (window.CSS ? CSS.escape(name) : name) + '"]');
-        const weight = parseFloat(input.value);
-        if (!Number.isFinite(weight) || weight < 0.1 || weight > 10) return;
-        try {
-          await fetch("/api/routing", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ account: name, weight }),
-          });
-          refresh();
-        } catch (e) { /* transient; next poll will reconcile */ }
+      document.querySelectorAll("[data-set-weight]").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const name = btn.getAttribute("data-set-weight");
+          const input = document.querySelector('input[data-weight-acct="' + (window.CSS ? CSS.escape(name) : name) + '"]');
+          const weight = parseFloat(input.value);
+          if (!Number.isFinite(weight) || weight < 0.1 || weight > 10) return;
+          try {
+            const res = await fetch("/api/routing", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ account: name, weight }),
+            });
+            if (res.ok) { accountSettingsDirty = false; refresh(); }
+          } catch (e) { /* transient; retain the draft until the user retries */ }
+        });
       });
-    });
+    }
 
     document.querySelectorAll("[data-scroll]").forEach((row) => {
       const scrollToCard = () => {
@@ -841,12 +924,12 @@ function wireMapping() {
       mappings.push(entry);
     });
     try {
-      await fetch("/api/mappings", {
+      const res = await fetch("/api/mappings", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ enabled: document.getElementById("mapping-enabled").checked, mappings }),
       });
-      refresh();
+      if (finishSettingsSave("mapping-panel", res, document.getElementById("mapping-status"))) refresh();
     } catch (e) { /* transient; next poll will reconcile */ }
   });
 }
@@ -875,8 +958,7 @@ function wireTuning() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify(patch),
       });
-      if (status) status.textContent = res.ok ? "saved" : "rejected";
-      refresh();
+      if (finishSettingsSave("tuning-panel", res, status)) refresh();
     } catch (e) {
       if (status) status.textContent = "offline";
     }

@@ -88,6 +88,7 @@ Notes:
 - `import --provider openai` requires an existing `codex login` — it reads `~/.codex/auth.json`. Run `codex login` first if it reports no login found.
 - Omit `--provider` (or pass `--provider anthropic`) for the default Claude login.
 - Standalone form: `bun run src/index.ts accounts login <name> --provider openai`.
+- The ChatGPT-subscription Codex backend rejects `max_output_tokens`, so the pool cannot enforce an Anthropic request's `max_tokens` upstream. Codex applies its own output cap; requests continue to work rather than failing on the unsupported field.
 
 Once added, OpenAI accounts appear in `bro accounts list` and on the dashboard with a provider badge, and requests for OpenAI models route to them (see below).
 
