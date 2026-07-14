@@ -19,6 +19,18 @@ describe("model table", () => {
     expect(r.upstreamModel).toBe("gpt-5.2-codex");
   });
 
+  test("gpt-5.6 family routes to openai: sol/terra/luna slugs plus gpt-5.6 alias -> sol", () => {
+    for (const id of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+      const r = resolveModel(DEFAULT_MODEL_TABLE, id);
+      expect(r.provider).toBe("openai");
+      expect(r.upstreamModel).toBe(id);
+    }
+    // Family alias: codex-rs models.json routes bare "gpt-5.6" to Sol.
+    const alias = resolveModel(DEFAULT_MODEL_TABLE, "gpt-5.6");
+    expect(alias.provider).toBe("openai");
+    expect(alias.upstreamModel).toBe("gpt-5.6-sol");
+  });
+
   test("loadModelTable merges file entries over defaults and survives a missing file", () => {
     const dir = mkdtempSync(join(tmpdir(), "pool-models-"));
     const file = join(dir, "models.json");

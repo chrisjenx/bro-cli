@@ -14,29 +14,82 @@ export function anthropicToCodexRequest(
       continue;
     }
     if (!Array.isArray(content)) continue;
-    const textBlocks: string[] = [];
-    for (const block of content as Array<Record<string, unknown>>) {
+    const blocks = content as Array<Record<string, unknown>>;
+    // Text and image blocks accumulate as message parts; tool_use/tool_result/
+    // reasoning are standalone items that flush any pending parts first.
+    const parts: Array<Record<string, unknown>> = [];
+    const flush = () => {
+      if (parts.length) input.push({ type: "message", role, content: parts.splice(0) });
+    };
+    for (let bi = 0; bi < blocks.length; bi++) {
+      const block = blocks[bi]!;
       if (block.type === "text" && typeof block.text === "string") {
-        textBlocks.push(block.text);
+        // Adjacent text blocks fold into one part joined with "\n" (matching
+        // the pre-image behavior); an intervening image starts a new part.
+        const last = parts[parts.length - 1];
+        const kind = role === "assistant" ? "output_text" : "input_text";
+        if (last && last.type === kind && typeof last.text === "string") {
+          last.text = `${last.text}\n${block.text}`;
+        } else {
+          parts.push({ type: kind, text: block.text });
+        }
+      } else if (block.type === "image" && role === "user") {
+        const image = imagePart(block);
+        if (image) parts.push(image);
       } else if (block.type === "tool_use") {
-        if (textBlocks.length) input.push(textMessage(role, textBlocks.splice(0).join("\n")));
+        flush();
         input.push({
           type: "function_call",
           call_id: String(block.id ?? ""),
           name: String(block.name ?? ""),
           arguments: JSON.stringify(block.input ?? {}),
         });
+      } else if (block.type === "thinking") {
+        // A thinking block whose signature is our stash of a Codex reasoning
+        // item round-trips back as a `reasoning` input item — Codex requires
+        // the reasoning item to precede its paired function_call under
+        // store:false, and 400s when it's missing. Thinking blocks from other
+        // backends (opaque non-JSON signatures) are dropped as before.
+        // Guard against orphans: a reasoning item must be followed by another
+        // item from the same turn (Codex 400s on a reasoning item "without its
+        // required following item"). An interrupted turn can end on thinking.
+        const hasFollowingItem = blocks
+          .slice(bi + 1)
+          .some((b) => b.type === "text" || b.type === "tool_use");
+        const stash = hasFollowingItem ? parseReasoningStash(block.signature) : null;
+        if (stash) {
+          flush();
+          input.push({
+            type: "reasoning",
+            id: stash.id,
+            summary:
+              typeof block.thinking === "string" && block.thinking
+                ? [{ type: "summary_text", text: block.thinking }]
+                : [],
+            encrypted_content: stash.encrypted_content,
+          });
+        }
       } else if (block.type === "tool_result") {
-        if (textBlocks.length) input.push(textMessage(role, textBlocks.splice(0).join("\n")));
+        flush();
         input.push({
           type: "function_call_output",
           call_id: String(block.tool_use_id ?? ""),
           output: foldToolResultContent(block.content),
         });
+        // function_call_output.output is string-only on Codex, so image blocks
+        // inside a tool_result (e.g. screenshots) ride in a follow-up user
+        // message immediately after the tool output.
+        const images = Array.isArray(block.content)
+          ? (block.content as Array<Record<string, unknown>>)
+              .filter((b) => b.type === "image")
+              .map(imagePart)
+              .filter((p): p is Record<string, unknown> => p !== null)
+          : [];
+        if (images.length) input.push({ type: "message", role: "user", content: images });
       }
-      // image / thinking / anything else: dropped (spec: degrade gracefully)
+      // assistant images / anything else: dropped (spec: degrade gracefully)
     }
-    if (textBlocks.length) input.push(textMessage(role, textBlocks.join("\n")));
+    flush();
   }
 
   const out: Record<string, unknown> = {
@@ -45,7 +98,22 @@ export function anthropicToCodexRequest(
     input,
     stream: true,
     store: false,
+    // Required on every stateless (store:false) call so reasoning items carry
+    // encrypted_content we can round-trip on the next turn — matching the
+    // Codex CLI (codex-rs/core/src/client.rs always sends this include).
+    include: ["reasoning.encrypted_content"],
   };
+  // Clamp: the Responses API 400s on max_output_tokens < 16, and Claude Code
+  // routinely sends max_tokens: 1 probe requests.
+  if (typeof body.max_tokens === "number") out.max_output_tokens = Math.max(16, body.max_tokens);
+  const thinking = body.thinking as Record<string, unknown> | undefined;
+  if (thinking?.type === "enabled" && typeof thinking.budget_tokens === "number") {
+    // Claude Code budget tiers → Responses effort: think (~4k) → low,
+    // megathink (~10k) → medium, ultrathink (~32k) → high. Left unset when the
+    // caller didn't ask for thinking so the server default applies.
+    const budget = thinking.budget_tokens;
+    out.reasoning = { effort: budget < 8192 ? "low" : budget < 16384 ? "medium" : "high" };
+  }
   const tools = (body.tools as Array<Record<string, unknown>> | undefined) ?? [];
   if (tools.length) {
     out.tools = tools
@@ -70,6 +138,20 @@ function textMessage(role: string, text: string): Record<string, unknown> {
   return { type: "message", role, content: [{ type: kind, text }] };
 }
 
+/** Maps an Anthropic image block onto a Codex `input_image` part; null when
+ * the source shape is unrecognized. */
+function imagePart(block: Record<string, unknown>): Record<string, unknown> | null {
+  const source = block.source as Record<string, unknown> | undefined;
+  if (source?.type === "base64" && typeof source.data === "string") {
+    const mediaType = typeof source.media_type === "string" ? source.media_type : "image/png";
+    return { type: "input_image", image_url: `data:${mediaType};base64,${source.data}` };
+  }
+  if (source?.type === "url" && typeof source.url === "string") {
+    return { type: "input_image", image_url: source.url };
+  }
+  return null;
+}
+
 function foldSystem(system: unknown): string {
   if (typeof system === "string") return system;
   if (Array.isArray(system)) {
@@ -85,10 +167,62 @@ function foldToolResultContent(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     return content
-      .map((b) => (typeof (b as Record<string, unknown>).text === "string" ? (b as Record<string, unknown>).text : ""))
+      .map((b) => (b as Record<string, unknown>).text)
+      .filter((t): t is string => typeof t === "string")
       .join("\n");
   }
   return "";
+}
+
+/**
+ * Strips thinking blocks fabricated by this translator (stash-JSON signature,
+ * or no signature at all — native Anthropic thinking blocks always carry an
+ * opaque one) from a request body headed to the real Anthropic API. Without
+ * this, a session that ran on a Codex model and then switches to a claude-*
+ * model replays fake-signed thinking blocks that Anthropic rejects with a
+ * retry-stable 400 during thinking-enabled tool-use continuations. Assistant
+ * messages emptied by the strip are dropped. Non-object bodies and bodies with
+ * nothing to strip are returned unchanged; the input is never mutated.
+ */
+export function stripCodexThinking(body: unknown): unknown {
+  if (body == null || typeof body !== "object" || Array.isArray(body)) return body;
+  const messages = (body as Record<string, unknown>).messages;
+  if (!Array.isArray(messages)) return body;
+
+  const isOurs = (block: Record<string, unknown>): boolean =>
+    block.type === "thinking" &&
+    (typeof block.signature !== "string" || parseReasoningStash(block.signature) !== null);
+
+  const needsStrip = messages.some(
+    (m) =>
+      Array.isArray((m as Record<string, unknown>)?.content) &&
+      ((m as Record<string, unknown>).content as Array<Record<string, unknown>>).some(isOurs),
+  );
+  if (!needsStrip) return body;
+
+  const stripped = messages.flatMap((m) => {
+    const msg = m as Record<string, unknown>;
+    if (!Array.isArray(msg?.content)) return [m];
+    const content = (msg.content as Array<Record<string, unknown>>).filter((b) => !isOurs(b));
+    if (content.length === 0) return [];
+    return [{ ...msg, content }];
+  });
+  return { ...(body as Record<string, unknown>), messages: stripped };
+}
+
+/** Parses a thinking-block signature back into the Codex reasoning stash we
+ * wrote in closeBlock(); returns null for foreign/opaque signatures. */
+function parseReasoningStash(signature: unknown): { id: string; encrypted_content: string } | null {
+  if (typeof signature !== "string") return null;
+  try {
+    const parsed = JSON.parse(signature) as Record<string, unknown>;
+    if (typeof parsed.id === "string" && typeof parsed.encrypted_content === "string") {
+      return { id: parsed.id, encrypted_content: parsed.encrypted_content };
+    }
+  } catch {
+    // not ours
+  }
+  return null;
 }
 
 function mapToolChoice(choice: unknown): unknown {
@@ -100,7 +234,10 @@ function mapToolChoice(choice: unknown): unknown {
 }
 
 export class CodexToAnthropicStream {
-  usage = { input_tokens: 0, output_tokens: 0 };
+  usage: { input_tokens: number; output_tokens: number; cache_read_input_tokens?: number } = {
+    input_tokens: 0,
+    output_tokens: 0,
+  };
   stopReason: string | null = null;
   sawError: { type: string; message: string } | null = null;
 
@@ -113,6 +250,11 @@ export class CodexToAnthropicStream {
   // Structured accumulation for the non-streaming (folded) response. Built
   // from the same events as the SSE frames below — no string round-trip
   // through the emitted frames is needed to reconstruct the final message.
+  /** Set when a tool_use block closed with unparseable non-empty args; the
+   * error is deferred to finish() so a token-cap terminal event (where
+   * truncated args are expected) can clear it first. */
+  private argsError: string | null = null;
+
   private msgId: string | undefined;
   private model: string | undefined;
   private content: Array<Record<string, unknown>> = [];
@@ -126,6 +268,9 @@ export class CodexToAnthropicStream {
   }
 
   handleEvent(event: { event: string; data: string }): string[] {
+    // An error is terminal for the Anthropic SSE contract: once emitted, no
+    // further content frames may follow it.
+    if (this.sawError) return [];
     let data: Record<string, unknown>;
     try {
       data = JSON.parse(event.data) as Record<string, unknown>;
@@ -149,7 +294,23 @@ export class CodexToAnthropicStream {
             input: {},
           })];
         }
-        return []; // reasoning etc.
+        if (item.type === "reasoning") {
+          // Reasoning becomes an Anthropic thinking block; its summary text
+          // streams as thinking_delta and closeBlock() stashes the item's
+          // encrypted_content into the signature for the next-turn round-trip.
+          return [this.openBlock({ type: "thinking", thinking: "" })];
+        }
+        return [];
+      }
+      case "response.reasoning_summary_text.delta": {
+        const block = this.content[this.index];
+        if (!this.blockOpen || block?.type !== "thinking") return [];
+        const text = String(data.delta ?? "");
+        block.thinking = (typeof block.thinking === "string" ? block.thinking : "") + text;
+        return [frame("content_block_delta", {
+          type: "content_block_delta", index: this.index,
+          delta: { type: "thinking_delta", thinking: text },
+        })];
       }
       case "response.output_text.delta": {
         if (!this.blockOpen) return [];
@@ -171,12 +332,29 @@ export class CodexToAnthropicStream {
         })];
       }
       case "response.output_item.done":
-        return this.closeBlock();
-      case "response.completed": {
-        const usage = ((data.response as Record<string, unknown>)?.usage ?? {}) as Record<string, unknown>;
+        return this.closeBlock((data.item ?? {}) as Record<string, unknown>);
+      case "response.completed":
+      case "response.incomplete": {
+        const response = (data.response ?? {}) as Record<string, unknown>;
+        const usage = (response.usage ?? {}) as Record<string, unknown>;
         if (typeof usage.input_tokens === "number") this.usage.input_tokens = usage.input_tokens;
         if (typeof usage.output_tokens === "number") this.usage.output_tokens = usage.output_tokens;
-        this.stopReason = this.sawToolUse ? "tool_use" : "end_turn";
+        const inputDetails = (usage.input_tokens_details ?? {}) as Record<string, unknown>;
+        if (typeof inputDetails.cached_tokens === "number") {
+          this.usage.cache_read_input_tokens = inputDetails.cached_tokens;
+        }
+        const incomplete = (response.incomplete_details ?? {}) as Record<string, unknown>;
+        if (response.status === "incomplete" || type === "response.incomplete") {
+          // Truncation must not read as a clean finish — Anthropic callers key
+          // continuation behavior off stop_reason. content_filter maps to
+          // "refusal"; token-cap (and unknown) reasons map to "max_tokens".
+          this.stopReason = incomplete.reason === "content_filter" ? "refusal" : "max_tokens";
+          // Truncated tool-call args are expected under a token cap; the
+          // non-clean stop_reason already tells the client not to run the tool.
+          this.argsError = null;
+        } else {
+          this.stopReason = this.sawToolUse ? "tool_use" : "end_turn";
+        }
         return [];
       }
       case "response.failed":
@@ -230,10 +408,17 @@ export class CodexToAnthropicStream {
     }
     this.finished = true;
     const frames = this.closeBlock();
+    if (this.argsError) {
+      // A tool call closed with corrupt args and no token-cap event excused
+      // it — end the stream with a terminal error instead of a clean close.
+      this.sawError = { type: "api_error", message: this.argsError };
+      frames.push(frame("error", { type: "error", error: this.sawError }));
+      return frames;
+    }
     frames.push(frame("message_delta", {
       type: "message_delta",
       delta: { stop_reason: this.stopReason ?? "end_turn", stop_sequence: null },
-      usage: { input_tokens: this.usage.input_tokens, output_tokens: this.usage.output_tokens },
+      usage: { ...this.usage },
     }));
     frames.push(frame("message_stop", { type: "message_stop" }));
     return frames;
@@ -248,21 +433,41 @@ export class CodexToAnthropicStream {
     });
   }
 
-  private closeBlock(): string[] {
+  private closeBlock(item?: Record<string, unknown>): string[] {
     if (!this.blockOpen) return [];
     this.blockOpen = false;
     const idx = this.index;
     const block = this.content[idx];
+    const frames: string[] = [];
     if (block && block.type === "tool_use") {
       const raw = this.argsAccum.get(idx) ?? "";
-      try {
-        block.input = JSON.parse(raw);
-      } catch {
-        block.input = {};
-      }
       this.argsAccum.delete(idx);
+      try {
+        block.input = raw ? JSON.parse(raw) : {};
+      } catch {
+        // Truncated/malformed argument JSON: running the tool with {} would
+        // fold a wrong result back into context. Defer the verdict to
+        // finish(): a token-cap terminal event downgrades this to a normal
+        // max_tokens stop; otherwise finish() ends the stream with an error.
+        block.input = {};
+        this.argsError = `Codex returned malformed arguments for tool "${String(block.name ?? "")}"`;
+      }
     }
-    return [frame("content_block_stop", { type: "content_block_stop", index: idx })];
+    if (
+      block && block.type === "thinking" &&
+      typeof item?.id === "string" && typeof item?.encrypted_content === "string"
+    ) {
+      // Stash the reasoning item's identity + encrypted payload in the
+      // signature; anthropicToCodexRequest() reverses this on the next turn.
+      const signature = JSON.stringify({ id: item.id, encrypted_content: item.encrypted_content });
+      block.signature = signature;
+      frames.push(frame("content_block_delta", {
+        type: "content_block_delta", index: idx,
+        delta: { type: "signature_delta", signature },
+      }));
+    }
+    frames.push(frame("content_block_stop", { type: "content_block_stop", index: idx }));
+    return frames;
   }
 
   /**
@@ -279,7 +484,7 @@ export class CodexToAnthropicStream {
       content: this.content,
       stop_reason: this.stopReason ?? "end_turn",
       stop_sequence: null,
-      usage: { input_tokens: this.usage.input_tokens, output_tokens: this.usage.output_tokens },
+      usage: { ...this.usage },
     };
   }
 }

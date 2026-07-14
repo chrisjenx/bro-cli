@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { anthropicToCodexRequest, CodexToAnthropicStream } from "./codex-translate.ts";
+import { anthropicToCodexRequest, CodexToAnthropicStream, stripCodexThinking } from "./codex-translate.ts";
 
 const parse = (frame: string) => JSON.parse(frame.split("\ndata: ")[1]!.trim());
 
@@ -40,6 +40,181 @@ describe("anthropicToCodexRequest", () => {
     expect(anthropicToCodexRequest(base, "m").tool_choice).toBe("auto");
   });
 
+  test("always requests encrypted reasoning content (store:false statelessness)", () => {
+    const out = anthropicToCodexRequest({ messages: [{ role: "user", content: "hi" }] }, "gpt-5.2-codex");
+    expect(out.include).toEqual(["reasoning.encrypted_content"]);
+  });
+
+  test("maps max_tokens to max_output_tokens", () => {
+    const out = anthropicToCodexRequest(
+      { max_tokens: 4096, messages: [{ role: "user", content: "hi" }] },
+      "gpt-5.2-codex",
+    );
+    expect(out.max_output_tokens).toBe(4096);
+  });
+
+  test("clamps max_tokens below the Responses API minimum of 16", () => {
+    // Claude Code sends max_tokens: 1 probe requests; the Responses API 400s
+    // on max_output_tokens < 16.
+    const out = anthropicToCodexRequest(
+      { max_tokens: 1, messages: [{ role: "user", content: "hi" }] },
+      "gpt-5.2-codex",
+    );
+    expect(out.max_output_tokens).toBe(16);
+  });
+
+  test("adjacent text blocks stay joined with a newline in a single part", () => {
+    const out = anthropicToCodexRequest({
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "<system-reminder>x</system-reminder>" },
+            { type: "text", text: "question" },
+          ],
+        },
+      ],
+    }, "m");
+    const input = out.input as Array<Record<string, unknown>>;
+    const parts = input[0]!.content as Array<Record<string, unknown>>;
+    expect(parts).toHaveLength(1);
+    expect(parts[0]!.text).toBe("<system-reminder>x</system-reminder>\nquestion");
+  });
+
+  test("an intervening image splits text into separate parts", () => {
+    const out = anthropicToCodexRequest({
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "before" },
+            { type: "image", source: { type: "base64", media_type: "image/png", data: "AA" } },
+            { type: "text", text: "after" },
+          ],
+        },
+      ],
+    }, "m");
+    const parts = (out.input as Array<Record<string, unknown>>)[0]!.content as Array<Record<string, unknown>>;
+    expect(parts.map((p) => p.type)).toEqual(["input_text", "input_image", "input_text"]);
+  });
+
+  test("a trailing thinking block with no following item in its message emits no orphan reasoning item", () => {
+    const signature = JSON.stringify({ id: "rs_9", encrypted_content: "enc" });
+    const out = anthropicToCodexRequest({
+      messages: [
+        { role: "user", content: "go" },
+        // Interrupted turn: thinking is the last (only) block.
+        { role: "assistant", content: [{ type: "thinking", thinking: "hmm", signature }] },
+        { role: "user", content: "continue" },
+      ],
+    }, "m");
+    const input = out.input as Array<Record<string, unknown>>;
+    expect(input.some((i) => i.type === "reasoning")).toBe(false);
+  });
+
+  test("reconstructs reasoning input items from replayed thinking blocks", () => {
+    const signature = JSON.stringify({ id: "rs_1", encrypted_content: "enc-blob" });
+    const out = anthropicToCodexRequest({
+      messages: [
+        { role: "user", content: "do it" },
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "I should read the file", signature },
+            { type: "tool_use", id: "call_1", name: "read_file", input: { path: "a" } },
+          ],
+        },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "data" }] },
+      ],
+    }, "gpt-5.2-codex");
+    const input = out.input as Array<Record<string, unknown>>;
+    // reasoning item must precede its paired function_call (Codex 400s otherwise)
+    expect(input[1]).toEqual({
+      type: "reasoning",
+      id: "rs_1",
+      summary: [{ type: "summary_text", text: "I should read the file" }],
+      encrypted_content: "enc-blob",
+    });
+    expect(input[2]).toMatchObject({ type: "function_call", call_id: "call_1" });
+    expect(input[3]).toMatchObject({ type: "function_call_output", call_id: "call_1" });
+  });
+
+  test("drops thinking blocks whose signature is not a codex reasoning stash", () => {
+    const out = anthropicToCodexRequest({
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "anthropic-native thought", signature: "opaque-base64-not-json" },
+            { type: "text", text: "hello" },
+          ],
+        },
+      ],
+    }, "gpt-5.2-codex");
+    const input = out.input as Array<Record<string, unknown>>;
+    expect(input).toHaveLength(1);
+    expect(input[0]).toMatchObject({ type: "message", role: "assistant" });
+  });
+
+  test("maps thinking.budget_tokens onto reasoning effort tiers", () => {
+    const base = { messages: [{ role: "user", content: "hi" }] };
+    const effortOf = (budget_tokens: number) =>
+      (anthropicToCodexRequest({ ...base, thinking: { type: "enabled", budget_tokens } }, "m")
+        .reasoning as Record<string, unknown>).effort;
+    expect(effortOf(4000)).toBe("low");      // "think"
+    expect(effortOf(10000)).toBe("medium");  // "megathink"
+    expect(effortOf(31999)).toBe("high");    // "ultrathink"
+    // No thinking requested → leave effort to the server default.
+    expect(anthropicToCodexRequest(base, "m").reasoning).toBeUndefined();
+  });
+
+  test("user image blocks become input_image parts (base64 and url sources)", () => {
+    const out = anthropicToCodexRequest({
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "what is this?" },
+            { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } },
+            { type: "image", source: { type: "url", url: "https://x.test/pic.jpg" } },
+          ],
+        },
+      ],
+    }, "m");
+    const input = out.input as Array<Record<string, unknown>>;
+    expect(input).toHaveLength(1);
+    const parts = input[0]!.content as Array<Record<string, unknown>>;
+    expect(parts[0]).toEqual({ type: "input_text", text: "what is this?" });
+    expect(parts[1]).toEqual({ type: "input_image", image_url: "data:image/png;base64,AAAA" });
+    expect(parts[2]).toEqual({ type: "input_image", image_url: "https://x.test/pic.jpg" });
+  });
+
+  test("tool_result image blocks are re-injected as a user input_image message", () => {
+    const out = anthropicToCodexRequest({
+      messages: [
+        { role: "assistant", content: [{ type: "tool_use", id: "c1", name: "screenshot", input: {} }] },
+        {
+          role: "user",
+          content: [{
+            type: "tool_result",
+            tool_use_id: "c1",
+            content: [
+              { type: "text", text: "captured" },
+              { type: "image", source: { type: "base64", media_type: "image/png", data: "BBBB" } },
+            ],
+          }],
+        },
+      ],
+    }, "m");
+    const input = out.input as Array<Record<string, unknown>>;
+    expect(input[1]).toMatchObject({ type: "function_call_output", call_id: "c1", output: "captured" });
+    // function_call_output.output is string-only on Codex, so the image rides
+    // in a follow-up user message right after the tool output.
+    expect(input[2]).toMatchObject({ type: "message", role: "user" });
+    const parts = input[2]!.content as Array<Record<string, unknown>>;
+    expect(parts).toContainEqual({ type: "input_image", image_url: "data:image/png;base64,BBBB" });
+  });
+
   test("maps tool_use/tool_result round-trip", () => {
     const out = anthropicToCodexRequest({
       messages: [
@@ -50,6 +225,55 @@ describe("anthropicToCodexRequest", () => {
     const input = out.input as Array<Record<string, unknown>>;
     expect(input[0]).toMatchObject({ type: "function_call", call_id: "tu_1", name: "read_file", arguments: '{"path":"a"}' });
     expect(input[1]).toMatchObject({ type: "function_call_output", call_id: "tu_1", output: "file contents" });
+  });
+});
+
+describe("stripCodexThinking", () => {
+  const stash = JSON.stringify({ id: "rs_1", encrypted_content: "enc" });
+
+  test("removes codex-stashed and signature-less thinking blocks, keeps native ones", () => {
+    const body = {
+      model: "claude-sonnet-5",
+      messages: [
+        { role: "user", content: "hi" },
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "codex thought", signature: stash },
+            { type: "thinking", thinking: "orphaned", }, // no signature: ours too
+            { type: "thinking", thinking: "native", signature: "opaque-base64-sig" },
+            { type: "text", text: "answer" },
+          ],
+        },
+      ],
+    };
+    const out = stripCodexThinking(body) as typeof body;
+    const content = out.messages[1]!.content as Array<Record<string, unknown>>;
+    expect(content).toEqual([
+      { type: "thinking", thinking: "native", signature: "opaque-base64-sig" },
+      { type: "text", text: "answer" },
+    ]);
+    expect(out.model).toBe("claude-sonnet-5");
+    // Input body is not mutated.
+    expect((body.messages[1]!.content as unknown[]).length).toBe(4);
+  });
+
+  test("drops an assistant message emptied by stripping (interrupted codex turn)", () => {
+    const out = stripCodexThinking({
+      messages: [
+        { role: "user", content: "go" },
+        { role: "assistant", content: [{ type: "thinking", thinking: "hmm", signature: stash }] },
+        { role: "user", content: "continue" },
+      ],
+    }) as { messages: Array<Record<string, unknown>> };
+    expect(out.messages).toHaveLength(2);
+    expect(out.messages.map((m) => m.role)).toEqual(["user", "user"]);
+  });
+
+  test("returns non-object and thinking-free bodies unchanged", () => {
+    expect(stripCodexThinking(null)).toBeNull();
+    const clean = { messages: [{ role: "user", content: "hi" }], stream: true };
+    expect(stripCodexThinking(clean)).toBe(clean);
   });
 });
 
@@ -158,6 +382,199 @@ describe("CodexToAnthropicStream", () => {
     const s = new CodexToAnthropicStream("gpt");
     s.handleEvent(ev("response.created", { response: { id: "r1" } }));
     expect(s.forceMessageStart()).toEqual([]);
+  });
+
+  test("reasoning item becomes a thinking block carrying encrypted_content in its signature", () => {
+    const s = new CodexToAnthropicStream("gpt");
+    const frames = [
+      ...s.handleEvent(ev("response.created", { response: { id: "r1" } })),
+      ...s.handleEvent(ev("response.output_item.added", { item: { type: "reasoning", id: "rs_1" } })),
+      ...s.handleEvent(ev("response.reasoning_summary_text.delta", { delta: "planning " })),
+      ...s.handleEvent(ev("response.reasoning_summary_text.delta", { delta: "the read" })),
+      ...s.handleEvent(ev("response.output_item.done", {
+        item: { type: "reasoning", id: "rs_1", encrypted_content: "enc-blob", summary: [] },
+      })),
+      ...s.handleEvent(ev("response.output_item.added", { item: { type: "function_call", call_id: "c1", name: "read_file" } })),
+      ...s.handleEvent(ev("response.function_call_arguments.delta", { delta: "{}" })),
+      ...s.handleEvent(ev("response.output_item.done", { item: { type: "function_call" } })),
+      ...s.handleEvent(ev("response.completed", { response: { usage: { input_tokens: 1, output_tokens: 2 } } })),
+      ...s.finish(),
+    ];
+    const parsed = frames.map(parse);
+    const start = parsed.find((d) => d.type === "content_block_start" && d.content_block.type === "thinking")!;
+    expect(start.index).toBe(0);
+    const thinkDeltas = parsed.filter((d) => d.type === "content_block_delta" && d.delta.type === "thinking_delta");
+    expect(thinkDeltas.map((d) => d.delta.thinking).join("")).toBe("planning the read");
+    const sig = parsed.find((d) => d.type === "content_block_delta" && d.delta.type === "signature_delta")!;
+    expect(JSON.parse(sig.delta.signature)).toEqual({ id: "rs_1", encrypted_content: "enc-blob" });
+
+    // Folded message carries the same thinking block, before the tool_use.
+    const msg = s.toAnthropicMessage();
+    const content = msg.content as Array<Record<string, unknown>>;
+    expect(content[0]).toMatchObject({ type: "thinking", thinking: "planning the read" });
+    expect(JSON.parse(content[0]!.signature as string)).toEqual({ id: "rs_1", encrypted_content: "enc-blob" });
+    expect(content[1]).toMatchObject({ type: "tool_use", id: "c1" });
+  });
+
+  test("reasoning item without encrypted_content still closes cleanly with no signature", () => {
+    const s = new CodexToAnthropicStream("gpt");
+    s.handleEvent(ev("response.created", { response: { id: "r1" } }));
+    s.handleEvent(ev("response.output_item.added", { item: { type: "reasoning", id: "rs_1" } }));
+    s.handleEvent(ev("response.output_item.done", { item: { type: "reasoning", id: "rs_1" } }));
+    s.handleEvent(ev("response.output_item.added", { item: { type: "message" } }));
+    s.handleEvent(ev("response.output_text.delta", { delta: "Hi" }));
+    s.handleEvent(ev("response.output_item.done", { item: { type: "message" } }));
+    s.handleEvent(ev("response.completed", { response: { usage: { input_tokens: 1, output_tokens: 1 } } }));
+    s.finish();
+    const content = s.toAnthropicMessage().content as Array<Record<string, unknown>>;
+    expect(content).toHaveLength(2);
+    expect(content[1]).toMatchObject({ type: "text", text: "Hi" });
+  });
+
+  test("incomplete response due to max_output_tokens maps to stop_reason max_tokens", () => {
+    const s = new CodexToAnthropicStream("gpt");
+    const frames = [
+      ...s.handleEvent(ev("response.created", { response: { id: "r1" } })),
+      ...s.handleEvent(ev("response.output_item.added", { item: { type: "message" } })),
+      ...s.handleEvent(ev("response.output_text.delta", { delta: "truncat" })),
+      ...s.handleEvent(ev("response.completed", {
+        response: {
+          status: "incomplete",
+          incomplete_details: { reason: "max_output_tokens" },
+          usage: { input_tokens: 5, output_tokens: 100 },
+        },
+      })),
+      ...s.finish(),
+    ];
+    expect(s.stopReason).toBe("max_tokens");
+    const delta = frames.map(parse).find((d) => d.type === "message_delta")!;
+    expect(delta.delta.stop_reason).toBe("max_tokens");
+  });
+
+  test("non-empty malformed tool args surface as an error, not a silent {} tool call", () => {
+    const s = new CodexToAnthropicStream("gpt");
+    const frames = [
+      ...s.handleEvent(ev("response.created", { response: { id: "r1" } })),
+      ...s.handleEvent(ev("response.output_item.added", { item: { type: "function_call", call_id: "c1", name: "write_file" } })),
+      ...s.handleEvent(ev("response.function_call_arguments.delta", { delta: '{"path":"a","content":"trunca' })),
+      ...s.handleEvent(ev("response.output_item.done", { item: { type: "function_call" } })),
+      ...s.finish(),
+    ];
+    const types = frames.map((f) => parse(f).type);
+    expect(s.sawError).not.toBeNull();
+    expect(types).toContain("error");
+    // Terminal like other mid-stream errors: no clean-finish frames follow.
+    expect(types).not.toContain("message_delta");
+    expect(types).not.toContain("message_stop");
+  });
+
+  test("empty tool args still fold to {} without error", () => {
+    const s = new CodexToAnthropicStream("gpt");
+    s.handleEvent(ev("response.created", { response: { id: "r1" } }));
+    s.handleEvent(ev("response.output_item.added", { item: { type: "function_call", call_id: "c1", name: "list" } }));
+    s.handleEvent(ev("response.output_item.done", { item: { type: "function_call" } }));
+    s.handleEvent(ev("response.completed", { response: { usage: { input_tokens: 1, output_tokens: 1 } } }));
+    s.finish();
+    expect(s.sawError).toBeNull();
+    const content = s.toAnthropicMessage().content as Array<Record<string, unknown>>;
+    expect(content[0]).toMatchObject({ type: "tool_use", input: {} });
+  });
+
+  test("cached input tokens surface as cache_read_input_tokens", () => {
+    const s = new CodexToAnthropicStream("gpt");
+    const frames = [
+      ...s.handleEvent(ev("response.created", { response: { id: "r1" } })),
+      ...s.handleEvent(ev("response.output_item.added", { item: { type: "message" } })),
+      ...s.handleEvent(ev("response.output_text.delta", { delta: "Hi" })),
+      ...s.handleEvent(ev("response.output_item.done", { item: { type: "message" } })),
+      ...s.handleEvent(ev("response.completed", {
+        response: { usage: { input_tokens: 100, output_tokens: 5, input_tokens_details: { cached_tokens: 80 } } },
+      })),
+      ...s.finish(),
+    ];
+    expect(s.usage.cache_read_input_tokens).toBe(80);
+    const delta = frames.map(parse).find((d) => d.type === "message_delta")!;
+    expect(delta.usage.cache_read_input_tokens).toBe(80);
+    expect((s.toAnthropicMessage().usage as Record<string, unknown>).cache_read_input_tokens).toBe(80);
+  });
+
+  test("no events are translated after an upstream error (error is terminal for handleEvent)", () => {
+    const s = new CodexToAnthropicStream("gpt");
+    s.handleEvent(ev("response.created", { response: { id: "r1" } }));
+    s.handleEvent(ev("error", { error: { code: "boom", message: "backend broke" } }));
+    // Post-error items must not leak content frames after the error event.
+    expect(s.handleEvent(ev("response.output_item.added", { item: { type: "message" } }))).toEqual([]);
+    expect(s.handleEvent(ev("response.output_text.delta", { delta: "late" }))).toEqual([]);
+  });
+
+  test("stream ending mid-args: finish() emits the error frame and no clean close", () => {
+    // Upstream disconnects while function_call arguments are still streaming —
+    // finish() closes the dangling block, detects the truncated JSON, and must
+    // NOT follow the error with message_delta/message_stop.
+    const s = new CodexToAnthropicStream("gpt");
+    s.handleEvent(ev("response.created", { response: { id: "r1" } }));
+    s.handleEvent(ev("response.output_item.added", { item: { type: "function_call", call_id: "c1", name: "write_file" } }));
+    s.handleEvent(ev("response.function_call_arguments.delta", { delta: '{"path":"a","content":"trun' }));
+    const frames = s.finish();
+    const types = frames.map((f) => parse(f).type);
+    expect(s.sawError).not.toBeNull();
+    expect(types).toContain("error");
+    expect(types).not.toContain("message_delta");
+    expect(types).not.toContain("message_stop");
+  });
+
+  test("args truncated by max_output_tokens fold to {} with stop_reason max_tokens, not an error", () => {
+    // When the response is token-capped, truncated tool args are expected —
+    // surface the Anthropic-native max_tokens stop instead of a terminal error.
+    const s = new CodexToAnthropicStream("gpt");
+    const frames = [
+      ...s.handleEvent(ev("response.created", { response: { id: "r1" } })),
+      ...s.handleEvent(ev("response.output_item.added", { item: { type: "function_call", call_id: "c1", name: "write_file" } })),
+      ...s.handleEvent(ev("response.function_call_arguments.delta", { delta: '{"path":"a","content":"trun' })),
+      ...s.handleEvent(ev("response.output_item.done", { item: { type: "function_call" } })),
+      ...s.handleEvent(ev("response.completed", {
+        response: {
+          status: "incomplete",
+          incomplete_details: { reason: "max_output_tokens" },
+          usage: { input_tokens: 5, output_tokens: 100 },
+        },
+      })),
+      ...s.finish(),
+    ];
+    const types = frames.map((f) => parse(f).type);
+    expect(s.sawError).toBeNull();
+    expect(types).not.toContain("error");
+    expect(s.stopReason).toBe("max_tokens");
+    expect(types).toContain("message_stop");
+  });
+
+  test("response.incomplete terminal event maps like completed-with-incomplete-status", () => {
+    const s = new CodexToAnthropicStream("gpt");
+    s.handleEvent(ev("response.created", { response: { id: "r1" } }));
+    s.handleEvent(ev("response.output_item.added", { item: { type: "message" } }));
+    s.handleEvent(ev("response.output_text.delta", { delta: "partial" }));
+    s.handleEvent(ev("response.incomplete", {
+      response: {
+        status: "incomplete",
+        incomplete_details: { reason: "max_output_tokens" },
+        usage: { input_tokens: 2, output_tokens: 50 },
+      },
+    }));
+    s.finish();
+    expect(s.stopReason).toBe("max_tokens");
+    expect(s.usage.output_tokens).toBe(50);
+  });
+
+  test("content_filter incompleteness maps to stop_reason refusal, not a clean finish", () => {
+    const s = new CodexToAnthropicStream("gpt");
+    s.handleEvent(ev("response.created", { response: { id: "r1" } }));
+    s.handleEvent(ev("response.output_item.added", { item: { type: "message" } }));
+    s.handleEvent(ev("response.output_item.done", { item: { type: "message" } }));
+    s.handleEvent(ev("response.completed", {
+      response: { status: "incomplete", incomplete_details: { reason: "content_filter" }, usage: {} },
+    }));
+    s.finish();
+    expect(s.stopReason).toBe("refusal");
   });
 
   test("mid-stream error is terminal: no message_delta/message_stop follow it", () => {

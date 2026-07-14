@@ -26,6 +26,7 @@ import {
 } from "./shared.ts";
 import type { SseEvent } from "./shared.ts";
 import { accessTokenFor } from "./oauth-token.ts";
+import { stripCodexThinking } from "./codex-translate.ts";
 import { maybeRefreshUsage } from "./usage.ts";
 
 interface ProxyHooks {
@@ -76,7 +77,13 @@ export async function proxyAnthropicMessages(
   // Fire-and-forget — the current request routes immediately on existing data.
   void maybeRefreshUsage(first, mgr, config).catch(() => {});
 
-  const bodyText = JSON.stringify(body ?? {});
+  // Deliberate exception to forwarding the caller body verbatim: thinking
+  // blocks fabricated by the Codex translation path (see stripCodexThinking)
+  // carry signatures the real Anthropic API rejects with a retry-stable 400.
+  // Stripping only what this pool itself synthesized keeps a session that
+  // switched from a gpt-* to a claude-* model recoverable without user
+  // intervention; genuine caller content is untouched.
+  const bodyText = JSON.stringify(stripCodexThinking(body) ?? {});
   const tried = new Set<string>();
   let account: Account | null = first;
   let lastRetry: RetryReason | null = null;

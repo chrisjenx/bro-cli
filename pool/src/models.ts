@@ -15,6 +15,10 @@ const openai = (id: string): ModelRoute => ({ id, provider: "openai", upstreamMo
 export const DEFAULT_MODEL_TABLE: ModelRoute[] = [
   claude("opus"), claude("sonnet"), claude("haiku"), claude("fable"),
   claude("claude-opus-4-8"), claude("claude-sonnet-5"), claude("claude-haiku-4-5"), claude("claude-fable-5"),
+  // GPT-5.6 tiers per codex-rs models-manager/models.json: sol (flagship),
+  // terra (mid), luna (fast/cheap); bare "gpt-5.6" is a family alias for sol.
+  openai("gpt-5.6-sol"), openai("gpt-5.6-terra"), openai("gpt-5.6-luna"),
+  { id: "gpt-5.6", provider: "openai", upstreamModel: "gpt-5.6-sol" },
   openai("gpt-5.5"), openai("gpt-5.4"), openai("gpt-5.4-mini"),
 ];
 
