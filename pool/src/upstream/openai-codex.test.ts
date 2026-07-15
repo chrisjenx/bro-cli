@@ -55,11 +55,30 @@ describe("parseCodexRateLimitSnapshot", () => {
     expect(s.unifiedStatus).toBe("allowed");
   });
 
-  test("exhausted primary window reads as rejected", () => {
+  test("exhausted primary window reads as rejected only on a 429", () => {
     const h = new Headers({ "x-codex-primary-used-percent": "100" });
+    expect(parseCodexRateLimitSnapshot(h).windows.find((w) => w.key === "5h")?.status).toBe("allowed");
+    const rejected = parseCodexRateLimitSnapshot(h, { rejected: true });
+    expect(rejected.windows.find((w) => w.key === "5h")?.status).toBe("rejected");
+    expect(rejected.unifiedStatus).toBe("rejected");
+  });
+
+  test("keys a window by its window-minutes, not its slot", () => {
+    const h = new Headers({
+      "x-codex-primary-used-percent": "100",
+      "x-codex-primary-window-minutes": "10080",
+      "x-codex-primary-reset-at": String(Math.floor(Date.now() / 1000) + 600_000),
+    });
     const s = parseCodexRateLimitSnapshot(h);
-    expect(s.windows.find((w) => w.key === "5h")?.status).toBe("rejected");
-    expect(s.unifiedStatus).toBe("rejected");
+    // Weekly window in the primary slot must read as 7d, not 5h.
+    expect(s.windows.find((w) => w.key === "7d")?.utilization).toBeCloseTo(1);
+    expect(s.windows.find((w) => w.key === "5h")).toBeUndefined();
+    expect(s.windows.find((w) => w.key === "7d")?.status).toBe("allowed");
+  });
+
+  test("keys a 300-minute primary window as 5h", () => {
+    const h = new Headers({ "x-codex-primary-used-percent": "20", "x-codex-primary-window-minutes": "300" });
+    expect(parseCodexRateLimitSnapshot(h).windows.find((w) => w.key === "5h")?.utilization).toBeCloseTo(0.2);
   });
 
   test("no headers → empty windows, null unified status", () => {

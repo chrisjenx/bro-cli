@@ -14,6 +14,7 @@ import type { Account, OpenAIOauthCreds, RateLimitSnapshot, RateLimitWindow } fr
 import type { ModelRoute } from "../models.ts";
 import { refreshOpenAIToken } from "../accounts/openai-oauth.ts";
 import { anthropicToCodexRequest, CodexToAnthropicStream } from "./codex-translate.ts";
+import { durationToWindowKey } from "./codex-windows.ts";
 import { CODEX_RESPONSES_URL, CODEX_ORIGINATOR, CODEX_ACCOUNT_ID_HEADER, CODEX_RATE_LIMIT_HEADERS } from "./codex-constants.ts";
 import { anthropicError, makeAbort, SseParser, isRateLimit, retryAfterMs, parseJson, stringProp, objectProp } from "./shared.ts";
 
@@ -156,7 +157,11 @@ async function tryCodexAccount(
     }
   }
 
-  mgr.recordRateLimitSnapshot(account.name, parseCodexRateLimitSnapshot(res.headers));
+  mgr.recordRateLimitSnapshot(
+    account.name,
+    parseCodexRateLimitSnapshot(res.headers, { rejected: res.status === 429 }),
+    true,
+  );
 
   if (res.status === 429) {
     const text = await res.text().catch(() => "");
@@ -487,8 +492,11 @@ async function streamCodexResponse(
  * secondary window onto the seven-day fields. Reset headers are an ABSOLUTE
  * unix timestamp in seconds (`...-reset-at`), not a countdown.
  */
-export function parseCodexRateLimitSnapshot(headers: Headers): RateLimitSnapshot {
-  const pct = (name: string): number | null => {
+export function parseCodexRateLimitSnapshot(
+  headers: Headers,
+  opts: { rejected?: boolean } = {},
+): RateLimitSnapshot {
+  const num = (name: string): number | null => {
     const raw = headers.get(name);
     if (raw == null || raw === "") return null;
     const n = Number.parseFloat(raw);
@@ -500,33 +508,38 @@ export function parseCodexRateLimitSnapshot(headers: Headers): RateLimitSnapshot
     const n = Number.parseInt(raw, 10);
     return Number.isFinite(n) ? n * 1000 : null;
   };
-  const statusFor = (usedPercent: number | null): string | null => {
-    if (usedPercent == null) return null;
-    return usedPercent < 100 ? "allowed" : "rejected";
-  };
 
   // Codex's primary/secondary windows map onto the pool's account-wide unified
-  // windows (model === null): primary → "5h", secondary → "7d". Codex has no
-  // model-scoped windows, so these are the only two.
+  // windows (model === null). Each window's real duration comes from its
+  // `-window-minutes` header, not its slot — a weekly window can arrive in the
+  // primary slot (see durationToWindowKey). Codex has no model-scoped windows.
   const windows: RateLimitWindow[] = [];
-  const addWindow = (key: string, usedName: string, resetName: string): void => {
-    const usedPct = pct(usedName);
+  const seen = new Set<string>();
+  const addWindow = (
+    slot: "primary" | "secondary",
+    usedName: string,
+    minutesName: string,
+    resetName: string,
+  ): void => {
+    const usedPct = num(usedName);
     const reset = resetAt(resetName);
     if (usedPct == null && reset == null) return;
-    windows.push({
-      key,
-      model: null,
-      status: statusFor(usedPct),
-      utilization: usedPct == null ? null : usedPct / 100,
-      reset,
-    });
+    const minutes = num(minutesName);
+    let key = durationToWindowKey(minutes == null ? null : minutes * 60_000, slot);
+    if (seen.has(key)) key = key === "5h" ? "7d" : "5h"; // collision guard (never today)
+    seen.add(key);
+    const utilization = usedPct == null ? null : usedPct / 100;
+    // A snapshot from a successful response proves the account is serving now, so
+    // windows are "allowed" even at 100% (unenforced limit). Only a 429 marks
+    // them spent by utilization.
+    const status = opts.rejected ? (utilization != null && utilization >= 1 ? "rejected" : "allowed") : "allowed";
+    windows.push({ key, model: null, status, utilization, reset });
   };
-  addWindow("5h", CODEX_RATE_LIMIT_HEADERS.primaryUsedPercent, CODEX_RATE_LIMIT_HEADERS.primaryResetAt);
-  addWindow("7d", CODEX_RATE_LIMIT_HEADERS.secondaryUsedPercent, CODEX_RATE_LIMIT_HEADERS.secondaryResetAt);
+  addWindow("primary", CODEX_RATE_LIMIT_HEADERS.primaryUsedPercent, CODEX_RATE_LIMIT_HEADERS.primaryWindowMinutes, CODEX_RATE_LIMIT_HEADERS.primaryResetAt);
+  addWindow("secondary", CODEX_RATE_LIMIT_HEADERS.secondaryUsedPercent, CODEX_RATE_LIMIT_HEADERS.secondaryWindowMinutes, CODEX_RATE_LIMIT_HEADERS.secondaryResetAt);
 
   const unifiedStatus =
     windows.length === 0 ? null : windows.some((w) => w.status === "rejected") ? "rejected" : "allowed";
-
   return { unifiedStatus, windows, updatedAt: Date.now() };
 }
 
