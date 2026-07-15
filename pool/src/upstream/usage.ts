@@ -11,6 +11,7 @@ import type { Config } from "../config.ts";
 import { AccountManager } from "../accounts/manager.ts";
 import type { Account } from "../accounts/types.ts";
 import { accessTokenFor } from "./oauth-token.ts";
+import { maybeRefreshCodexUsage } from "./codex-usage.ts";
 
 function parseResetMs(iso: string | undefined): number | null {
   if (!iso) return null;
@@ -208,16 +209,24 @@ export async function maybeRefreshUsage(
 }
 
 /**
- * Periodic ground-truth sweep: refresh usage for every authenticated Anthropic
- * account whose snapshot is stale, regardless of whether it is being routed to.
+ * Periodic ground-truth sweep: refresh usage for every authenticated account
+ * (Anthropic via maybeRefreshUsage, openai/Codex via maybeRefreshCodexUsage)
+ * whose snapshot is stale, regardless of whether it is being routed to.
  * Without this, an account that 429s and then falls out of rotation (e.g. its
  * stale spent 5h window sinks its routing score) never serves a request, so the
- * serve-path maybeRefreshUsage call never fires and the account's status stays
- * frozen at rate-limit-time forever. maybeRefreshUsage's own TTL/backoff gating
- * keeps this sweep cheap: fresh accounts and recently-failed checks are skipped.
+ * serve-path refresh call never fires and the account's status stays frozen at
+ * rate-limit-time forever. Each refresh path's own TTL/backoff gating keeps
+ * this sweep cheap: fresh accounts and recently-failed checks are skipped.
  */
 export async function sweepUsageRefresh(mgr: AccountManager, config: Config): Promise<void> {
   if (!config.usageRefreshEnabled) return;
-  const eligible = mgr.listAccounts().filter((a) => a.provider === "anthropic" && a.authenticated);
-  await Promise.all(eligible.map((a) => maybeRefreshUsage(a, mgr, config).catch(() => {})));
+  const accounts = mgr.listAccounts().filter((a) => a.authenticated);
+  await Promise.all(
+    accounts.map((a) =>
+      (a.provider === "openai"
+        ? maybeRefreshCodexUsage(a, mgr, config)
+        : maybeRefreshUsage(a, mgr, config)
+      ).catch(() => {}),
+    ),
+  );
 }

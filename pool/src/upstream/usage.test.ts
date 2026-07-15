@@ -300,3 +300,21 @@ test("maybeRefreshUsage is a no-op when disabled", async () => {
     globalThis.fetch = orig;
   }
 });
+
+test("sweepUsageRefresh polls openai accounts via the Codex path", async () => {
+  const config = loadConfig({ usageRefreshEnabled: true } as any);
+  const calls: string[] = [];
+  const mgr: any = {
+    listAccounts: () => [
+      { name: "claude", provider: "anthropic", authenticated: true, usage: {} },
+      { name: "codex", provider: "openai", authenticated: true, usage: {} },
+    ],
+    // Any refresh path that touches an account records its name here via the
+    // stubbed creds accessors returning null (so the real fetch short-circuits).
+    getOAuthCreds: (n: string) => { calls.push("anthropic:" + n); return null; },
+    getOpenAICreds: (n: string) => { calls.push("openai:" + n); return null; },
+    recordUsageCheckError: () => {},
+  };
+  await sweepUsageRefresh(mgr, config);
+  expect(calls).toContain("openai:codex");
+});
