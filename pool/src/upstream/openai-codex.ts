@@ -231,7 +231,7 @@ async function fetchCodex(
   }
 }
 
-async function ensureFreshToken(
+export async function ensureFreshToken(
   accountName: string,
   mgr: AccountManager,
   config: Config,

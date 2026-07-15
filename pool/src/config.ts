@@ -82,6 +82,10 @@ export interface Config {
   usageFetchTimeoutMs: number;
   /** User-Agent sent to /api/oauth/usage; the wrong/absent UA hits a throttled bucket. */
   usageUserAgent: string;
+  /** Codex ground-truth usage endpoint (ChatGPT backend). */
+  codexUsageUrl: string;
+  /** User-Agent sent to the Codex usage endpoint. */
+  codexUsageUserAgent: string;
 }
 
 function intEnv(name: string, fallback: number): number {
@@ -153,6 +157,8 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
     usageRefreshTtlMs: positiveIntEnv("USAGE_REFRESH_TTL_MS", 120_000, 1000),
     usageFetchTimeoutMs: positiveIntEnv("USAGE_FETCH_TIMEOUT_MS", 2500, 250),
     usageUserAgent: process.env.CLAUDE_USAGE_USER_AGENT || "claude-code/2.1.207",
+    codexUsageUrl: process.env.CODEX_USAGE_URL || "https://chatgpt.com/backend-api/wham/usage",
+    codexUsageUserAgent: process.env.CODEX_USAGE_USER_AGENT || "codex-cli",
     ...overrides,
   };
 
