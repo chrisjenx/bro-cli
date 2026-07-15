@@ -110,6 +110,26 @@ describe("resetAtFromCodexHeaders", () => {
   test("undefined when neither header is present", () => {
     expect(resetAtFromCodexHeaders(new Headers())).toBeUndefined();
   });
+
+  test("uses the soonest future reset among primary and secondary windows", () => {
+    const soon = Math.floor(Date.now() / 1000) + 600;
+    const later = Math.floor(Date.now() / 1000) + 7 * 86400;
+    const h = new Headers({
+      "x-codex-primary-reset-at": String(later),
+      "x-codex-secondary-reset-at": String(soon),
+    });
+    expect(resetAtFromCodexHeaders(h)).toBe(soon * 1000);
+  });
+
+  test("ignores a window reset already in the past", () => {
+    const past = Math.floor(Date.now() / 1000) - 100;
+    const future = Math.floor(Date.now() / 1000) + 600;
+    const h = new Headers({
+      "x-codex-primary-reset-at": String(past),
+      "x-codex-secondary-reset-at": String(future),
+    });
+    expect(resetAtFromCodexHeaders(h)).toBe(future * 1000);
+  });
 });
 
 // Each SSE event is terminated by a blank line, per spec — the events must

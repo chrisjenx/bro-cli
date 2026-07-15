@@ -544,14 +544,18 @@ export function parseCodexRateLimitSnapshot(
 }
 
 export function resetAtFromCodexHeaders(headers: Headers): number | undefined {
-  // Codex's own absolute reset-at is the authoritative cooldown-until, so it
-  // takes precedence over a generic retry-after (which a gateway/CDN might
-  // inject alongside it); retry-after is only a fallback.
-  const primaryResetAt = headers.get(CODEX_RATE_LIMIT_HEADERS.primaryResetAt);
-  if (primaryResetAt) {
-    const n = Number.parseInt(primaryResetAt, 10);
-    if (Number.isFinite(n)) return n * 1000;
+  // Codex ships the weekly window in the primary slot when the session window is
+  // absent, so a primary-only preference could bench for ~7d on a session 429.
+  // Use the soonest FUTURE reset among both windows; fall back to retry-after.
+  const now = Date.now();
+  const resets: number[] = [];
+  for (const name of [CODEX_RATE_LIMIT_HEADERS.primaryResetAt, CODEX_RATE_LIMIT_HEADERS.secondaryResetAt]) {
+    const raw = headers.get(name);
+    if (!raw) continue;
+    const n = Number.parseInt(raw, 10);
+    if (Number.isFinite(n) && n * 1000 > now) resets.push(n * 1000);
   }
+  if (resets.length > 0) return Math.min(...resets);
   return retryAfterMs(headers);
 }
 
