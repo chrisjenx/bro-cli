@@ -948,10 +948,13 @@ export class AccountManager {
 
   /**
    * Record Anthropic's latest rate-limit headroom snapshot for this account.
-   * Merges by window key rather than replacing wholesale: a response only
-   * carries headers for the window(s) relevant to that request (e.g. a
-   * model-scoped Fable window may only appear on Fable requests), so a window
-   * absent from the latest snapshot is presumed still in effect, not cleared.
+   * By default (replace=false) merges by window key rather than replacing
+   * wholesale: a response only carries headers for the window(s) relevant to
+   * that request (e.g. a model-scoped Fable window may only appear on Fable
+   * requests), so a window absent from the latest snapshot is presumed still
+   * in effect, not cleared. When replace=true, uses replaceRateLimitSnapshot
+   * to overwrite the account's windows wholesale instead — used by the Codex
+   * header tap, whose responses always carry the full current window set.
    */
   recordRateLimitSnapshot(name: string, snapshot: RateLimitSnapshot, replace = false): void {
     const u = this.usageFor(name);
@@ -1424,6 +1427,8 @@ function isAllowedStatus(status: string | null): boolean {
  */
 function isSpentWindow(w: RateLimitWindow): boolean {
   if (isBlockingStatus(w.status)) return true;
+  // Safe for Anthropic accounts only because Anthropic never pairs status:"allowed"
+  // with utilization>=1 — only Codex's unenforced-limit case does that.
   if (isAllowedStatus(w.status)) return false;
   return w.utilization != null && w.utilization >= 1;
 }

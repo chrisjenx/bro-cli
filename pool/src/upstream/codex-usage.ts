@@ -8,6 +8,7 @@
 
 import type { Account, RateLimitSnapshot, RateLimitWindow } from "../accounts/types.ts";
 import type { Config } from "../config.ts";
+import { sortRateLimitWindows } from "../accounts/types.ts";
 import { AccountManager } from "../accounts/manager.ts";
 import { ensureFreshToken } from "./openai-codex.ts";
 import { durationToWindowKey } from "./codex-windows.ts";
@@ -43,7 +44,7 @@ export function mapCodexUsageResponse(
   addWindow("primary");
   addWindow("secondary");
   if (windows.length === 0) return null;
-  return { unifiedStatus: rejected ? "rejected" : "allowed", windows, updatedAt: now };
+  return { unifiedStatus: rejected ? "rejected" : "allowed", windows: sortRateLimitWindows(windows), updatedAt: now };
 }
 
 export async function fetchCodexUsageSnapshot(
