@@ -157,11 +157,13 @@ async function tryCodexAccount(
     }
   }
 
-  mgr.recordRateLimitSnapshot(
-    account.name,
-    parseCodexRateLimitSnapshot(res.headers, { rejected: res.status === 429 }),
-    true,
-  );
+  // Skip an empty snapshot: a response with no x-codex-* headers (e.g. a
+  // codex-exec-style turn) would otherwise wipe the account's known 5h/7d
+  // windows via replace mode. Preserve the prior windows instead.
+  const codexRateLimit = parseCodexRateLimitSnapshot(res.headers, { rejected: res.status === 429 });
+  if (codexRateLimit.windows.length > 0) {
+    mgr.recordRateLimitSnapshot(account.name, codexRateLimit, true);
+  }
 
   if (res.status === 429) {
     const text = await res.text().catch(() => "");

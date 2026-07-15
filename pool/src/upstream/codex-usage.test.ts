@@ -40,6 +40,23 @@ test("marks windows rejected when the limit is enforced", () => {
   expect(snap.unifiedStatus).toBe("rejected");
 });
 
+test("under an enforced weekly limit, an unfull session window stays allowed", () => {
+  const enforcedWeekly = {
+    rate_limit: {
+      allowed: false,
+      limit_reached: true,
+      primary_window: { used_percent: 100, limit_window_seconds: 604800, reset_at: 1784666164 }, // weekly, full
+      secondary_window: { used_percent: 12, limit_window_seconds: 18000, reset_at: 1784600000 }, // 5h, not full
+    },
+  };
+  const snap = mapCodexUsageResponse(enforcedWeekly, 1_000)!;
+  // Only the full weekly window is spent; the low-usage session window must NOT
+  // be marked rejected, else the account would un-bench at the sooner 5h reset.
+  expect(snap.windows.find((x) => x.key === "7d")?.status).toBe("rejected");
+  expect(snap.windows.find((x) => x.key === "5h")?.status).toBe("allowed");
+  expect(snap.unifiedStatus).toBe("rejected");
+});
+
 test("reads both windows and falls back to reset_after_seconds", () => {
   const both = {
     rate_limit: {

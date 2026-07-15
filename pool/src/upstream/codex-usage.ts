@@ -39,12 +39,18 @@ export function mapCodexUsageResponse(
     seen.add(key);
     const utilization = usedPct == null ? null : Math.max(0, Math.min(1, usedPct / 100));
     const reset = resetAtSec != null ? resetAtSec * 1000 : resetAfter != null ? now + resetAfter * 1000 : null;
-    windows.push({ key, model: null, status: rejected ? "rejected" : "allowed", utilization, reset });
+    // A window is spent only when the account is limited AND this window is the
+    // full one. Marking an unfull window (e.g. a low-usage session window while
+    // the WEEKLY limit is enforced) rejected would bench the account only until
+    // that shorter window resets — an early un-bench and a wasted 429.
+    const windowRejected = rejected && usedPct != null && usedPct >= 100;
+    windows.push({ key, model: null, status: windowRejected ? "rejected" : "allowed", utilization, reset });
   };
   addWindow("primary");
   addWindow("secondary");
   if (windows.length === 0) return null;
-  return { unifiedStatus: rejected ? "rejected" : "allowed", windows: sortRateLimitWindows(windows), updatedAt: now };
+  const unifiedStatus = windows.some((w) => w.status === "rejected") ? "rejected" : "allowed";
+  return { unifiedStatus, windows: sortRateLimitWindows(windows), updatedAt: now };
 }
 
 export async function fetchCodexUsageSnapshot(

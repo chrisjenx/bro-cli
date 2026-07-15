@@ -233,6 +233,41 @@ describe("proxyCodexMessages", () => {
     }
   });
 
+  test("a successful response with no rate-limit headers preserves prior windows", async () => {
+    const { poolDir, mgr } = tempOpenAIPool(["gpt1"]);
+    try {
+      const config = loadConfig({ poolDir, accountsDir: join(poolDir, "accounts"), usageFile: join(poolDir, "usage.json") });
+      // Seed a known weekly window from an earlier header-bearing response.
+      mgr.recordRateLimitSnapshot(
+        "gpt1",
+        {
+          unifiedStatus: "allowed",
+          windows: [{ key: "7d", model: null, status: "allowed", utilization: 0.8, reset: Date.now() + 7 * 24 * 60 * 60_000 }],
+          updatedAt: Date.now(),
+        },
+        true,
+      );
+      // A headerless 200 (e.g. a codex-exec-style turn) must NOT wipe that window.
+      const fakeFetch = (async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) =>
+        new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch;
+      const res = await proxyCodexMessages(
+        { model: "gpt", messages: [{ role: "user", content: "hi" }] },
+        mgr,
+        config,
+        new AbortController().signal,
+        { id: "gpt", provider: "openai", upstreamModel: "gpt-5.2-codex" },
+        {},
+        fakeFetch,
+      );
+      expect(res.status).toBe(200);
+      expect(
+        mgr.getAccount("gpt1").usage.rateLimitStatus?.windows.find((w) => w.key === "7d")?.utilization,
+      ).toBeCloseTo(0.8);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
   test("429 sidelines the account and fails over to the next one", async () => {
     const { poolDir, mgr } = tempOpenAIPool(["gpt1", "gpt2"]);
     try {
