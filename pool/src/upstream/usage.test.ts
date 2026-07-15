@@ -257,7 +257,7 @@ test("maybeRefreshUsage backs off after a failed refresh, within the TTL", async
   }
 });
 
-test("sweepUsageRefresh refreshes stale authenticated anthropic accounts, skips fresh/openai/logged-out", async () => {
+test("sweepUsageRefresh refreshes stale authenticated anthropic accounts, skips fresh/logged-out, fails closed on openai/codex", async () => {
   const fetchedNames: string[] = [];
   const orig = globalThis.fetch;
   globalThis.fetch = (async () => {
@@ -274,15 +274,22 @@ test("sweepUsageRefresh refreshes stale authenticated anthropic accounts, skips 
     const accounts = [
       stale("idle-stale"), // should refresh: never checked, no traffic
       stale("fresh", { usage: { rateLimitStatus: { unifiedStatus: "allowed", windows: [], updatedAt: Date.now() }, lastUsageCheckAt: Date.now() } }), // fresh -> TTL skip
-      stale("codex", { provider: "openai" }), // not an anthropic account
+      stale("codex", { provider: "openai" }), // routed to maybeRefreshCodexUsage, not skipped
       stale("logged-out", { authenticated: false }), // no creds to call with
     ];
     const mgr = mgrSpy({
       listAccounts: () => accounts,
       recordUsageSnapshot: (n: string, _s: any) => fetchedNames.push(n),
+      // No OpenAI creds on file: the codex account is attempted (not skipped)
+      // but fails closed via ensureFreshToken -> fetchCodexUsageSnapshot
+      // returning null, so it lands in recordUsageCheckError rather than
+      // fetchedNames. This keeps the outcome deterministic instead of
+      // depending on an unstubbed getOpenAICreds throwing.
+      getOpenAICreds: () => null,
     });
     await sweepUsageRefresh(mgr, loadConfig());
     expect(fetchedNames).toEqual(["idle-stale"]);
+    expect(mgr.errors).toContain("codex usage refresh failed (see logs)");
   } finally {
     globalThis.fetch = orig;
   }
