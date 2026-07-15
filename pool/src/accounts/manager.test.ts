@@ -43,7 +43,7 @@ function tempPool(
 
 function win(key: string, overrides: Partial<RateLimitWindow> = {}): RateLimitWindow {
   const model = key.split(/[-_]/).find((t) => !/^\d/.test(t)) ?? null;
-  return { key, model, status: "allowed", utilization: null, reset: null, ...overrides };
+  return { key, model, status: null, utilization: null, reset: null, ...overrides };
 }
 
 function snapshot(windows: RateLimitWindow[]): RateLimitSnapshot {
@@ -443,6 +443,46 @@ test("an account with a spent window is available again once its reset has passe
 
     const acct = mgr.getAccount("reset-account");
     expect(acct.available).toBe(true);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("getAccount() keeps an explicitly-allowed window available even at 100% utilization", () => {
+  const { poolDir, mgr } = tempPool(["unenforced"]);
+  try {
+    mgr.recordRateLimitSnapshot(
+      "unenforced",
+      snapshot([win("7d", { status: "allowed", utilization: 1, reset: Date.now() + 7 * 24 * 60 * 60_000 })]),
+    );
+    expect(mgr.getAccount("unenforced").available).toBe(true);
+    expect(mgr.pick()?.name).toBe("unenforced");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("recordUsageSnapshot does not sideline an explicitly-allowed window at 100%", () => {
+  const { poolDir, mgr } = tempPool(["acct"]);
+  try {
+    mgr.recordUsageSnapshot(
+      "acct",
+      snapshot([win("7d", { status: "allowed", utilization: 1, reset: Date.now() + 7 * 24 * 60 * 60_000 })]),
+    );
+    const u = mgr.listAccounts().find((a) => a.name === "acct")!.usage;
+    expect(u.rateLimitedUntil).toBeNull();
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("recordUsageSnapshot still sidelines an explicitly-rejected window at 100%", () => {
+  const { poolDir, mgr } = tempPool(["acct"]);
+  try {
+    const resetAt = Date.now() + 3_600_000;
+    mgr.recordUsageSnapshot("acct", snapshot([win("7d", { status: "rejected", utilization: 1, reset: resetAt })]));
+    const u = mgr.listAccounts().find((a) => a.name === "acct")!.usage;
+    expect(u.rateLimitedUntil).toBe(resetAt);
   } finally {
     rmSync(poolDir, { recursive: true, force: true });
   }

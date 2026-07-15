@@ -953,9 +953,11 @@ export class AccountManager {
    * model-scoped Fable window may only appear on Fable requests), so a window
    * absent from the latest snapshot is presumed still in effect, not cleared.
    */
-  recordRateLimitSnapshot(name: string, snapshot: RateLimitSnapshot): void {
+  recordRateLimitSnapshot(name: string, snapshot: RateLimitSnapshot, replace = false): void {
     const u = this.usageFor(name);
-    u.rateLimitStatus = mergeRateLimitSnapshot(u.rateLimitStatus, snapshot);
+    u.rateLimitStatus = replace
+      ? replaceRateLimitSnapshot(u.rateLimitStatus, snapshot)
+      : mergeRateLimitSnapshot(u.rateLimitStatus, snapshot);
     this.saveState();
   }
 
@@ -1306,7 +1308,10 @@ function activeTier(accounts: Account[]): Account[] {
  * no window reports a utilization.
  */
 function headroomOf(windows: RateLimitWindow[]): number {
-  const utilizations = windows.map((w) => w.utilization).filter((u): u is number => u != null);
+  const utilizations = windows
+    .filter((w) => !(isAllowedStatus(w.status) && w.utilization != null && w.utilization >= 1))
+    .map((w) => w.utilization)
+    .filter((u): u is number => u != null);
   if (utilizations.length === 0) return 1;
   return Math.max(0, 1 - Math.max(...utilizations));
 }
@@ -1337,7 +1342,7 @@ function longestBindingWindows(usage: AccountUsage, modelFamily: string | null, 
  */
 function candidateExpiryReset(usage: AccountUsage, modelFamily: string | null, now: number): number | null {
   const resets = longestBindingWindows(usage, modelFamily, now)
-    .filter((w) => w.reset != null && w.reset > now && (w.utilization == null || w.utilization < 1))
+    .filter((w) => w.reset != null && w.reset > now && !isSpentWindow(w))
     .map((w) => w.reset!);
   return resets.length > 0 ? Math.min(...resets) : null;
 }
@@ -1349,7 +1354,7 @@ function candidateExpiryReset(usage: AccountUsage, modelFamily: string | null, n
  * account ranks LAST instead of inheriting an unprobed account's first-place rank.
  */
 function weeklyWindowSpent(usage: AccountUsage, modelFamily: string | null, now: number): boolean {
-  return longestBindingWindows(usage, modelFamily, now).some((w) => w.utilization != null && w.utilization >= 1);
+  return longestBindingWindows(usage, modelFamily, now).some(isSpentWindow);
 }
 
 /**
@@ -1406,6 +1411,23 @@ function isBlockingStatus(status: string | null): boolean {
   return s === "rejected" || s === "blocked" || s === "exhausted";
 }
 
+/** A unified-window status that explicitly says the window is currently servable. */
+function isAllowedStatus(status: string | null): boolean {
+  return status != null && status.toLowerCase() === "allowed";
+}
+
+/**
+ * True when a window will 429 if routed to: explicitly blocking, OR fully
+ * utilized WITHOUT an explicit "allowed" status. An explicit "allowed" overrides
+ * a full utilization — Codex reports used_percent:100 with allowed:true while a
+ * limit is unenforced, and such an account still serves.
+ */
+function isSpentWindow(w: RateLimitWindow): boolean {
+  if (isBlockingStatus(w.status)) return true;
+  if (isAllowedStatus(w.status)) return false;
+  return w.utilization != null && w.utilization >= 1;
+}
+
 /**
  * Soonest future reset among windows Anthropic currently reports as blocking
  * (fully consumed or explicitly rejected). Used as markRateLimited's fallback
@@ -1416,7 +1438,7 @@ function isBlockingStatus(status: string | null): boolean {
 function blockingWindowReset(rl: RateLimitSnapshot | null, now: number): number | null {
   if (!rl?.windows) return null;
   const resets = rl.windows
-    .filter((w) => (w.utilization != null && w.utilization >= 1) || isBlockingStatus(w.status))
+    .filter(isSpentWindow)
     .filter((w) => w.reset != null && w.reset > now)
     .map((w) => w.reset!);
   return resets.length > 0 ? Math.min(...resets) : null;
@@ -1430,7 +1452,7 @@ function blockingWindowReset(rl: RateLimitSnapshot | null, now: number): number 
  */
 function spentWindowReason(windows: RateLimitWindow[], now: number): string | null {
   for (const w of windows) {
-    const spent = (w.utilization != null && w.utilization >= 1) || isBlockingStatus(w.status);
+    const spent = isSpentWindow(w);
     if (spent && w.reset != null && w.reset > now) {
       const mins = Math.ceil((w.reset - now) / 60000);
       return `usage limit reached (${w.key} window) — resets in ~${mins} min`;
