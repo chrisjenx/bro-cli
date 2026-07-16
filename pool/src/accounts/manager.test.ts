@@ -1698,6 +1698,28 @@ test("recordUsageSnapshot keeps the rate-limit error while a window still blocks
   }
 });
 
+test("recordUsageSnapshot clears a still-future cooldown once ground truth shows nothing blocking", () => {
+  const { poolDir, mgr } = tempPool(["acct"]);
+  try {
+    // A 429 sidelined the account with a far-future reset (e.g. a weekly
+    // window ~135h out), then the provider reset the limit early.
+    mgr.markRateLimited("acct", Date.now() + 135 * 3_600_000);
+    // The next ground-truth poll shows every window healthy and allowed, so the
+    // 429's reset-at is stale — un-sideline instead of waiting it out.
+    mgr.recordUsageSnapshot(
+      "acct",
+      snapshot([win("7d", { status: "allowed", utilization: 0, reset: Date.now() + 168 * 3_600_000 })]),
+    );
+    const acct = mgr.listAccounts().find((a) => a.name === "acct")!;
+    expect(acct.usage.rateLimitedUntil).toBeNull();
+    expect(acct.usage.lastError).toBeNull();
+    expect(acct.available).toBe(true);
+    expect(acct.unavailableReason).toBeNull();
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
 describe("pickProvider", () => {
   // One anthropic account + one openai account, mirroring the "provider-aware
   // pick" describe block's fixture-construction calls.

@@ -143,6 +143,14 @@ export interface ProviderCandidate {
 
 const defaultKeychainOps: KeychainOps = { read: readKeychainCreds, delete: deleteKeychainCreds };
 
+/**
+ * lastError marker written by markRateLimited when an account is sidelined by a
+ * 429. recordUsageSnapshot matches on it to clear a stale sideline, so the set
+ * and clear sites must share one string. (Kept as-is for both providers — Codex
+ * 429s write it too — to avoid changing the persisted/displayed value.)
+ */
+const RATE_LIMITED_LAST_ERROR = "rate limited by Anthropic";
+
 export class AccountManager {
   private config: Config;
   private usage: Record<string, AccountUsage> = {};
@@ -940,7 +948,7 @@ export class AccountManager {
     const now = Date.now();
     u.rateLimitedUntil =
       resetAt ?? blockingWindowReset(u.rateLimitStatus, now) ?? now + this.config.rateLimitCooldownMs;
-    u.lastError = "rate limited by Anthropic";
+    u.lastError = RATE_LIMITED_LAST_ERROR;
     // Drop pins so sessions reroute away from this account.
     this.sessions.evictAccount(name);
     this.saveState();
@@ -983,14 +991,16 @@ export class AccountManager {
     const blockingReset = blockingWindowReset(u.rateLimitStatus, now);
     if (blockingReset != null) {
       u.rateLimitedUntil = Math.max(u.rateLimitedUntil ?? 0, blockingReset);
-    } else if (
-      u.lastError === "rate limited by Anthropic" &&
-      (u.rateLimitedUntil == null || u.rateLimitedUntil <= now)
-    ) {
-      // Ground truth says nothing blocks and the cooldown has lapsed: the
-      // rate-limit note is stale. Only recordSuccess clears lastError otherwise,
-      // and a benched account may not serve for a long time.
-      u.lastError = null;
+    } else {
+      // Ground truth says nothing blocks. A cooldown still pending from an
+      // earlier 429 (whose reset-at may sit far in the future, e.g. a weekly
+      // window) is now stale — the provider reset the limit — so drop it and
+      // un-sideline rather than wait out a timestamp reality has overtaken.
+      // Extend-only above still guards the case where a window is genuinely
+      // still blocking; here there is none. Only recordSuccess would otherwise
+      // clear these, and a benched account may not serve for a long time.
+      u.rateLimitedUntil = null;
+      if (u.lastError === RATE_LIMITED_LAST_ERROR) u.lastError = null;
     }
     this.saveState();
   }
