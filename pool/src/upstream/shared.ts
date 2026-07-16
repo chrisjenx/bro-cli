@@ -155,3 +155,53 @@ export function retryAfterMs(headers: Headers): number | undefined {
   if (Number.isFinite(parsed)) return parsed;
   return undefined;
 }
+
+export interface OverloadBackoffOpts {
+  /** Base delay, doubled per attempt. */
+  baseMs: number;
+  /** Hard cap on any single sleep. */
+  maxDelayMs: number;
+}
+
+/**
+ * Delay before the next same-account retry of a transient overload.
+ * A future `resetAt` (from Retry-After/reset headers) wins, capped at
+ * `maxDelayMs` so a huge value can't stall the request. Otherwise full jitter
+ * over the exponential ceiling `min(maxDelayMs, baseMs * 2**attempt)`.
+ * `rand`/`now` are injectable for deterministic tests.
+ */
+export function overloadBackoffMs(
+  attempt: number,
+  opts: OverloadBackoffOpts,
+  resetAt?: number,
+  rand: () => number = Math.random,
+  now: () => number = Date.now,
+): number {
+  if (resetAt !== undefined) {
+    const wait = resetAt - now();
+    if (wait > 0) return Math.min(wait, opts.maxDelayMs);
+  }
+  const ceiling = Math.min(opts.maxDelayMs, opts.baseMs * 2 ** attempt);
+  return rand() * ceiling;
+}
+
+/**
+ * Sleep `ms`, but resolve `false` immediately (or as soon as possible) if
+ * `signal` is/gets aborted — so a client disconnect cuts the backoff short.
+ * Resolves `true` when the delay elapses normally. Cleans up its timer and
+ * listener on either outcome.
+ */
+export function sleepWithAbort(ms: number, signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) return Promise.resolve(false);
+  return new Promise<boolean>((resolve) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve(false);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve(true);
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
