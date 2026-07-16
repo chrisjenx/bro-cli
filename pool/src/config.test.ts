@@ -1,7 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { loadConfig } from "./config.ts";
 
-const ENV_KEYS = ["TOKEN_REFRESH_TIMEOUT_MS", "STREAM_KEEPALIVE_MS"] as const;
+const ENV_KEYS = [
+  "TOKEN_REFRESH_TIMEOUT_MS",
+  "STREAM_KEEPALIVE_MS",
+  "OVERLOAD_RETRY_MAX",
+  "OVERLOAD_RETRY_BASE_MS",
+  "OVERLOAD_RETRY_MAX_DELAY_MS",
+] as const;
 const originalEnv: Record<string, string | undefined> = {};
 for (const key of ENV_KEYS) originalEnv[key] = process.env[key];
 
@@ -44,4 +50,21 @@ test("usage-refresh config defaults", () => {
   expect(c.usageRefreshTtlMs).toBe(120_000);
   expect(c.usageFetchTimeoutMs).toBe(2500);
   expect(c.usageUserAgent).toBe("claude-code/2.1.207");
+});
+
+test("overload backoff config defaults", () => {
+  const c = loadConfig();
+  expect(c.overloadRetryMax).toBe(4);
+  expect(c.overloadRetryBaseMs).toBe(500);
+  expect(c.overloadRetryMaxDelayMs).toBe(8000);
+});
+
+test("overload backoff knobs are env-overridable and floored at 0", () => {
+  process.env.OVERLOAD_RETRY_MAX = "0"; // 0 is valid: disables backoff
+  process.env.OVERLOAD_RETRY_BASE_MS = "-100"; // below floor → clamped to 0
+  process.env.OVERLOAD_RETRY_MAX_DELAY_MS = "1500";
+  const c = loadConfig();
+  expect(c.overloadRetryMax).toBe(0);
+  expect(c.overloadRetryBaseMs).toBe(0);
+  expect(c.overloadRetryMaxDelayMs).toBe(1500);
 });
