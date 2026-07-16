@@ -43,11 +43,9 @@ interface RetryReason {
   /** Transient upstream overload (529/500/503 or SSE overloaded_error) — retry same account with backoff. */
   transient: boolean;
   resetAt?: number;
-  /** Raw upstream error body, captured so surfaceOverload can replay it verbatim (HTTP path only). */
+  /** Raw upstream error body + headers, captured so surfaceOverload can replay them verbatim (HTTP path only). */
   bodyText?: string;
-  contentType?: string;
-  retryAfter?: string;
-  requestId?: string;
+  headers?: Headers;
 }
 
 type AttemptResult =
@@ -93,13 +91,16 @@ export async function proxyAnthropicMessages(
   // switched from a gpt-* to a claude-* model recoverable without user
   // intervention; genuine caller content is untouched.
   const bodyText = JSON.stringify(stripCodexThinking(body) ?? {});
+  // Computed once from the already-parsed body; threaded into every attempt so
+  // the backoff loop doesn't re-JSON.parse bodyText on each retry.
+  const streamRequested = Boolean(asObject(body)?.stream);
   const tried = new Set<string>();
   let account: Account | null = first;
   let lastRetry: RetryReason | null = null;
 
   while (account) {
     tried.add(account.name);
-    const attempt = await tryAccount(account, bodyText, incomingHeaders, mgr, config, signal);
+    const attempt = await tryAccount(account, bodyText, incomingHeaders, mgr, config, signal, streamRequested);
 
     if (attempt.kind === "response") {
       if (sessionKey) mgr.setAffinity(sessionKey, account.name);
@@ -129,31 +130,33 @@ async function tryAccount(
   mgr: AccountManager,
   config: Config,
   signal: AbortSignal,
+  streamRequested: boolean,
 ): Promise<AttemptResult> {
   const opts = { baseMs: config.overloadRetryBaseMs, maxDelayMs: config.overloadRetryMaxDelayMs };
+  // Backoff budget spent (or client gone): record the overload once, at surface
+  // time, and hand the caller the faithful upstream error.
+  const surface = (reason: RetryReason): AttemptResult => {
+    mgr.recordError(account.name, reason.message);
+    return { kind: "terminal", response: surfaceOverload(reason, account.name) };
+  };
   let attempt = 0;
   while (true) {
-    const result = await attemptOnce(account, bodyText, incomingHeaders, mgr, config, signal);
+    const result = await attemptOnce(account, bodyText, incomingHeaders, mgr, config, signal, streamRequested);
     // Success, terminal, or a 429 rate-limit retry all pass straight up; only a
     // transient overload retry is handled here (same-account backoff).
     if (result.kind !== "retry" || !result.reason.transient) return result;
+    const reason = result.reason;
 
-    if (attempt >= config.overloadRetryMax) {
-      mgr.recordError(account.name, result.reason.message);
-      return { kind: "terminal", response: surfaceOverload(result.reason, account.name) };
-    }
+    if (attempt >= config.overloadRetryMax) return surface(reason);
 
-    const delay = overloadBackoffMs(attempt, opts, result.reason.resetAt);
+    const delay = overloadBackoffMs(attempt, opts, reason.resetAt);
     if (config.logFailover) {
       console.log(
-        `  ⏳ overloaded (${result.reason.status}) on "${account.name}" — retry ${attempt + 1}/${config.overloadRetryMax} in ~${Math.round(delay)}ms`,
+        `  ⏳ overloaded (${reason.status}) on "${account.name}" — retry ${attempt + 1}/${config.overloadRetryMax} in ~${Math.round(delay)}ms`,
       );
     }
-    if (!(await sleepWithAbort(delay, signal))) {
-      // Client disconnected mid-backoff — stop and surface the last overload.
-      mgr.recordError(account.name, result.reason.message);
-      return { kind: "terminal", response: surfaceOverload(result.reason, account.name) };
-    }
+    // Client disconnected mid-backoff — stop and surface the last overload.
+    if (!(await sleepWithAbort(delay, signal))) return surface(reason);
     attempt += 1;
   }
 }
@@ -165,6 +168,7 @@ async function attemptOnce(
   mgr: AccountManager,
   config: Config,
   signal: AbortSignal,
+  streamRequested: boolean,
 ): Promise<AttemptResult> {
   let upstream: FetchResult;
   try {
@@ -190,7 +194,6 @@ async function attemptOnce(
     mgr.recordRateLimitSnapshot(account.name, parseRateLimitSnapshot(upstream.response.headers));
   }
 
-  const streamRequested = bodyRequestsStream(bodyText);
   const contentType = upstream.response.headers.get("content-type") ?? "";
   const isSse = streamRequested || contentType.toLowerCase().includes("text/event-stream");
 
@@ -487,9 +490,7 @@ function classifyHttpError(status: number, headers: Headers, text: string): Retr
     transient,
     resetAt: resetAtFromHeaders(headers),
     bodyText: text,
-    contentType: headers.get("content-type") ?? undefined,
-    retryAfter: headers.get("retry-after") ?? undefined,
-    requestId: headers.get("request-id") ?? undefined,
+    headers,
   };
 }
 
@@ -619,16 +620,21 @@ function responseFromUpstreamText(text: string, upstream: Response, accountName:
 
 /**
  * Build the client-facing response when overload survives the backoff budget.
- * Replays the real upstream error as closely as possible — the SDK reads
- * `retry-after` to pace its own retries and surfaces `request-id`. For the
- * SSE-origin case (no HTTP body) it synthesizes the Anthropic error shape.
+ * Replays the real upstream error as closely as possible: the captured upstream
+ * headers go through the same `responseHeaders` path as every other proxied
+ * response (hop-by-hop stripped, `X-Pool-Account` set), so the SDK's
+ * `retry-after`/`request-id` and any other diagnostic headers survive. For the
+ * SSE-origin case (no HTTP headers/body) it synthesizes the Anthropic error
+ * shape and derives `retry-after` from any known reset time.
  */
 function surfaceOverload(reason: RetryReason, accountName: string): Response {
-  const headers = new Headers({ "content-type": reason.contentType ?? "application/json" });
-  const retryAfter = reason.retryAfter ?? retryAfterHeaderFrom(reason.resetAt);
-  if (retryAfter) headers.set("retry-after", retryAfter);
-  if (reason.requestId) headers.set("request-id", reason.requestId);
-  headers.set("X-Pool-Account", accountName);
+  const headers = reason.headers
+    ? responseHeaders(reason.headers, accountName)
+    : new Headers({ "content-type": "application/json", "X-Pool-Account": accountName });
+  if (!headers.get("retry-after")) {
+    const retryAfter = retryAfterHeaderFrom(reason.resetAt);
+    if (retryAfter) headers.set("retry-after", retryAfter);
+  }
   const body =
     reason.bodyText ??
     JSON.stringify({ type: "error", error: { type: reason.type, message: reason.message } });
@@ -674,11 +680,6 @@ export function extractSessionKey(body: unknown): string | undefined {
   const metadata = objectProp(asObject(body), "metadata");
   const userId = stringProp(metadata, "user_id");
   return userId || undefined;
-}
-
-function bodyRequestsStream(bodyText: string): boolean {
-  const body = parseJson(bodyText);
-  return Boolean(body?.stream);
 }
 
 function noAccountMessage(mgr: AccountManager): string {
