@@ -275,7 +275,7 @@ async function prepareStreamingResponse(
   const tap = new StreamUsageTap(mgr, account.name);
 
   try {
-    while (!tap.committed && !tap.initialRateLimit && prefixBytes < 64 * 1024) {
+    while (!tap.committed && !tap.initialRateLimit && !tap.initialTransient && prefixBytes < 64 * 1024) {
       const { value, done } = await reader.read();
       if (done) {
         tap.finish();
@@ -300,6 +300,14 @@ async function prepareStreamingResponse(
       upstream.cleanup();
       mgr.markRateLimited(account.name, tap.initialRateLimit.resetAt);
       return { kind: "retry", reason: tap.initialRateLimit };
+    }
+
+    if (tap.initialTransient) {
+      await reader.cancel().catch(() => {});
+      upstream.cleanup();
+      // Overload is not the account's fault — do not sideline or recordError
+      // here; tryAccount's backoff loop retries the same account.
+      return { kind: "retry", reason: tap.initialTransient };
     }
 
     const stream = streamWithTap(reader, prefix, tap, upstream.cleanup);
@@ -371,6 +379,7 @@ function streamWithTap(
 class StreamUsageTap {
   committed = false;
   initialRateLimit: RetryReason | null = null;
+  initialTransient: RetryReason | null = null;
 
   private parser = new SseParser((event) => this.onEvent(event));
   private usage: CliUsage = { input_tokens: 0, output_tokens: 0 };
@@ -425,6 +434,10 @@ class StreamUsageTap {
       if (!this.committed && reason.rateLimited) {
         this.initialRateLimit = reason;
         return;
+      }
+      if (!this.committed && reason.transient) {
+        this.initialTransient = reason;
+        return; // do NOT fall through to `this.committed = true`
       }
       this.sawError = true;
       this.finalError = reason;
@@ -485,9 +498,11 @@ function classifySseError(data: Record<string, unknown> | null): RetryReason {
   const type = stringProp(error, "type") ?? "api_error";
   const message = stringProp(error, "message") ?? "Anthropic streaming error";
   const rateLimited = isRateLimit(type, message);
-  // SSE-origin overload retry is out of scope for this task (see Task 4);
-  // transient stays false here so the existing sawError/finalError path is unchanged.
-  return { status: rateLimited ? 429 : 502, type, message, rateLimited, transient: false };
+  const transient = !rateLimited && type === "overloaded_error";
+  // Overload as a stream event must surface as 529 (not 502) so it stays in
+  // CROSS_PROVIDER_RETRY_STATUSES and the client sees the status it handles.
+  const status = rateLimited ? 429 : transient ? 529 : 502;
+  return { status, type, message, rateLimited, transient };
 }
 
 function isRateLimit(type: string, message: string): boolean {

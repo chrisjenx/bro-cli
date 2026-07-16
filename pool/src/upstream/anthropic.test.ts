@@ -579,3 +579,56 @@ test("OVERLOAD_RETRY_MAX=0 surfaces the 529 immediately with passthrough fidelit
     rmSync(poolDir, { recursive: true, force: true });
   }
 });
+
+const OVERLOAD_SSE =
+  'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}\n\n';
+
+test("retries a pre-commit SSE overloaded_error on the same account, then streams success", async () => {
+  const { poolDir, mgr, config } = tempPool(["a", "b"]);
+  try {
+    const successSse =
+      'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":4,"output_tokens":0}}}\n\n' +
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n' +
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+    let n = 0;
+    const calls = mockFetch(() => {
+      n += 1;
+      return n === 1 ? sseResponse(OVERLOAD_SSE) : sseResponse(successSse);
+    });
+
+    const response = await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", max_tokens: 8, stream: true, messages: [{ role: "user", content: "hi" }] },
+      new Headers(),
+      mgr,
+      backoffConfig(config),
+      new AbortController().signal,
+    );
+
+    expect(response.status).toBe(200);
+    // Client sees only the success stream — never the overload error event.
+    expect(await drain(response)).toBe(successSse);
+    expect(calls.map((c) => c.headers.get("authorization"))).toEqual(["Bearer tok-a", "Bearer tok-a"]);
+    expect(mgr.getAccount("a").available).toBe(true);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("surfaces status 529 (not 502) when a pre-commit SSE overload never clears", async () => {
+  const { poolDir, mgr, config } = tempPool(["a"]);
+  try {
+    const calls = mockFetch(() => sseResponse(OVERLOAD_SSE));
+    const response = await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", max_tokens: 8, stream: true, messages: [{ role: "user", content: "hi" }] },
+      new Headers(),
+      mgr,
+      backoffConfig(config, 2),
+      new AbortController().signal,
+    );
+    expect(response.status).toBe(529); // eligible for cross-provider last resort
+    expect(calls).toHaveLength(3); // overloadRetryMax(2) + 1
+    expect(mgr.getAccount("a").available).toBe(true);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
