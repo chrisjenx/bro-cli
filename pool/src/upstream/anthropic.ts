@@ -23,6 +23,8 @@ import {
   numberProp,
   isRateLimit as isRateLimitShared,
   retryAfterMs,
+  overloadBackoffMs,
+  sleepWithAbort,
 } from "./shared.ts";
 import type { SseEvent } from "./shared.ts";
 import { accessTokenFor } from "./oauth-token.ts";
@@ -38,7 +40,14 @@ interface RetryReason {
   type: string;
   message: string;
   rateLimited: boolean;
+  /** Transient upstream overload (529/500/503 or SSE overloaded_error) — retry same account with backoff. */
+  transient: boolean;
   resetAt?: number;
+  /** Raw upstream error body, captured so surfaceOverload can replay it verbatim (HTTP path only). */
+  bodyText?: string;
+  contentType?: string;
+  retryAfter?: string;
+  requestId?: string;
 }
 
 type AttemptResult =
@@ -121,6 +130,42 @@ async function tryAccount(
   config: Config,
   signal: AbortSignal,
 ): Promise<AttemptResult> {
+  const opts = { baseMs: config.overloadRetryBaseMs, maxDelayMs: config.overloadRetryMaxDelayMs };
+  let attempt = 0;
+  while (true) {
+    const result = await attemptOnce(account, bodyText, incomingHeaders, mgr, config, signal);
+    // Success, terminal, or a 429 rate-limit retry all pass straight up; only a
+    // transient overload retry is handled here (same-account backoff).
+    if (result.kind !== "retry" || !result.reason.transient) return result;
+
+    if (attempt >= config.overloadRetryMax) {
+      mgr.recordError(account.name, result.reason.message);
+      return { kind: "terminal", response: surfaceOverload(result.reason, account.name) };
+    }
+
+    const delay = overloadBackoffMs(attempt, opts, result.reason.resetAt);
+    if (config.logFailover) {
+      console.log(
+        `  ⏳ overloaded (${result.reason.status}) on "${account.name}" — retry ${attempt + 1}/${config.overloadRetryMax} in ~${Math.round(delay)}ms`,
+      );
+    }
+    if (!(await sleepWithAbort(delay, signal))) {
+      // Client disconnected mid-backoff — stop and surface the last overload.
+      mgr.recordError(account.name, result.reason.message);
+      return { kind: "terminal", response: surfaceOverload(result.reason, account.name) };
+    }
+    attempt += 1;
+  }
+}
+
+async function attemptOnce(
+  account: Account,
+  bodyText: string,
+  incomingHeaders: Headers,
+  mgr: AccountManager,
+  config: Config,
+  signal: AbortSignal,
+): Promise<AttemptResult> {
   let upstream: FetchResult;
   try {
     upstream = await fetchWithAccount(account, bodyText, incomingHeaders, mgr, config, signal, false);
@@ -155,6 +200,12 @@ async function tryAccount(
     const reason = classifyHttpError(upstream.response.status, upstream.response.headers, text);
     if (reason.rateLimited) {
       mgr.markRateLimited(account.name, reason.resetAt);
+      return { kind: "retry", reason };
+    }
+    if (reason.transient) {
+      // Overload/5xx: let tryAccount's backoff loop retry the SAME account.
+      // recordError is deferred to surface time so a healthy account isn't
+      // spammed with "Overloaded" on every capacity blip.
       return { kind: "retry", reason };
     }
     mgr.recordError(account.name, reason.message);
@@ -414,7 +465,19 @@ function classifyHttpError(status: number, headers: Headers, text: string): Retr
   const type = stringProp(error, "type") ?? (status === 429 ? "rate_limit_error" : "api_error");
   const message = stringProp(error, "message") ?? (text.slice(0, 500) || `Anthropic API returned HTTP ${status}`);
   const rateLimited = status === 429 || isRateLimit(type, message);
-  return { status, type, message, rateLimited, resetAt: resetAtFromHeaders(headers) };
+  const transient = !rateLimited && (status === 529 || status === 500 || status === 503);
+  return {
+    status,
+    type,
+    message,
+    rateLimited,
+    transient,
+    resetAt: resetAtFromHeaders(headers),
+    bodyText: text,
+    contentType: headers.get("content-type") ?? undefined,
+    retryAfter: headers.get("retry-after") ?? undefined,
+    requestId: headers.get("request-id") ?? undefined,
+  };
 }
 
 function classifySseError(data: Record<string, unknown> | null): RetryReason {
@@ -422,7 +485,9 @@ function classifySseError(data: Record<string, unknown> | null): RetryReason {
   const type = stringProp(error, "type") ?? "api_error";
   const message = stringProp(error, "message") ?? "Anthropic streaming error";
   const rateLimited = isRateLimit(type, message);
-  return { status: rateLimited ? 429 : 502, type, message, rateLimited };
+  // SSE-origin overload retry is out of scope for this task (see Task 4);
+  // transient stays false here so the existing sawError/finalError path is unchanged.
+  return { status: rateLimited ? 429 : 502, type, message, rateLimited, transient: false };
 }
 
 function isRateLimit(type: string, message: string): boolean {
@@ -499,7 +564,7 @@ function resetAtFromHeaders(headers: Headers): number | undefined {
 }
 
 function authOrNetworkReason(message: string): RetryReason {
-  return { status: 401, type: "authentication_error", message, rateLimited: false };
+  return { status: 401, type: "authentication_error", message, rateLimited: false, transient: false };
 }
 
 function upstreamHeaders(incoming: Headers, token: string): Headers {
@@ -535,6 +600,30 @@ function responseFromUpstreamText(text: string, upstream: Response, accountName:
     statusText: upstream.statusText,
     headers: responseHeaders(upstream.headers, accountName),
   });
+}
+
+/**
+ * Build the client-facing response when overload survives the backoff budget.
+ * Replays the real upstream error as closely as possible — the SDK reads
+ * `retry-after` to pace its own retries and surfaces `request-id`. For the
+ * SSE-origin case (no HTTP body) it synthesizes the Anthropic error shape.
+ */
+function surfaceOverload(reason: RetryReason, accountName: string): Response {
+  const headers = new Headers({ "content-type": reason.contentType ?? "application/json" });
+  const retryAfter = reason.retryAfter ?? retryAfterHeaderFrom(reason.resetAt);
+  if (retryAfter) headers.set("retry-after", retryAfter);
+  if (reason.requestId) headers.set("request-id", reason.requestId);
+  headers.set("X-Pool-Account", accountName);
+  const body =
+    reason.bodyText ??
+    JSON.stringify({ type: "error", error: { type: reason.type, message: reason.message } });
+  return new Response(body, { status: reason.status, headers });
+}
+
+function retryAfterHeaderFrom(resetAt: number | undefined): string | undefined {
+  if (resetAt === undefined) return undefined;
+  const secs = Math.ceil((resetAt - Date.now()) / 1000);
+  return secs > 0 ? String(secs) : undefined;
 }
 
 function responseHeaders(source: Headers, accountName: string): Headers {

@@ -444,3 +444,138 @@ test("streams upstream SSE bytes through unchanged and records final usage", asy
     rmSync(poolDir, { recursive: true, force: true });
   }
 });
+
+// Overload backoff: base/maxDelay zeroed for instant sleeps, small max for crisp call counts.
+function backoffConfig(config: Config, overloadRetryMax = 2): Config {
+  return { ...config, overloadRetryMax, overloadRetryBaseMs: 0, overloadRetryMaxDelayMs: 0 };
+}
+
+test("retries a 529 on the SAME account and returns the eventual success", async () => {
+  const { poolDir, mgr, config } = tempPool(["a", "b"]);
+  try {
+    let n = 0;
+    const calls = mockFetch(() => {
+      n += 1;
+      if (n === 1) {
+        return jsonResponse(
+          { type: "error", error: { type: "overloaded_error", message: "Overloaded" } },
+          529,
+        );
+      }
+      return jsonResponse({
+        type: "message",
+        content: [{ type: "text", text: "ok" }],
+        usage: { input_tokens: 2, output_tokens: 3 },
+      });
+    });
+
+    const response = await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", max_tokens: 8, messages: [{ role: "user", content: "hi" }] },
+      new Headers(),
+      mgr,
+      backoffConfig(config),
+      new AbortController().signal,
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-Pool-Account")).toBe("a");
+    // Two calls, both on account "a" — never failed over to "b".
+    expect(calls.map((c) => c.headers.get("authorization"))).toEqual(["Bearer tok-a", "Bearer tok-a"]);
+    expect(mgr.getAccount("a").available).toBe(true);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("surfaces a persistent 529 faithfully after the budget, without failing over", async () => {
+  const { poolDir, mgr, config } = tempPool(["a", "b"]);
+  try {
+    // Spy on recordError to prove it runs exactly once (at surface time).
+    const errors: string[] = [];
+    const orig = mgr.recordError.bind(mgr);
+    mgr.recordError = ((name: string, message: string) => {
+      errors.push(message);
+      return orig(name, message);
+    }) as typeof mgr.recordError;
+
+    const calls = mockFetch(() =>
+      jsonResponse(
+        { type: "error", error: { type: "overloaded_error", message: "Overloaded, retry" } },
+        529,
+        { "retry-after": "3", "request-id": "req_xyz" },
+      ),
+    );
+
+    const response = await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", max_tokens: 8, messages: [{ role: "user", content: "hi" }] },
+      new Headers(),
+      mgr,
+      backoffConfig(config, 2),
+      new AbortController().signal,
+    );
+
+    expect(response.status).toBe(529);
+    // overloadRetryMax(2) + 1 = 3 upstream calls, all on "a".
+    expect(calls).toHaveLength(3);
+    expect(calls.every((c) => c.headers.get("authorization") === "Bearer tok-a")).toBe(true);
+    // Faithful surface: original body + retry-after + request-id + X-Pool-Account.
+    expect(await response.json()).toMatchObject({
+      error: { type: "overloaded_error", message: "Overloaded, retry" },
+    });
+    expect(response.headers.get("retry-after")).toBe("3");
+    expect(response.headers.get("request-id")).toBe("req_xyz");
+    expect(response.headers.get("X-Pool-Account")).toBe("a");
+    // Not sidelined; recordError called once, not per attempt.
+    expect(mgr.getAccount("a").available).toBe(true);
+    expect(errors).toHaveLength(1);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("backs off and surfaces transient 500 and 503 like 529", async () => {
+  for (const status of [500, 503]) {
+    const { poolDir, mgr, config } = tempPool(["a"]);
+    try {
+      const calls = mockFetch(() =>
+        jsonResponse({ type: "error", error: { type: "api_error", message: "boom" } }, status),
+      );
+      const response = await proxyAnthropicMessages(
+        { model: "claude-sonnet-5", max_tokens: 8, messages: [{ role: "user", content: "hi" }] },
+        new Headers(),
+        mgr,
+        backoffConfig(config, 1),
+        new AbortController().signal,
+      );
+      expect(response.status).toBe(status);
+      expect(calls).toHaveLength(2); // 1 retry + initial
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("OVERLOAD_RETRY_MAX=0 surfaces the 529 immediately with passthrough fidelity", async () => {
+  const { poolDir, mgr, config } = tempPool(["a"]);
+  try {
+    const calls = mockFetch(() =>
+      jsonResponse(
+        { type: "error", error: { type: "overloaded_error", message: "Overloaded" } },
+        529,
+      ),
+    );
+    const response = await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", max_tokens: 8, messages: [{ role: "user", content: "hi" }] },
+      new Headers(),
+      mgr,
+      backoffConfig(config, 0),
+      new AbortController().signal,
+    );
+    expect(response.status).toBe(529);
+    expect(calls).toHaveLength(1);
+    expect(response.headers.get("X-Pool-Account")).toBe("a");
+    expect(await response.json()).toMatchObject({ error: { type: "overloaded_error" } });
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
