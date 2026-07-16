@@ -632,3 +632,33 @@ test("surfaces status 529 (not 502) when a pre-commit SSE overload never clears"
     rmSync(poolDir, { recursive: true, force: true });
   }
 });
+
+test("forwards a POST-commit SSE overloaded_error verbatim without retrying", async () => {
+  const { poolDir, mgr, config } = tempPool(["a", "b"]);
+  try {
+    const committedThenError =
+      'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":0}}}\n\n' +
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n' +
+      'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}\n\n';
+    const calls = mockFetch(() => sseResponse(committedThenError));
+
+    const response = await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", max_tokens: 8, stream: true, messages: [{ role: "user", content: "hi" }] },
+      new Headers(),
+      mgr,
+      config,
+      new AbortController().signal,
+    );
+
+    expect(response.status).toBe(200);
+    // Committed before the error → client receives the whole stream verbatim, error event included.
+    expect(await drain(response)).toBe(committedThenError);
+    // Exactly one upstream call: a post-commit overload must NOT be retried.
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.headers.get("authorization")).toBe("Bearer tok-a");
+    // Not sidelined (recording an error is fine; markRateLimited must not fire for overload).
+    expect(mgr.getAccount("a").available).toBe(true);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
