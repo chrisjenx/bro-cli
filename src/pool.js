@@ -19,7 +19,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { which, globalBinDirs, runInherit } from './proc.js';
 import { permissionArgs } from './launch.js';
-import { applyPoolEnv, clearPoolEnv, isPoolEnvActive } from './settings.js';
+import { applyPoolEnv, clearPoolEnv, isPoolEnvActive, POOL_SONNET_MODEL } from './settings.js';
 import { select, prompt, holdOrContinue } from './ui.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -485,11 +485,11 @@ export async function runPool({ extraArgs = [], permissionMode = 'auto', dryRun 
       backend: process.env.CLAUDE_POOL_BACKEND || 'oauth',
       baseUrl,
       accounts: listAccounts(),
-      settingsEnv: { ANTHROPIC_BASE_URL: b, ANTHROPIC_AUTH_TOKEN: token },
+      settingsEnv: { ANTHROPIC_BASE_URL: b, ANTHROPIC_AUTH_TOKEN: token, ANTHROPIC_DEFAULT_SONNET_MODEL: POOL_SONNET_MODEL },
       claude: {
         cmd: which('claude') || 'claude',
         args: [...permissionArgs(permissionMode), ...extraArgs],
-        env: { ANTHROPIC_BASE_URL: baseUrl }
+        env: { ANTHROPIC_BASE_URL: baseUrl, ANTHROPIC_DEFAULT_SONNET_MODEL: POOL_SONNET_MODEL }
       }
     };
   }
@@ -532,6 +532,9 @@ export async function runPool({ extraArgs = [], permissionMode = 'auto', dryRun 
   delete env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
   env.ANTHROPIC_BASE_URL = b;
   env.ANTHROPIC_AUTH_TOKEN = token;
+  // Pin the sonnet alias to its 1M variant so Claude Code budgets the full
+  // window instead of 200K behind the pool gateway (see POOL_SONNET_MODEL).
+  env.ANTHROPIC_DEFAULT_SONNET_MODEL = POOL_SONNET_MODEL;
   env.NODE_NO_WARNINGS = '1';
 
   const claudeArgs = [...permissionArgs(permissionMode), ...extraArgs];

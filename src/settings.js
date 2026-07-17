@@ -7,7 +7,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-const POOL_ENV_KEYS = ['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN'];
+// Pin Claude Code's `sonnet` alias to its 1M-context variant. Behind a custom
+// ANTHROPIC_BASE_URL (Claude Code treats the pool as an "LLM gateway") it can't
+// verify 1M support, so plain Sonnet is budgeted at 200K and auto-compacts
+// there; the `[1m]` suffix selects the full ~1M window. Claude Code strips the
+// `[1m]` before sending the request, so the pool still receives `claude-sonnet-5`.
+// Bump this when the Sonnet default version changes.
+export const POOL_SONNET_MODEL = 'claude-sonnet-5[1m]';
+
+const POOL_ENV_KEYS = ['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_DEFAULT_SONNET_MODEL'];
 
 // Where Claude Code actually reads settings from (honor CLAUDE_CONFIG_DIR), and
 // where bro records the pre-pool snapshot.
@@ -38,14 +46,33 @@ export function applyPoolEnv({ baseUrl, token }, paths = defaultPaths()) {
   const settings = readJson(paths.settings) || {};
   const env = { ...(settings.env || {}) };
 
-  if (!fs.existsSync(paths.state)) {
+  // Snapshot the user's pre-pool values once so clearPoolEnv restores them.
+  // Backfill keys introduced in a later bro version: a state file written before
+  // a key existed won't have snapshotted it, and env[k] is still the user's own
+  // value here (we overwrite below). The `!(k in prior)` guard stops already-
+  // managed keys from being re-snapshotted with the pool's own values. A present
+  // but unreadable state file is left alone (matches the original behaviour).
+  const stateExists = fs.existsSync(paths.state);
+  const state = stateExists ? readJson(paths.state) : null;
+  if (!stateExists) {
     const prior = {};
     for (const k of POOL_ENV_KEYS) prior[k] = k in env ? env[k] : null;
     writeJson(paths.state, { managed: true, prior });
+  } else if (state) {
+    const prior = { ...(state.prior || {}) };
+    let changed = false;
+    for (const k of POOL_ENV_KEYS) {
+      if (!(k in prior)) {
+        prior[k] = k in env ? env[k] : null;
+        changed = true;
+      }
+    }
+    if (changed) writeJson(paths.state, { ...state, prior });
   }
 
   env.ANTHROPIC_BASE_URL = baseUrl;
   env.ANTHROPIC_AUTH_TOKEN = token;
+  env.ANTHROPIC_DEFAULT_SONNET_MODEL = POOL_SONNET_MODEL;
   settings.env = env;
   writeJson(paths.settings, settings);
 }

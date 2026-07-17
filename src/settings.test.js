@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { applyPoolEnv, clearPoolEnv, isPoolEnvActive } from './settings.js';
+import { applyPoolEnv, clearPoolEnv, isPoolEnvActive, POOL_SONNET_MODEL } from './settings.js';
 
 function tmpPaths() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bro-settings-'));
@@ -19,6 +19,7 @@ test('apply adds env keys and preserves other settings', () => {
   const s = read(p.settings);
   assert.equal(s.env.ANTHROPIC_BASE_URL, POOL.baseUrl);
   assert.equal(s.env.ANTHROPIC_AUTH_TOKEN, POOL.token);
+  assert.equal(s.env.ANTHROPIC_DEFAULT_SONNET_MODEL, POOL_SONNET_MODEL);
   assert.equal(s.model, 'opus');
   assert.deepEqual(s.permissions, { defaultMode: 'auto' });
   assert.equal(isPoolEnvActive(p), true);
@@ -61,6 +62,24 @@ test('apply creates settings.json when absent, clear removes empty env', () => {
   clearPoolEnv(p);
   const s = read(p.settings);
   assert.ok(!('env' in s)); // empty env removed
+});
+
+test('clear restores a user ANTHROPIC_DEFAULT_SONNET_MODEL added before the key was managed', () => {
+  const p = tmpPaths();
+  // Simulate an older bro: the pool is already active (state file exists) but its
+  // snapshot predates the sonnet key, while the user has their own value set.
+  fs.writeFileSync(p.settings, JSON.stringify({
+    env: { ANTHROPIC_BASE_URL: POOL.baseUrl, ANTHROPIC_AUTH_TOKEN: POOL.token, ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-4-5' }
+  }));
+  fs.writeFileSync(p.state, JSON.stringify({ managed: true, prior: { ANTHROPIC_BASE_URL: null, ANTHROPIC_AUTH_TOKEN: null } }));
+
+  applyPoolEnv(POOL, p);
+  assert.equal(read(p.settings).env.ANTHROPIC_DEFAULT_SONNET_MODEL, POOL_SONNET_MODEL); // overridden while active
+
+  clearPoolEnv(p);
+  const s = read(p.settings);
+  assert.equal(s.env.ANTHROPIC_DEFAULT_SONNET_MODEL, 'claude-sonnet-4-5'); // user value backfilled + restored
+  assert.ok(!('ANTHROPIC_BASE_URL' in s.env)); // was absent pre-pool → stays absent
 });
 
 test('apply twice keeps the original snapshot', () => {

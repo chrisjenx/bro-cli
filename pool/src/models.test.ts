@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import { loadModelTable, resolveModel, DEFAULT_MODEL_TABLE, loadModelConfig, saveModelConfig, DEFAULT_MAPPINGS, type ModelConfig, mappingFor, type ModelMapping } from "./models.ts";
+import { loadModelTable, resolveModel, DEFAULT_MODEL_TABLE, loadModelConfig, saveModelConfig, DEFAULT_MAPPINGS, type ModelConfig, mappingFor, modelsForListing, type ModelMapping } from "./models.ts";
+import { modelFamilyOf } from "./accounts/types.ts";
 
 describe("model table", () => {
   test("unknown model id falls through to anthropic pass-through", () => {
@@ -29,6 +30,28 @@ describe("model table", () => {
     const alias = resolveModel(DEFAULT_MODEL_TABLE, "gpt-5.6");
     expect(alias.provider).toBe("openai");
     expect(alias.upstreamModel).toBe("gpt-5.6-sol");
+  });
+
+  test("modelsForListing shows one entry per Claude family (the alias), keeps openai + custom ids", () => {
+    const ids = modelsForListing(DEFAULT_MODEL_TABLE).map((m) => m.id);
+    // one alias per Claude family, and no bundled full-id duplicates
+    for (const alias of ["opus", "sonnet", "haiku", "fable"]) expect(ids).toContain(alias);
+    for (const full of ["claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5", "claude-fable-5"]) {
+      expect(ids).not.toContain(full);
+    }
+    // exactly one Sonnet in the listing
+    expect(ids.filter((id) => modelFamilyOf(id) === "sonnet")).toEqual(["sonnet"]);
+    // openai entries are untouched
+    expect(ids).toContain("gpt-5.6-sol");
+    expect(ids).toContain("gpt-5.6");
+    // user-added anthropic ids stay visible (only the bundled dupes are hidden)
+    const withCustom = [
+      ...DEFAULT_MODEL_TABLE,
+      { id: "claude-sonnet-5-20991231", provider: "anthropic" as const, upstreamModel: "claude-sonnet-5-20991231" },
+    ];
+    expect(modelsForListing(withCustom).map((m) => m.id)).toContain("claude-sonnet-5-20991231");
+    // routing is unaffected — a hidden id still resolves
+    expect(resolveModel(DEFAULT_MODEL_TABLE, "claude-sonnet-5").upstreamModel).toBe("claude-sonnet-5");
   });
 
   test("loadModelTable merges file entries over defaults and survives a missing file", () => {

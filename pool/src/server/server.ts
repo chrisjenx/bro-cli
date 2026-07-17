@@ -19,6 +19,7 @@ import {
   isCodexEffort,
   mappingFor,
   mergeMappingsOver,
+  modelsForListing,
   type ModelRoute,
   type ModelConfig,
   type ModelMapping,
@@ -133,7 +134,7 @@ export function startServer(config: Config): void {
       if (req.method === "GET" && (path === "/v1/models" || path === "/models")) {
         return json({
           object: "list",
-          data: modelTable.map((m) => ({
+          data: modelsForListing(modelTable).map((m) => ({
             id: m.id,
             object: "model",
             created: 0,

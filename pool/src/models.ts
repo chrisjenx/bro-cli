@@ -44,6 +44,25 @@ export const DEFAULT_MODEL_TABLE: ModelRoute[] = [
   openai("gpt-5.5"), openai("gpt-5.4"), openai("gpt-5.4-mini"),
 ];
 
+/** Bundled full-id duplicates of the family aliases (e.g. `claude-sonnet-5`
+ * alongside `sonnet`). Hidden from the GET /v1/models listing so each Claude
+ * family shows once — the alias — while the full ids still ROUTE via
+ * resolveModel fall-through. Computed from the bundled defaults only, so a
+ * user-added id in models.json stays visible unless it reuses one of these
+ * exact bundled full-ids. */
+const BUNDLED_ALIAS_DUPES: ReadonlySet<string> = new Set(
+  DEFAULT_MODEL_TABLE.filter((m) => m.provider === "anthropic" && modelFamilyOf(m.id) !== m.id).map(
+    (m) => m.id,
+  ),
+);
+
+/** The model table as shown by GET /v1/models: one entry per Claude family (the
+ * alias), with the bundled full-id duplicates filtered out. Routing is
+ * unaffected — it keys off the full table, not this projection. */
+export function modelsForListing(table: ModelRoute[]): ModelRoute[] {
+  return table.filter((m) => !(m.provider === "anthropic" && BUNDLED_ALIAS_DUPES.has(m.id)));
+}
+
 /** Reads and parses <modelsFile> once, or null when absent/unparseable. */
 function parseModelsFile(modelsFile: string): Record<string, unknown> | null {
   if (!existsSync(modelsFile)) return null;
