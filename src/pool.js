@@ -376,6 +376,13 @@ function poolEnvValues(port) {
   };
 }
 
+// Point settings.json's env at the pool on <port>. Shared by `up` and `restart`
+// so a restart keeps the override — including the sonnet 1M pin — in sync with
+// `up` rather than drifting. `paths` is injectable for tests.
+export function reapplyPoolEnv(port, paths) {
+  applyPoolEnv(poolEnvValues(port), paths);
+}
+
 // `bro pool up` — start the pool as the backend for ALL Claude Code sessions.
 export async function poolUp() {
   const port = poolPort();
@@ -387,8 +394,7 @@ export async function poolUp() {
     return 0;
   }
   await ensureServer(bun, port, baseUrl);
-  const { baseUrl: b, token } = poolEnvValues(port);
-  applyPoolEnv({ baseUrl: b, token });
+  reapplyPoolEnv(port);
   printStatus(await fetchStatus(port), baseUrl);
   console.log('  ' + C.green('Pool is now the backend for all Claude Code sessions') + C.dim(' (agents included).'));
   console.log('  ' + C.dim('Stop it with ') + 'bro pool down');
@@ -410,7 +416,9 @@ export async function poolDown() {
 }
 
 // `bro pool restart` — drain + stop, then start again, holding the terminal
-// until the server is healthy. Leaves the settings.json override untouched.
+// until the server is healthy. Re-applies the settings.json override (like
+// `up`) so a restart picks up pool env changes, e.g. the sonnet 1M pin, instead
+// of leaving a stale block behind.
 export async function poolRestart() {
   const port = poolPort();
   const baseUrl = `http://127.0.0.1:${port}`;
@@ -422,6 +430,7 @@ export async function poolRestart() {
     console.log('Pool server not running — starting it.');
   }
   await ensureServer(bun, port, baseUrl);
+  reapplyPoolEnv(port);
   printStatus(await fetchStatus(port), baseUrl);
   console.log('  ' + C.green('Pool restarted.') + '\n');
   return 0;
