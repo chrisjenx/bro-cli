@@ -15,7 +15,18 @@ import path from 'node:path';
 // Bump this when the Sonnet default version changes.
 export const POOL_SONNET_MODEL = 'claude-sonnet-5[1m]';
 
-const POOL_ENV_KEYS = ['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_DEFAULT_SONNET_MODEL'];
+// Pin Claude Code's `opus` alias to the 1M-context Opus 5, for the same reason
+// as Sonnet above: the bare id is budgeted at 200K behind the gateway and
+// auto-compacts there, and pinning it would *downgrade* a user who had picked
+// the 1M Opus row themselves. Bump when the Opus default version changes.
+export const POOL_OPUS_MODEL = 'claude-opus-5[1m]';
+
+const POOL_ENV_KEYS = [
+  'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL'
+];
 
 // Where Claude Code actually reads settings from (honor CLAUDE_CONFIG_DIR), and
 // where bro records the pre-pool snapshot.
@@ -73,6 +84,7 @@ export function applyPoolEnv({ baseUrl, token }, paths = defaultPaths()) {
   env.ANTHROPIC_BASE_URL = baseUrl;
   env.ANTHROPIC_AUTH_TOKEN = token;
   env.ANTHROPIC_DEFAULT_SONNET_MODEL = POOL_SONNET_MODEL;
+  env.ANTHROPIC_DEFAULT_OPUS_MODEL = POOL_OPUS_MODEL;
   settings.env = env;
   writeJson(paths.settings, settings);
 }

@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { waitForExit, reapplyPoolEnv } from './pool.js';
-import { POOL_SONNET_MODEL } from './settings.js';
+import { POOL_SONNET_MODEL, POOL_OPUS_MODEL } from './settings.js';
 
 test('waitForExit resolves true once the process exits', async () => {
   const child = spawn('sleep', ['0.3']);
@@ -34,7 +34,7 @@ test('waitForExit resolves true immediately for a dead pid', async () => {
 // `bro pool up` and `bro pool restart` both go through reapplyPoolEnv, so a
 // restart writes the same settings.json override as up — including the sonnet
 // 1M pin. Guards against restart silently drifting from up again.
-test('reapplyPoolEnv writes the pool env, including the sonnet 1M pin', () => {
+test('reapplyPoolEnv writes the pool env, including the sonnet and opus 1M pins', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bro-pool-restart-'));
   const paths = {
     settings: path.join(dir, 'settings.json'),
@@ -44,4 +44,5 @@ test('reapplyPoolEnv writes the pool env, including the sonnet 1M pin', () => {
   const { env } = JSON.parse(fs.readFileSync(paths.settings, 'utf8'));
   assert.equal(env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:4321');
   assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL, POOL_SONNET_MODEL);
+  assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL, POOL_OPUS_MODEL);
 });
