@@ -459,13 +459,23 @@ export async function poolStatus() {
   return 0;
 }
 
+// `start`/`stop` alias `up`/`down`: `restart` exists, so those are the verbs
+// people reach for, and falling through to the usage line meant the
+// settings.json override was never written — Claude Code kept its normal login.
+export const POOL_SUBCOMMANDS = {
+  up: poolUp,
+  start: poolUp,
+  down: poolDown,
+  stop: poolDown,
+  restart: poolRestart,
+  status: poolStatus
+};
+
 export async function runPoolCommand(args = []) {
   const sub = args[0];
-  if (sub === 'up') return poolUp();
-  if (sub === 'down') return poolDown();
-  if (sub === 'restart') return poolRestart();
-  if (sub === 'status') return poolStatus();
-  console.log('Usage: bro pool <up|down|restart|status>');
+  const run = Object.prototype.hasOwnProperty.call(POOL_SUBCOMMANDS, sub) ? POOL_SUBCOMMANDS[sub] : null;
+  if (run) return run();
+  console.log('Usage: bro pool <up|start|down|stop|restart|status>');
   return sub ? 1 : 0;
 }
 

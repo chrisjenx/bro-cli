@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { waitForExit, reapplyPoolEnv } from './pool.js';
+import { waitForExit, reapplyPoolEnv, POOL_SUBCOMMANDS, runPoolCommand } from './pool.js';
 import { POOL_SONNET_MODEL, POOL_OPUS_MODEL } from './settings.js';
 
 test('waitForExit resolves true once the process exits', async () => {
@@ -45,4 +45,16 @@ test('reapplyPoolEnv writes the pool env, including the sonnet and opus 1M pins'
   assert.equal(env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:4321');
   assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL, POOL_SONNET_MODEL);
   assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL, POOL_OPUS_MODEL);
+});
+
+// `start`/`stop` are the verbs people reach for once `restart` exists. They used
+// to fall through to the usage line, so the settings.json override was never
+// written and Claude Code kept using the normal login.
+test('start and stop are aliases for up and down', () => {
+  assert.equal(POOL_SUBCOMMANDS.start, POOL_SUBCOMMANDS.up);
+  assert.equal(POOL_SUBCOMMANDS.stop, POOL_SUBCOMMANDS.down);
+});
+
+test('an unknown pool subcommand still fails instead of silently doing nothing', async () => {
+  assert.equal(await runPoolCommand(['bogus']), 1);
 });

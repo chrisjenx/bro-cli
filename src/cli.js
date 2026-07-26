@@ -28,9 +28,9 @@ Usage:
                          web UI opens (images save to ./.bro/image-gen)
   bro image -p <api>     Skip the image API menu (e.g. bro image -p yunwu)
   bro pool up            Make the account pool the backend for ALL Claude
-                         Code sessions (agents included)
+                         Code sessions (agents included). Alias: bro pool start
   bro pool down          Stop the pool (drains in-flight requests first) and
-                         restore your normal Claude login
+                         restore your normal Claude login. Alias: bro pool stop
   bro pool restart       Restart the pool server, draining in-flight requests
   bro pool status        Show pool server + backend-override status
   bro -p <provider>      Skip the provider menu (id or name)
