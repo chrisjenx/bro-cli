@@ -16,18 +16,50 @@ import { createHash } from 'node:crypto';
 // Bump this when the Sonnet default version changes.
 export const POOL_SONNET_MODEL = 'claude-sonnet-5[1m]';
 
+// Behind a custom base URL Claude Code renders the Sonnet picker row *from*
+// ANTHROPIC_DEFAULT_SONNET_MODEL, defaulting the label to the raw id and the
+// description to "Custom Sonnet model" — so an unnamed pin shows up as
+// `claude-sonnet-5[1m]  Custom Sonnet model (1M context)`. The _NAME/
+// _DESCRIPTION keys are Claude Code's own opt-out; these mirror its built-in
+// row wording. Bump alongside POOL_SONNET_MODEL.
+export const POOL_SONNET_MODEL_NAME = 'Sonnet';
+export const POOL_SONNET_MODEL_DESCRIPTION = 'Sonnet 5 with 1M context · Efficient for routine tasks';
+
 // Pin Claude Code's `opus` alias to the 1M-context Opus 5, for the same reason
 // as Sonnet above: the bare id is budgeted at 200K behind the gateway and
 // auto-compacts there, and pinning it would *downgrade* a user who had picked
 // the 1M Opus row themselves. Bump when the Opus default version changes.
 export const POOL_OPUS_MODEL = 'claude-opus-5[1m]';
 
+// As POOL_SONNET_MODEL_NAME above. Bump alongside POOL_OPUS_MODEL.
+export const POOL_OPUS_MODEL_NAME = 'Opus';
+export const POOL_OPUS_MODEL_DESCRIPTION = 'Opus 5 with 1M context · Best for everyday, complex tasks';
+
 const POOL_ENV_KEYS = [
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_AUTH_TOKEN',
   'ANTHROPIC_DEFAULT_SONNET_MODEL',
-  'ANTHROPIC_DEFAULT_OPUS_MODEL'
+  'ANTHROPIC_DEFAULT_SONNET_MODEL_NAME',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL_NAME',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION'
 ];
+
+// The full settings.json `env` mutation, in one place so applyPoolEnv, the
+// `bro pool` launch env and `--dry-run`'s report can't drift apart.
+export function poolEnvBlock({ baseUrl, token }) {
+  return {
+    ANTHROPIC_BASE_URL: baseUrl,
+    ANTHROPIC_AUTH_TOKEN: token,
+    ANTHROPIC_DEFAULT_SONNET_MODEL: POOL_SONNET_MODEL,
+    ANTHROPIC_DEFAULT_SONNET_MODEL_NAME: POOL_SONNET_MODEL_NAME,
+    ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION: POOL_SONNET_MODEL_DESCRIPTION,
+    ANTHROPIC_DEFAULT_OPUS_MODEL: POOL_OPUS_MODEL,
+    ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: POOL_OPUS_MODEL_NAME,
+    ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION: POOL_OPUS_MODEL_DESCRIPTION
+  };
+}
 
 // The snapshot file for one Claude profile. Profiles must not share one: with a
 // single fixed path, `bro pool up` under ~/.claude-personal and a later
@@ -103,11 +135,7 @@ export function applyPoolEnv({ baseUrl, token }, paths = defaultPaths()) {
     if (changed) writeJson(paths.state, { ...state, prior });
   }
 
-  env.ANTHROPIC_BASE_URL = baseUrl;
-  env.ANTHROPIC_AUTH_TOKEN = token;
-  env.ANTHROPIC_DEFAULT_SONNET_MODEL = POOL_SONNET_MODEL;
-  env.ANTHROPIC_DEFAULT_OPUS_MODEL = POOL_OPUS_MODEL;
-  settings.env = env;
+  settings.env = { ...env, ...poolEnvBlock({ baseUrl, token }) };
   writeJson(paths.settings, settings);
 }
 

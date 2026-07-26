@@ -9,7 +9,11 @@ import {
   isPoolEnvActive,
   defaultPaths,
   POOL_SONNET_MODEL,
-  POOL_OPUS_MODEL
+  POOL_OPUS_MODEL,
+  POOL_SONNET_MODEL_NAME,
+  POOL_SONNET_MODEL_DESCRIPTION,
+  POOL_OPUS_MODEL_NAME,
+  POOL_OPUS_MODEL_DESCRIPTION
 } from './settings.js';
 
 function tmpPaths() {
@@ -96,6 +100,45 @@ test('apply adds env keys and preserves other settings', () => {
   assert.equal(s.model, 'opus');
   assert.deepEqual(s.permissions, { defaultMode: 'auto' });
   assert.equal(isPoolEnvActive(p), true);
+});
+
+// Behind a custom ANTHROPIC_BASE_URL, Claude Code builds its Opus/Sonnet picker
+// rows *from* ANTHROPIC_DEFAULT_{OPUS,SONNET}_MODEL, and falls back to the raw
+// model id for the label and "Custom Opus model" for the description. Without
+// the companion _NAME/_DESCRIPTION keys the picker reads `claude-opus-5[1m]`
+// instead of `Opus`.
+test('apply names and describes the pinned models so the picker reads like the built-in rows', () => {
+  const p = tmpPaths();
+  applyPoolEnv(POOL, p);
+  const { env } = read(p.settings);
+  assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME, POOL_SONNET_MODEL_NAME);
+  assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION, POOL_SONNET_MODEL_DESCRIPTION);
+  assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME, POOL_OPUS_MODEL_NAME);
+  assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION, POOL_OPUS_MODEL_DESCRIPTION);
+  // A raw model id as the label is the exact symptom these keys exist to avoid.
+  assert.ok(!env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME.includes('[1m]'));
+  assert.ok(!env.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME.includes('[1m]'));
+});
+
+test('clear removes the name/description keys the user never set', () => {
+  const p = tmpPaths();
+  fs.writeFileSync(p.settings, JSON.stringify({ model: 'opus' }));
+  applyPoolEnv(POOL, p);
+  clearPoolEnv(p);
+  assert.deepEqual(read(p.settings), { model: 'opus' });
+});
+
+test('clear restores a user ANTHROPIC_DEFAULT_OPUS_MODEL_NAME added before the key was managed', () => {
+  const p = tmpPaths();
+  // Older bro: state file exists but predates the name key, user has their own.
+  fs.writeFileSync(p.settings, JSON.stringify({
+    env: { ANTHROPIC_BASE_URL: POOL.baseUrl, ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: 'My Opus' }
+  }));
+  fs.writeFileSync(p.state, JSON.stringify({ managed: true, prior: { ANTHROPIC_BASE_URL: null } }));
+  applyPoolEnv(POOL, p);
+  assert.equal(read(p.settings).env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME, POOL_OPUS_MODEL_NAME);
+  clearPoolEnv(p);
+  assert.equal(read(p.settings).env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME, 'My Opus');
 });
 
 test('clear restores a file that had no env block', () => {
