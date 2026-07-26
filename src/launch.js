@@ -68,7 +68,10 @@ export async function launch({ provider, model, apiKey, extraArgs = [], permissi
     writeCcrConfig(provider, model, apiKey);
     const { ccr, dirs } = ensureProxy();
     const env = { ...process.env, NODE_NO_WARNINGS: '1' };
-    for (const k of ['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_DISABLE_1M_CONTEXT']) {
+    // CLAUDE_CONFIG_DIR stays: it selects the Claude profile (history, projects,
+    // background jobs), so dropping it hides the session from that profile's
+    // `claude agents`. Only upstream/auth vars are cleared here.
+    for (const k of ['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'CLAUDE_CODE_DISABLE_1M_CONTEXT']) {
       delete env[k];
     }
     env.PATH = [...dirs, env.PATH].join(path.delimiter);

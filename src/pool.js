@@ -554,8 +554,11 @@ export async function runPool({ extraArgs = [], permissionMode = 'auto', dryRun 
     throw new Error('The `claude` CLI was not found. Install Claude Code: https://claude.com/claude-code');
   }
 
+  // CLAUDE_CONFIG_DIR is deliberately passed through: it picks the Claude profile
+  // (history, projects, background jobs). Stripping it forced every bro-launched
+  // session into ~/.claude, so sessions started from a per-directory profile
+  // vanished from that profile's `claude agents` list.
   const env = { ...process.env };
-  delete env.CLAUDE_CONFIG_DIR; // use the user's normal Claude Code workspace/config
   delete env.ANTHROPIC_API_KEY;
   delete env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
   env.ANTHROPIC_BASE_URL = b;

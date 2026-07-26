@@ -6,6 +6,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 
 // Pin Claude Code's `sonnet` alias to its 1M-context variant. Behind a custom
 // ANTHROPIC_BASE_URL (Claude Code treats the pool as an "LLM gateway") it can't
@@ -28,13 +29,34 @@ const POOL_ENV_KEYS = [
   'ANTHROPIC_DEFAULT_OPUS_MODEL'
 ];
 
-// Where Claude Code actually reads settings from (honor CLAUDE_CONFIG_DIR), and
-// where bro records the pre-pool snapshot.
+// The snapshot file for one Claude profile. Profiles must not share one: with a
+// single fixed path, `bro pool up` under ~/.claude-personal and a later
+// `bro pool down` under ~/.claude took each other's snapshot — down cleaned the
+// wrong settings.json and left the other profile pinned to a dead pool with no
+// state left for bro to find it by. The default profile keeps the original
+// filename so state written by an earlier bro still round-trips.
+function stateFileFor(claudeDir) {
+  const broDir = path.join(os.homedir(), '.bro');
+  const resolved = path.resolve(claudeDir);
+  if (resolved === path.resolve(path.join(os.homedir(), '.claude'))) {
+    return path.join(broDir, 'pool-settings.json');
+  }
+  // Readable stem for eyeballing ~/.bro, hash for collision-free + bounded.
+  // Profile dirs are dot-prefixed, so drop leading dots or the name reads
+  // `pool-settings..claude-personal.<hash>.json`.
+  const stem = path.basename(resolved).replace(/^\.+/, '').replace(/[^a-zA-Z0-9._-]+/g, '-').slice(0, 40);
+  const hash = createHash('sha256').update(resolved).digest('hex').slice(0, 8);
+  return path.join(broDir, `pool-settings.${stem}.${hash}.json`);
+}
+
+// Where Claude Code actually reads settings from (honor CLAUDE_CONFIG_DIR, which
+// Claude Code exports to its own subprocesses), plus bro's pre-pool snapshot for
+// that same profile. Both move together so up/down always target one profile.
 export function defaultPaths() {
   const claudeDir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
   return {
     settings: path.join(claudeDir, 'settings.json'),
-    state: path.join(os.homedir(), '.bro', 'pool-settings.json')
+    state: stateFileFor(claudeDir)
   };
 }
 

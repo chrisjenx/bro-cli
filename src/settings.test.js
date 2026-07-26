@@ -3,7 +3,14 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { applyPoolEnv, clearPoolEnv, isPoolEnvActive, POOL_SONNET_MODEL, POOL_OPUS_MODEL } from './settings.js';
+import {
+  applyPoolEnv,
+  clearPoolEnv,
+  isPoolEnvActive,
+  defaultPaths,
+  POOL_SONNET_MODEL,
+  POOL_OPUS_MODEL
+} from './settings.js';
 
 function tmpPaths() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bro-settings-'));
@@ -11,6 +18,71 @@ function tmpPaths() {
 }
 const read = (f) => JSON.parse(fs.readFileSync(f, 'utf8'));
 const POOL = { baseUrl: 'http://127.0.0.1:3456', token: 'claude-max-pool' };
+
+// Run `fn` with CLAUDE_CONFIG_DIR set to `dir` (or unset when null).
+function withConfigDir(dir, fn) {
+  const prior = process.env.CLAUDE_CONFIG_DIR;
+  if (dir === null) delete process.env.CLAUDE_CONFIG_DIR;
+  else process.env.CLAUDE_CONFIG_DIR = dir;
+  try {
+    return fn();
+  } finally {
+    if (prior === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = prior;
+  }
+}
+
+test('defaultPaths follows CLAUDE_CONFIG_DIR to the active profile', () => {
+  const dir = path.join(os.homedir(), '.claude-personal');
+  const p = withConfigDir(dir, defaultPaths);
+  assert.equal(p.settings, path.join(dir, 'settings.json'));
+});
+
+// The default profile keeps the original filename so a state file written by an
+// earlier bro — which only ever managed ~/.claude — still round-trips.
+test('defaultPaths keeps the legacy state filename for the default profile', () => {
+  const expected = path.join(os.homedir(), '.bro', 'pool-settings.json');
+  assert.equal(withConfigDir(null, defaultPaths).state, expected);
+  assert.equal(withConfigDir(path.join(os.homedir(), '.claude'), defaultPaths).state, expected);
+});
+
+// One fixed state path meant `bro pool up` under ~/.claude-personal and a later
+// `bro pool down` under ~/.claude shared a snapshot: down cleaned the wrong file
+// and left the other profile with an override bro could never find again.
+test('defaultPaths gives each profile its own state file', () => {
+  const a = withConfigDir(path.join(os.homedir(), '.claude-personal'), defaultPaths).state;
+  const b = withConfigDir(path.join(os.homedir(), '.claude-work'), defaultPaths).state;
+  const dflt = withConfigDir(null, defaultPaths).state;
+  assert.notEqual(a, b);
+  assert.notEqual(a, dflt);
+  assert.notEqual(b, dflt);
+  // Stable across calls, and inside ~/.bro.
+  assert.equal(a, withConfigDir(path.join(os.homedir(), '.claude-personal'), defaultPaths).state);
+  assert.equal(path.dirname(a), path.join(os.homedir(), '.bro'));
+});
+
+// Profile dirs are dot-prefixed (~/.claude-personal), so a naive basename gave
+// `pool-settings..claude-personal.<hash>.json`.
+test('the per-profile state filename is not dot-mangled', () => {
+  const f = path.basename(withConfigDir(path.join(os.homedir(), '.claude-personal'), defaultPaths).state);
+  assert.ok(!f.includes('..'), `double dot in ${f}`);
+  assert.match(f, /^pool-settings\.claude-personal\.[0-9a-f]{8}\.json$/);
+});
+
+// Two profiles pointed at the pool must unwind independently.
+test('clearing one profile leaves another profile’s override intact', () => {
+  const a = tmpPaths();
+  const b = tmpPaths();
+  fs.writeFileSync(a.settings, JSON.stringify({ model: 'opus' }));
+  fs.writeFileSync(b.settings, JSON.stringify({ model: 'opus' }));
+  applyPoolEnv(POOL, a);
+  applyPoolEnv(POOL, b);
+  assert.equal(clearPoolEnv(a), true);
+  assert.deepEqual(read(a.settings), { model: 'opus' });
+  assert.equal(isPoolEnvActive(a), false);
+  assert.equal(isPoolEnvActive(b), true);
+  assert.equal(read(b.settings).env.ANTHROPIC_BASE_URL, POOL.baseUrl);
+});
 
 test('apply adds env keys and preserves other settings', () => {
   const p = tmpPaths();
