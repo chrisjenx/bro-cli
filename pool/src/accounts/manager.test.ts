@@ -1868,3 +1868,174 @@ describe("pickProvider", () => {
     }
   });
 });
+
+function keychainHolding(creds: unknown): KeychainOps {
+  return { read: () => creds as ReturnType<KeychainOps["read"]>, delete: () => {} };
+}
+
+describe("dead refresh tokens", () => {
+  test("an account the OAuth endpoint rejected is unavailable and routed around", () => {
+    const { poolDir, mgr } = tempPool(["dead", "healthy"]);
+    try {
+      mgr.markRefreshTokenDead("dead", "r");
+
+      const dead = mgr.getAccount("dead");
+      expect(dead.available).toBe(false);
+      expect(dead.unavailableReason).toContain("accounts login");
+      expect(mgr.getAccount("healthy").available).toBe(true);
+      expect(mgr.pick()?.name).toBe("healthy");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a session pinned to an account with a dead refresh token is rerouted", () => {
+    const { poolDir, mgr } = tempPool(["dead", "healthy"]);
+    try {
+      mgr.setAffinity("s1", "dead", "anthropic");
+      mgr.markRefreshTokenDead("dead", "r");
+
+      expect(mgr.pick("s1")?.name).toBe("healthy");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("markRefreshTokenDead records why the account was sidelined", () => {
+    const { poolDir, mgr } = tempPool(["dead"]);
+    try {
+      mgr.recordError("dead", "some earlier unrelated blip");
+
+      mgr.markRefreshTokenDead("dead", "r");
+
+      expect(mgr.getAccount("dead").usage.lastError).toContain("refresh token expired");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("markRefreshTokenDead only sidelines the credential the endpoint rejected", () => {
+    const { poolDir, mgr } = tempPool(["racy"]);
+    try {
+      // A re-login (or another process) rewrote the credentials between the 400
+      // response and this call, so the rejected token is no longer the live one.
+      mgr.markRefreshTokenDead("racy", "some-older-token");
+
+      expect(mgr.getAccount("racy").available).toBe(true);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a dead refresh token outranks a rate-limit cooldown in the reported reason", () => {
+    const { poolDir, mgr } = tempPool(["dead"]);
+    try {
+      mgr.markRateLimited("dead", Date.now() + 600_000);
+      mgr.markRefreshTokenDead("dead", "r");
+
+      expect(mgr.getAccount("dead").unavailableReason).toContain("accounts login");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("re-logging in an account clears the dead-refresh-token sideline", () => {
+    const { poolDir, mgr } = tempPool(["dead"]);
+    try {
+      mgr.markRefreshTokenDead("dead", "r");
+      expect(mgr.getAccount("dead").available).toBe(false);
+
+      // `accounts login` mints a brand-new refresh token for the same account.
+      writeFileSync(
+        join(mgr.configDirFor("dead"), ".credentials.json"),
+        JSON.stringify({
+          claudeAiOauth: {
+            accessToken: "tok-fresh",
+            refreshToken: "r-fresh",
+            expiresAt: Date.now() + 3_600_000,
+            subscriptionType: "max",
+          },
+        }),
+      );
+
+      expect(mgr.getAccount("dead").available).toBe(true);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a refresh that succeeds without rotating the token clears the sideline", () => {
+    const { poolDir, mgr } = tempPool(["dead"]);
+    try {
+      mgr.markRefreshTokenDead("dead", "r");
+
+      // updateOAuthCreds owns the invariant: new creds written -> no dead token.
+      mgr.updateOAuthCreds("dead", { accessToken: "tok-new", refreshToken: "r", expiresAt: Date.now() + 1000 });
+
+      expect(mgr.getAccount("dead").available).toBe(true);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("adopting a macOS Keychain login", () => {
+  test("promotes a newer Keychain login over a stale credentials file, keeping other entries", () => {
+    const keychain = keychainHolding({
+      claudeAiOauth: {
+        accessToken: "tok-fresh",
+        refreshToken: "r-fresh",
+        expiresAt: Date.now() + 3_600_000,
+        subscriptionType: "max",
+      },
+    });
+    const { poolDir, mgr } = tempPool(["relogged"], keychain);
+    try {
+      const credsFile = join(mgr.configDirFor("relogged"), ".credentials.json");
+      writeFileSync(
+        credsFile,
+        JSON.stringify({
+          claudeAiOauth: { accessToken: "tok-old", refreshToken: "r", expiresAt: Date.now() + 1000 },
+          mcpOAuth: { "server-a": { accessToken: "mcp-token" } },
+        }),
+      );
+      mgr.markRefreshTokenDead("relogged", "r");
+      expect(mgr.getAccount("relogged").available).toBe(false);
+
+      expect(mgr.adoptKeychainLogin("relogged")).toBe(true);
+
+      const written = JSON.parse(readFileSync(credsFile, "utf8"));
+      expect(written.claudeAiOauth.refreshToken).toBe("r-fresh");
+      expect(written.mcpOAuth).toEqual({ "server-a": { accessToken: "mcp-token" } });
+      expect(mgr.getAccount("relogged").available).toBe(true);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps the existing credentials when the Keychain has no login", () => {
+    const { poolDir, mgr } = tempPool(["untouched"], keychainHolding(null));
+    try {
+      expect(mgr.adoptKeychainLogin("untouched")).toBe(false);
+
+      expect(mgr.getOAuthCreds("untouched")?.refreshToken).toBe("r");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps the existing credentials when the Keychain login is the same one", () => {
+    const keychain = keychainHolding({
+      claudeAiOauth: { accessToken: "tok-old", refreshToken: "r", expiresAt: Date.now() + 1000 },
+    });
+    const { poolDir, mgr } = tempPool(["same"], keychain);
+    try {
+      mgr.markRefreshTokenDead("same", "r");
+
+      expect(mgr.adoptKeychainLogin("same")).toBe(false);
+      expect(mgr.getAccount("same").available).toBe(false);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+});

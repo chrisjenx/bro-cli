@@ -10,6 +10,7 @@
  */
 
 import { mkdirSync, existsSync, readdirSync, readFileSync, writeFileSync, rmSync, copyFileSync, statSync } from "fs";
+import { createHash } from "crypto";
 import { join } from "path";
 import type { Config } from "../config.ts";
 import { defaultClaudeConfigDir } from "../config.ts";
@@ -151,6 +152,24 @@ const defaultKeychainOps: KeychainOps = { read: readKeychainCreds, delete: delet
  */
 const RATE_LIMITED_LAST_ERROR = "rate limited by Anthropic";
 
+const DEAD_REFRESH_LAST_ERROR = "refresh token expired — re-login required";
+
+/** Stable, non-reversible id for a refresh token, safe to persist in usage.json. */
+function refreshTokenFingerprint(token: string): string {
+  return createHash("sha256").update(token).digest("hex").slice(0, 16);
+}
+
+/**
+ * Unavailability reason when the stored credentials are the exact login the
+ * OAuth endpoint rejected, else null. See AccountUsage.deadRefreshToken.
+ */
+function deadLoginReason(usage: AccountUsage, refreshToken: string | undefined): string | null {
+  if (usage.deadRefreshToken == null || refreshToken == null) return null;
+  return usage.deadRefreshToken === refreshTokenFingerprint(refreshToken)
+    ? "refresh token expired — run `accounts login`"
+    : null;
+}
+
 export class AccountManager {
   private config: Config;
   private usage: Record<string, AccountUsage> = {};
@@ -184,6 +203,7 @@ export class AccountManager {
         u.rateLimitStatus = normalizeRateLimitSnapshot(u.rateLimitStatus);
         u.lastUsageCheckAt ??= null;
         u.lastUsageCheckError ??= null;
+        u.deadRefreshToken ??= null;
       }
     } catch {
       this.usage = {};
@@ -492,6 +512,14 @@ export class AccountManager {
     const existing = this.readCreds(name) ?? {};
     const next: CredentialsFile = { ...existing, claudeAiOauth: oauth };
     writeFileSync(this.credsPath(name), JSON.stringify(next, null, 2));
+    // Writing credentials retires any known-dead refresh token for this account:
+    // whatever we just stored is the login to judge from now on. Keeping that
+    // invariant here means no write path can forget to clear the marker.
+    const u = this.usageFor(name);
+    if (u.deadRefreshToken != null) {
+      u.deadRefreshToken = null;
+      this.saveState();
+    }
   }
 
   providerFor(name: string): Provider {
@@ -525,12 +553,18 @@ export class AccountManager {
     const usage = this.usageFor(name);
     const now = Date.now();
     const cooling = usage.rateLimitedUntil != null && usage.rateLimitedUntil > now;
+    const deadLogin = deadLoginReason(usage, oauth?.refreshToken);
 
     let available = true;
     let reason: string | null = null;
     if (!authenticated) {
       available = false;
       reason = "not authenticated — run `accounts login`";
+    } else if (deadLogin) {
+      // Ranked above the rate-limit checks: a cooldown expires on its own, this
+      // does not, so the re-login is the reason worth surfacing.
+      available = false;
+      reason = deadLogin;
     } else if (cooling) {
       available = false;
       const mins = Math.ceil((usage.rateLimitedUntil! - now) / 60000);
@@ -1016,6 +1050,52 @@ export class AccountManager {
     const u = this.usageFor(name);
     u.rateLimitedUntil = null;
     this.saveState();
+  }
+
+  /**
+   * Sideline this account because the OAuth endpoint rejected `refreshToken` as
+   * permanently invalid. Without it the expired-but-well-formed access token
+   * left on disk keeps the account looking authenticated, so every request
+   * routed here burns a doomed token round-trip before failing over.
+   *
+   * Takes the rejected token rather than re-reading the credentials: a re-login
+   * (or a refresh in another process — the refresh lock is per-process) can land
+   * between the rejection and this call, and fingerprinting whatever is on disk
+   * by then would sideline a brand-new valid login.
+   */
+  markRefreshTokenDead(name: string, refreshToken: string): void {
+    const u = this.usageFor(name);
+    const fingerprint = refreshTokenFingerprint(refreshToken);
+    // Idempotent: the usage sweep keeps retrying a dead account every couple of
+    // minutes, and re-marking it must not rewrite usage.json each time.
+    if (u.deadRefreshToken === fingerprint) return;
+    u.deadRefreshToken = fingerprint;
+    u.lastError = DEAD_REFRESH_LAST_ERROR;
+    // Drop pins so sessions reroute away, as markRateLimited does — this
+    // account cannot serve their next turn either.
+    this.sessions.evictAccount(name);
+    this.saveState();
+  }
+
+  /**
+   * Promote a macOS Keychain login over this account's `.credentials.json` when
+   * the two disagree, returning true when the file was replaced.
+   *
+   * `accounts login` spawns `claude` with CLAUDE_CONFIG_DIR, and on darwin that
+   * writes the new login to the Keychain only — but readCreds() prefers the
+   * plaintext file the pool materializes on its first successful refresh. So a
+   * re-login of an account the pool has ever refreshed would otherwise leave the
+   * old (possibly dead) token in charge, and report success while doing it.
+   *
+   * Off darwin there is no `security` binary, so the Keychain read returns null
+   * and this is a no-op — `claude` writes the plaintext file directly there.
+   */
+  adoptKeychainLogin(name: string): boolean {
+    const incoming = this.keychain.read(keychainServiceForConfigDir(this.configDirFor(name)))?.claudeAiOauth;
+    if (!incoming?.accessToken) return false;
+    if (incoming.refreshToken === this.getOAuthCreds(name)?.refreshToken) return false;
+    this.updateOAuthCreds(name, incoming);
+    return true;
   }
 
   /** True if any account holds a valid-looking login. */

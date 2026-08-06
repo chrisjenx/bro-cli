@@ -72,11 +72,22 @@ async function refreshOAuth(
     throw err;
   }
   const text = await response.text();
+  const json = parseJson(text);
   if (!response.ok) {
+    // invalid_grant is the endpoint's terminal verdict: this refresh token is
+    // gone for good and no amount of retrying revives it. Sideline the account
+    // so pick() stops routing to it, and say what actually fixes it — the raw
+    // body ("Refresh token expired") reads like a blip on the dashboard. Note
+    // the OAuth spec's bare top-level string, not Anthropic's nested error type.
+    if (stringProp(json, "error") === "invalid_grant") {
+      mgr.markRefreshTokenDead(accountName, current.refreshToken);
+      throw new Error(
+        `OAuth refresh failed for "${accountName}": refresh token expired — run \`accounts login ${accountName}\``,
+      );
+    }
     throw new Error(`OAuth refresh failed for "${accountName}" (${response.status}): ${safeErrorText(text)}`);
   }
 
-  const json = parseJson(text);
   const accessToken = stringProp(json, "access_token") ?? stringProp(json, "accessToken");
   if (!accessToken) throw new Error(`OAuth refresh failed for "${accountName}": no access token in response`);
 
@@ -91,6 +102,7 @@ async function refreshOAuth(
     expiresAt: Date.now() + Math.max(1, expiresIn) * 1000,
     scopes: scope ? scope.split(/\s+/).filter(Boolean) : current.scopes,
   };
+  // Retires any dead-token sideline for this account (see updateOAuthCreds).
   mgr.updateOAuthCreds(accountName, next);
   return next;
 }

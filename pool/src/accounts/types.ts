@@ -189,7 +189,8 @@ export function normalizeRateLimitSnapshot(raw: unknown): RateLimitSnapshot | nu
   return { unifiedStatus, windows, updatedAt };
 }
 
-/** Rolling + lifetime usage counters for one account. */
+/** Per-account mutable pool state: rolling + lifetime counters, and the health
+ *  markers (rate-limit cooldown, dead login) that gate routing. */
 export interface AccountUsage {
   /** Start of the current rolling window (epoch ms). */
   windowStart: number;
@@ -220,6 +221,17 @@ export interface AccountUsage {
   lastUsageCheckAt: number | null;
   /** Last usage-refresh failure message, surfaced on the dashboard; null when healthy. */
   lastUsageCheckError: string | null;
+
+  /**
+   * Fingerprint of a refresh token the OAuth endpoint rejected as permanently
+   * invalid (`invalid_grant`); null while the account's login is usable. Unlike
+   * a rate limit this never heals on its own — only a fresh interactive login
+   * mints a new refresh token — so the account is sidelined until one arrives.
+   * Storing the fingerprint rather than a bare flag lets that sideline clear
+   * itself: `accounts login` writes a different refresh token, the fingerprint
+   * stops matching, and the account returns to rotation with no manual reset.
+   */
+  deadRefreshToken: string | null;
 }
 
 /** Fully-resolved view of an account for status/routing. */
@@ -263,5 +275,6 @@ export function emptyUsage(now: number): AccountUsage {
     rateLimitStatus: null,
     lastUsageCheckAt: null,
     lastUsageCheckError: null,
+    deadRefreshToken: null,
   };
 }

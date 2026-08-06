@@ -145,6 +145,12 @@ Pool dir: ${config.accountsDir}`);
       });
       await proc.exited;
 
+      // macOS writes the new login to the Keychain, which the pool reads second
+      // (see adoptKeychainLogin) — reconcile before reporting success.
+      if (mgr.adoptKeychainLogin(name)) {
+        console.log(`Picked up the new login from the macOS Keychain for "${name}".`);
+      }
+
       const acct = mgr.getAccount(name);
       if (acct.authenticated) {
         console.log(`\n✓ "${name}" is authenticated (${acct.subscriptionType ?? "plan unknown"}, tier ${acct.rateLimitTier ?? "-"}).`);
