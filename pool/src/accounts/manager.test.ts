@@ -1671,6 +1671,30 @@ test("recordUsageSnapshot hard-sidelines until a spent binding window resets", (
   }
 });
 
+test("recordUsageSnapshot keeps the account in rotation when only a model-scoped window is spent", () => {
+  const { poolDir, mgr } = tempPool(["fable-spent"]);
+  try {
+    const resetAt = Date.now() + 29 * 3_600_000;
+    // Ground truth: the account-wide 7d window still has headroom, only Fable's
+    // own allowance is gone. The account must keep serving every other model.
+    mgr.recordUsageSnapshot(
+      "fable-spent",
+      snapshot([
+        win("5h", { utilization: 0 }),
+        win("7d", { utilization: 0.9, reset: resetAt }),
+        win("7d-fable", { status: "rejected", utilization: 1, reset: resetAt }),
+      ]),
+    );
+    const acct = mgr.getAccount("fable-spent");
+    expect(acct.usage.rateLimitedUntil).toBeNull();
+    expect(acct.available).toBe(true);
+    expect(mgr.pick(undefined, undefined, "anthropic", "sonnet")?.name).toBe("fable-spent");
+    expect(mgr.pick(undefined, undefined, "anthropic", "fable")).toBeNull();
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
 test("recordUsageSnapshot clears a stale rate-limit error once nothing is blocking", () => {
   const { poolDir, mgr } = tempPool(["acct"]);
   try {

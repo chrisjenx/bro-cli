@@ -1524,15 +1524,21 @@ function isSpentWindow(w: RateLimitWindow): boolean {
 }
 
 /**
- * Soonest future reset among windows Anthropic currently reports as blocking
- * (fully consumed or explicitly rejected). Used as markRateLimited's fallback
- * when the 429 carried no explicit reset — the snapshot recorded moments
- * earlier on the same request already knows the real reset. null when no
- * blocking window has a future reset.
+ * Soonest future reset among account-wide windows Anthropic currently reports
+ * as blocking (fully consumed or explicitly rejected). Used as
+ * markRateLimited's fallback when the 429 carried no explicit reset — the
+ * snapshot recorded moments earlier on the same request already knows the real
+ * reset. null when no blocking window has a future reset.
+ *
+ * Model-scoped windows are excluded for the same reason exhaustedReason skips
+ * them: they only bar their own model. `rateLimitedUntil` is account-wide, so
+ * letting a spent Fable window set it would bench the account for every model.
+ * pick()'s per-request modelExhaustedReason check keeps Fable itself out.
  */
 function blockingWindowReset(rl: RateLimitSnapshot | null, now: number): number | null {
   if (!rl?.windows) return null;
   const resets = rl.windows
+    .filter((w) => w.model == null)
     .filter(isSpentWindow)
     .filter((w) => w.reset != null && w.reset > now)
     .map((w) => w.reset!);
