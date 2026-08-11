@@ -131,6 +131,11 @@ Pool dir: ${config.accountsDir}`);
       console.log(`Config dir: ${dir}`);
       console.log(`When Claude starts, run /login (or complete onboarding), then /exit.\n`);
 
+      // Snapshot the Keychain first: adoption must require the item to change,
+      // or an aborted login lets a stale Keychain token overwrite the rotated
+      // one the pool cached to disk (see adoptKeychainLogin).
+      const keychainBefore = mgr.keychainRefreshToken(name);
+
       const proc = Bun.spawn([config.claudeBin], {
         cwd: process.cwd(),
         env: {
@@ -147,7 +152,7 @@ Pool dir: ${config.accountsDir}`);
 
       // macOS writes the new login to the Keychain, which the pool reads second
       // (see adoptKeychainLogin) — reconcile before reporting success.
-      if (mgr.adoptKeychainLogin(name)) {
+      if (mgr.adoptKeychainLogin(name, keychainBefore)) {
         console.log(`Picked up the new login from the macOS Keychain for "${name}".`);
       }
 

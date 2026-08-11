@@ -518,7 +518,44 @@ export class AccountManager {
     const u = this.usageFor(name);
     if (u.deadRefreshToken != null) {
       u.deadRefreshToken = null;
+      this.persistDeadRefreshTokenCleared(name);
+    }
+  }
+
+  /**
+   * Clear one account's dead-refresh-token marker in usage.json without
+   * rewriting the rest of the file from this process's snapshot.
+   *
+   * saveState() persists the whole in-memory map, which is wrong here: the
+   * `accounts login` CLI builds its AccountManager and then blocks on an
+   * interactive `claude` for minutes, so by the time this runs its map is
+   * stale. A full write would revert everything a concurrently-running pool
+   * server recorded meanwhile — request counters, cooldowns, rate-limit
+   * snapshots, other accounts' dead markers — and could put an account the
+   * server had just sidelined on a 429 straight back into rotation.
+   */
+  private persistDeadRefreshTokenCleared(name: string): void {
+    let onDisk: Record<string, AccountUsage> | null = null;
+    try {
+      const parsed = JSON.parse(readFileSync(this.config.usageFile, "utf8")) as PersistedState;
+      onDisk = parsed.usage ?? null;
+    } catch {
+      onDisk = null;
+    }
+    // No readable file (first run, or corrupt) — nothing to preserve.
+    if (!onDisk) {
       this.saveState();
+      return;
+    }
+    const record = onDisk[name] ?? this.usage[name];
+    if (!record) return;
+    record.deadRefreshToken = null;
+    onDisk[name] = record;
+    const state: PersistedState = { usage: this.pruneToLiveAccounts(onDisk) };
+    try {
+      writeFileSync(this.config.usageFile, JSON.stringify(state, null, 2));
+    } catch {
+      // Non-fatal, as in saveState().
     }
   }
 
@@ -1089,13 +1126,35 @@ export class AccountManager {
    *
    * Off darwin there is no `security` binary, so the Keychain read returns null
    * and this is a no-op — `claude` writes the plaintext file directly there.
+   *
+   * @param refreshTokenBeforeLogin the Keychain's refresh token as it stood
+   *   *before* `claude` was spawned (see keychainRefreshToken). Adoption
+   *   requires the item to have actually changed: the pool caches rotated
+   *   refresh tokens to `.credentials.json` and never writes the Keychain, so
+   *   once an account has refreshed, the Keychain item is OLDER than the file.
+   *   "Differs from the file" is then true of a stale item just as much as of a
+   *   fresh login, and adopting one — after a login the user aborted, say —
+   *   would downgrade working credentials to a dead token and, via
+   *   updateOAuthCreds, un-sideline the account while it is at it.
    */
-  adoptKeychainLogin(name: string): boolean {
+  adoptKeychainLogin(name: string, refreshTokenBeforeLogin: string | null): boolean {
     const incoming = this.keychain.read(keychainServiceForConfigDir(this.configDirFor(name)))?.claudeAiOauth;
     if (!incoming?.accessToken) return false;
+    if (incoming.refreshToken === refreshTokenBeforeLogin) return false;
     if (incoming.refreshToken === this.getOAuthCreds(name)?.refreshToken) return false;
     this.updateOAuthCreds(name, incoming);
     return true;
+  }
+
+  /**
+   * The refresh token currently held in the macOS Keychain for this account, or
+   * null when there is no item (or we are not on darwin). Snapshot this before
+   * spawning an interactive login so adoptKeychainLogin can tell a new login
+   * from the item that was already there.
+   */
+  keychainRefreshToken(name: string): string | null {
+    const creds = this.keychain.read(keychainServiceForConfigDir(this.configDirFor(name)))?.claudeAiOauth;
+    return creds?.refreshToken ?? null;
   }
 
   /** True if any account holds a valid-looking login. */

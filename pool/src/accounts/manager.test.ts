@@ -1988,6 +1988,35 @@ describe("dead refresh tokens", () => {
     }
   });
 
+  test("clearing the dead marker keeps what another process wrote to usage.json", () => {
+    // `accounts login` builds its AccountManager, then blocks on an interactive
+    // `claude` for minutes while the pool server keeps recording. Writing the
+    // whole in-memory map back would revert everything the server logged in
+    // between — including a cooldown it just applied to a different account.
+    const { poolDir, mgr } = tempPool(["relogged", "other"]);
+    try {
+      mgr.markRefreshTokenDead("relogged", "r");
+
+      const usageFile = join(poolDir, "usage.json");
+      const live = JSON.parse(readFileSync(usageFile, "utf8"));
+      const cooldown = Date.now() + 3_600_000;
+      live.usage.other = { ...(live.usage.other ?? {}), rateLimitedUntil: cooldown };
+      writeFileSync(usageFile, JSON.stringify(live, null, 2));
+
+      mgr.updateOAuthCreds("relogged", {
+        accessToken: "tok-fresh",
+        refreshToken: "r-fresh",
+        expiresAt: Date.now() + 3_600_000,
+      });
+
+      const persisted = JSON.parse(readFileSync(usageFile, "utf8"));
+      expect(persisted.usage.other.rateLimitedUntil).toBe(cooldown);
+      expect(persisted.usage.relogged.deadRefreshToken).toBeNull();
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
   test("a refresh that succeeds without rotating the token clears the sideline", () => {
     const { poolDir, mgr } = tempPool(["dead"]);
     try {
@@ -2026,7 +2055,7 @@ describe("adopting a macOS Keychain login", () => {
       mgr.markRefreshTokenDead("relogged", "r");
       expect(mgr.getAccount("relogged").available).toBe(false);
 
-      expect(mgr.adoptKeychainLogin("relogged")).toBe(true);
+      expect(mgr.adoptKeychainLogin("relogged", "r-before-login")).toBe(true);
 
       const written = JSON.parse(readFileSync(credsFile, "utf8"));
       expect(written.claudeAiOauth.refreshToken).toBe("r-fresh");
@@ -2037,10 +2066,41 @@ describe("adopting a macOS Keychain login", () => {
     }
   });
 
+  test("ignores a Keychain item the login did not touch", () => {
+    // The pool caches rotated refresh tokens to .credentials.json and never
+    // writes the Keychain, so after the first rotation the Keychain item is
+    // OLDER than the file. A login the user aborted leaves it that way —
+    // adopting it would downgrade to a stale token and un-sideline a genuinely
+    // dead account.
+    const keychain = keychainHolding({
+      claudeAiOauth: { accessToken: "tok-keychain", refreshToken: "r-stale", expiresAt: Date.now() + 1000 },
+    });
+    const { poolDir, mgr } = tempPool(["aborted"], keychain);
+    try {
+      const credsFile = join(mgr.configDirFor("aborted"), ".credentials.json");
+      writeFileSync(
+        credsFile,
+        JSON.stringify({
+          claudeAiOauth: { accessToken: "tok-rotated", refreshToken: "r-rotated", expiresAt: Date.now() + 1000 },
+        }),
+      );
+      mgr.markRefreshTokenDead("aborted", "r-rotated");
+      const before = mgr.keychainRefreshToken("aborted");
+      expect(before).toBe("r-stale");
+
+      expect(mgr.adoptKeychainLogin("aborted", before)).toBe(false);
+
+      expect(JSON.parse(readFileSync(credsFile, "utf8")).claudeAiOauth.refreshToken).toBe("r-rotated");
+      expect(mgr.getAccount("aborted").available).toBe(false);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
   test("keeps the existing credentials when the Keychain has no login", () => {
     const { poolDir, mgr } = tempPool(["untouched"], keychainHolding(null));
     try {
-      expect(mgr.adoptKeychainLogin("untouched")).toBe(false);
+      expect(mgr.adoptKeychainLogin("untouched", null)).toBe(false);
 
       expect(mgr.getOAuthCreds("untouched")?.refreshToken).toBe("r");
     } finally {
@@ -2056,7 +2116,7 @@ describe("adopting a macOS Keychain login", () => {
     try {
       mgr.markRefreshTokenDead("same", "r");
 
-      expect(mgr.adoptKeychainLogin("same")).toBe(false);
+      expect(mgr.adoptKeychainLogin("same", "r")).toBe(false);
       expect(mgr.getAccount("same").available).toBe(false);
     } finally {
       rmSync(poolDir, { recursive: true, force: true });

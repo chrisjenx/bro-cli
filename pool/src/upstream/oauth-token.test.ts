@@ -64,6 +64,24 @@ test("an invalid_grant refresh sidelines the account and explains the fix", asyn
   }
 });
 
+test("an invalid_grant reported in Anthropic's nested error shape also sidelines", async () => {
+  const { poolDir, mgr, config } = tempPool("dead-nested");
+  try {
+    // The endpoint speaks bare OAuth today, but the same 400 can come back
+    // wrapped by the API error envelope. Missing it would leave the sideline
+    // silently inert, so match either shape.
+    respondWith(400, { type: "error", error: { type: "invalid_grant", message: "Refresh token expired" } });
+
+    await expect(accessTokenFor(mgr.getAccount("dead-nested"), mgr, config, true)).rejects.toThrow(
+      /accounts login/,
+    );
+
+    expect(mgr.getAccount("dead-nested").available).toBe(false);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
 test("a transient OAuth failure leaves the account in rotation", async () => {
   const { poolDir, mgr, config } = tempPool("blip");
   try {
