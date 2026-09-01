@@ -17,14 +17,7 @@ import type { Config } from "./config.ts";
 import { AccountManager, isValidPriority } from "./accounts/manager.ts";
 import { loginOpenAI } from "./accounts/openai-login.ts";
 import { normalizeCodexAuthJson } from "./accounts/openai-oauth.ts";
-import {
-  applyContextEdits,
-  declaredCeiling,
-  effectiveContextWindow,
-  loadModelConfig,
-  saveModelConfig,
-  updateOpenAIModels,
-} from "./models.ts";
+import { loadModelConfig, saveModelConfig, updateOpenAIModels } from "./models.ts";
 
 function fmtWhen(ts: number | null): string {
   if (!ts) return "never";
@@ -54,53 +47,6 @@ export function parsePriorityArg(raw: string | undefined): number | null {
   if (raw == null || !/^\d+$/.test(raw.trim())) return null;
   const n = Number(raw);
   return isValidPriority(n) ? n : null;
-}
-
-/** Parse the token count for `models context`. Bare non-negative integers only,
- * mirroring parsePriorityArg — `Number("")` would otherwise coerce to 0. */
-export function parseContextArg(raw: string | undefined): number | null {
-  if (raw == null || !/^\d+$/.test(raw.trim())) return null;
-  const n = Number(raw);
-  return n > 0 ? n : null;
-}
-
-const CONTEXT_USAGE = "models context <model-id> <tokens|default>";
-/** Spelled the way the usage string and README document it — no undocumented
- * aliases, so what the CLI accepts and what it advertises stay the same set. */
-const CLEAR_WORDS = new Set(["default", "clear"]);
-
-/**
- * Send a context edit to a running pool, or report that there isn't one.
- *
- * Returns an exit code when a pool answered — including when it REFUSED. A
- * refusal is authoritative and must not fall through to the file path, or the
- * CLI would quietly apply an edit the pool just rejected and the two surfaces
- * would disagree all over again.
- */
-async function postContextEdit(config: Config, body: unknown): Promise<0 | 1 | "unreachable"> {
-  let res: Response;
-  try {
-    res = await fetch(`http://${config.host}:${config.port}/api/context`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(2000),
-    });
-  } catch {
-    return "unreachable";
-  }
-  if (res.ok) return 0;
-  // A pool from before this route existed answers 404/405. That says nothing
-  // about the edit, so treat it as "no pool" and let the file path handle it —
-  // reporting a routing failure would strand anyone with a long-running pool
-  // started from an older build.
-  if (res.status === 404 || res.status === 405) return "unreachable";
-  const detail = await res
-    .json()
-    .then((b: any) => b?.error?.message)
-    .catch(() => null);
-  console.error(detail ?? `pool rejected the edit (HTTP ${res.status})`);
-  return 1;
 }
 
 function unknownProviderErr(provider: string): number {
@@ -297,14 +243,9 @@ function usageErr(usage: string): number {
 /**
  * `models` sub-commands.
  *
- *   models list                    Show the current model-id → provider routing
- *                                   table, each row's effective context window,
- *                                   and the house cap it's clamped against.
- *   models update                  Refresh the openai entries from an authenticated
- *                                   ChatGPT-subscription account (best-effort; see models.ts).
- *   models context <id> <tokens>   Set a per-model context-window ceiling
- *                                   (maxContextWindow) in models.json — the same
- *                                   field the dashboard editor writes.
+ *   models list      Show the current model-id → provider routing table.
+ *   models update     Refresh the openai entries from an authenticated
+ *                     ChatGPT-subscription account (best-effort; see models.ts).
  */
 export async function runModelsCommand(config: Config, args: string[]): Promise<number> {
   const [sub] = args;
@@ -312,16 +253,7 @@ export async function runModelsCommand(config: Config, args: string[]): Promise<
   const table = cfg.models;
 
   if (sub === undefined || sub === "list") {
-    for (const m of table) {
-      const win = effectiveContextWindow(m, config.contextWindowCap);
-      const ceiling = declaredCeiling(m);
-      const note = ceiling !== null && ceiling > win ? ` (capped from ${ceiling.toLocaleString("en-US")})` : "";
-      console.log(
-        `${m.id.padEnd(24)} → ${m.provider}:${m.upstreamModel.padEnd(16)} ` +
-        `${win.toLocaleString("en-US").padStart(11)} ctx${note}`,
-      );
-    }
-    console.log(`\nHouse cap: ${config.contextWindowCap.toLocaleString("en-US")} (POOL_MAX_CONTEXT)`);
+    for (const m of table) console.log(`${m.id.padEnd(24)} → ${m.provider}:${m.upstreamModel}`);
     return 0;
   }
 
@@ -333,42 +265,6 @@ export async function runModelsCommand(config: Config, args: string[]): Promise<
     return 0;
   }
 
-  if (sub === "context") {
-    const [, id, raw] = args;
-    if (!id || raw === undefined) return usageErr(CONTEXT_USAGE);
-    // "default" is the CLI spelling of the dashboard's null: clear the override
-    // and fall back to the bundled ceiling. Without it the two surfaces could
-    // not express the same edit.
-    let ceiling: number | null = null;
-    if (!CLEAR_WORDS.has(raw)) {
-      ceiling = parseContextArg(raw);
-      if (ceiling === null) return usageErr(CONTEXT_USAGE);
-    }
-    const edit = { models: [{ id, maxContextWindow: ceiling }] };
-    const applied = ceiling === null ? "cleared to the bundled default" : `set to ${ceiling.toLocaleString("en-US")}`;
-
-    // A running pool owns the live table. Going through it means the edit
-    // hot-applies and survives — writing the file behind its back left the pool
-    // serving its boot-time table, and the next dashboard Save wrote that stale
-    // table back over this edit.
-    const viaPool = await postContextEdit(config, edit);
-    if (viaPool !== "unreachable") {
-      if (viaPool === 0) console.log(`${id}: context ceiling ${applied} (applied to the running pool)`);
-      return viaPool;
-    }
-
-    // No pool listening: same validated core, same rules, written straight to
-    // the file for the next start to pick up.
-    const result = applyContextEdits(cfg, edit, config.autoCompactWindowOverride);
-    if (!result.ok) {
-      console.error(result.message);
-      return 1;
-    }
-    saveModelConfig(config.modelsFile, result.config);
-    console.log(`${id}: context ceiling ${applied} in ${config.modelsFile}`);
-    return 0;
-  }
-
   console.error(`Unknown models sub-command: ${sub}`);
-  return usageErr("models <list|update|context>");
+  return usageErr("models <list|update>");
 }

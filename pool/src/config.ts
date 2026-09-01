@@ -9,7 +9,6 @@
 
 import { homedir } from "os";
 import { join } from "path";
-import { clampContextWindow, usableWindow } from "./models.ts";
 
 export interface Config {
   /** Root directory that holds every account's config dir + pool state. */
@@ -56,19 +55,6 @@ export interface Config {
    * usage roughly every 5 hours; we mirror that window for display/routing.
    */
   usageWindowMs: number;
-  /**
-   * House cap on how much of a model's upstream context ceiling we hand the
-   * client. Codex's 5.6 tiers allow 872K, but a bigger live window burns quota
-   * faster and drags on latency, so we default to 500K. Clamped into the range
-   * Claude Code accepts for CLAUDE_CODE_AUTO_COMPACT_WINDOW.
-   */
-  contextWindowCap: number;
-  /**
-   * Explicit session auto-compact window, overriding the value derived from the
-   * mapping. Null (the default) means derive it. Set this when you want one
-   * number regardless of which models are mapped.
-   */
-  autoCompactWindowOverride: number | null;
   /** How long to sideline an account after it reports a rate limit, in ms. */
   rateLimitCooldownMs: number;
   /** Max same-account backoff retries for a transient upstream overload (529/500/503). 0 disables. */
@@ -120,18 +106,6 @@ function positiveIntEnv(name: string, fallback: number, min: number): number {
   return Math.max(min, intEnv(name, fallback));
 }
 
-/** An explicit window from the environment, clamped into Claude Code's range,
- * or null when unset/unparseable. Distinct from intEnv's fallback behaviour:
- * "unset" and "0" must both mean "derive it", not "use zero". Defers to
- * models.ts for both halves of that: the environment must not be able to seed
- * a window the serving path would itself have rejected. */
-function optionalWindowEnv(name: string): number | null {
-  const raw = process.env[name];
-  if (!raw) return null;
-  const n = usableWindow(Number.parseInt(raw, 10));
-  return n === null ? null : clampContextWindow(n);
-}
-
 function floatEnv(name: string, fallback: number): number {
   const raw = process.env[name];
   if (!raw) return fallback;
@@ -180,8 +154,6 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
     requestTimeoutMs: intEnv("REQUEST_TIMEOUT_MS", 15 * 60 * 1000),
     streamKeepAliveMs: positiveIntEnv("STREAM_KEEPALIVE_MS", 1000, 100),
     usageWindowMs: intEnv("USAGE_WINDOW_MS", 5 * 60 * 60 * 1000),
-    contextWindowCap: clampContextWindow(intEnv("POOL_MAX_CONTEXT", 500_000)),
-    autoCompactWindowOverride: optionalWindowEnv("POOL_AUTO_COMPACT_WINDOW"),
     rateLimitCooldownMs: intEnv("RATE_LIMIT_COOLDOWN_MS", 60 * 60 * 1000),
     overloadRetryMax: positiveIntEnv("OVERLOAD_RETRY_MAX", 4, 0),
     overloadRetryBaseMs: positiveIntEnv("OVERLOAD_RETRY_BASE_MS", 500, 0),

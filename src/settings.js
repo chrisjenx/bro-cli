@@ -23,6 +23,7 @@ export const POOL_SONNET_MODEL = 'claude-sonnet-5[1m]';
 // _DESCRIPTION keys are Claude Code's own opt-out; these mirror its built-in
 // row wording. Bump alongside POOL_SONNET_MODEL.
 export const POOL_SONNET_MODEL_NAME = 'Sonnet';
+export const POOL_SONNET_MODEL_DESCRIPTION = 'Sonnet 5 with 1M context · Efficient for routine tasks';
 
 // Pin Claude Code's `opus` alias to the 1M-context Opus 5, for the same reason
 // as Sonnet above: the bare id is budgeted at 200K behind the gateway and
@@ -32,23 +33,7 @@ export const POOL_OPUS_MODEL = 'claude-opus-5[1m]';
 
 // As POOL_SONNET_MODEL_NAME above. Bump alongside POOL_OPUS_MODEL.
 export const POOL_OPUS_MODEL_NAME = 'Opus';
-
-// "1M" / "500K" / "272K" — matches how Claude Code's own picker writes windows.
-export function formatContextWindow(n) {
-  return n % 1_000_000 === 0 ? `${n / 1_000_000}M` : `${Math.round(n / 1000)}K`;
-}
-
-// The picker description for each pinned alias. Behind a gateway Claude Code
-// renders these rows from the env, so when the pool caps the window the row has
-// to say the real number — a row promising 1M while auto-compact fires at 272K
-// is how you get a surprised user.
-export function sonnetDescriptionFor(contextWindow) {
-  return `Sonnet 5 with ${formatContextWindow(contextWindow ?? 1_000_000)} context · Efficient for routine tasks`;
-}
-export function opusDescriptionFor(contextWindow) {
-  return `Opus 5 with ${formatContextWindow(contextWindow ?? 1_000_000)} context · Best for everyday, complex tasks`;
-}
-
+export const POOL_OPUS_MODEL_DESCRIPTION = 'Opus 5 with 1M context · Best for everyday, complex tasks';
 
 const POOL_ENV_KEYS = [
   'ANTHROPIC_BASE_URL',
@@ -58,49 +43,22 @@ const POOL_ENV_KEYS = [
   'ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION',
   'ANTHROPIC_DEFAULT_OPUS_MODEL',
   'ANTHROPIC_DEFAULT_OPUS_MODEL_NAME',
-  'ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION',
-  // Sized from the pool's mapping. Listed here so `bro pool down` restores or
-  // removes them like the rest of the block.
-  'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
-  'CLAUDE_CODE_MAX_CONTEXT_TOKENS'
+  'ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION'
 ];
 
-/**
- * The full settings.json `env` mutation, in one place so applyPoolEnv, the
- * `bro pool` launch env and `--dry-run`'s report can't drift apart.
- *
- * `contextWindow` is the pool's session-safe budget (see the pool's
- * sessionContextWindow), or null when no family is Codex-mapped. When set:
- *   - CLAUDE_CODE_AUTO_COMPACT_WINDOW sizes auto-compact for the pinned
- *     `claude-*[1m]` aliases — Claude Code takes min(model window, this).
- *   - CLAUDE_CODE_MAX_CONTEXT_TOKENS sizes a raw `gpt-5.6-*` id picked from
- *     gateway discovery. Claude Code applies it only to ids that aren't a known
- *     Claude model, so it can't disturb the aliases above.
- * The [1m] pins stay either way — they're what lifts the ceiling to 1M so the
- * auto-compact value can bind; without them the ceiling is 200K.
- */
-export function poolEnvBlock({ baseUrl, token, contextWindow = null }) {
-  // Normalize once so the descriptions and the write guard can never disagree.
-  // 0, negative, NaN, and non-numbers all mean "no window" — the same path as
-  // null/undefined.
-  const win = typeof contextWindow === 'number' && Number.isFinite(contextWindow) && contextWindow > 0
-    ? contextWindow
-    : null;
-  const env = {
+// The full settings.json `env` mutation, in one place so applyPoolEnv, the
+// `bro pool` launch env and `--dry-run`'s report can't drift apart.
+export function poolEnvBlock({ baseUrl, token }) {
+  return {
     ANTHROPIC_BASE_URL: baseUrl,
     ANTHROPIC_AUTH_TOKEN: token,
     ANTHROPIC_DEFAULT_SONNET_MODEL: POOL_SONNET_MODEL,
     ANTHROPIC_DEFAULT_SONNET_MODEL_NAME: POOL_SONNET_MODEL_NAME,
-    ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION: sonnetDescriptionFor(win),
+    ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION: POOL_SONNET_MODEL_DESCRIPTION,
     ANTHROPIC_DEFAULT_OPUS_MODEL: POOL_OPUS_MODEL,
     ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: POOL_OPUS_MODEL_NAME,
-    ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION: opusDescriptionFor(win)
+    ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION: POOL_OPUS_MODEL_DESCRIPTION
   };
-  if (win) {
-    env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = String(win);
-    env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(win);
-  }
-  return env;
 }
 
 // The snapshot file for one Claude profile. Profiles must not share one: with a
@@ -149,7 +107,7 @@ function writeJson(file, obj) {
 
 // Point settings.json's env at the pool. Snapshots prior values once (so repeat
 // calls don't clobber the original snapshot) and preserves all other settings.
-export function applyPoolEnv({ baseUrl, token, contextWindow = null }, paths = defaultPaths()) {
+export function applyPoolEnv({ baseUrl, token }, paths = defaultPaths()) {
   const settings = readJson(paths.settings) || {};
   const env = { ...(settings.env || {}) };
 
@@ -161,14 +119,12 @@ export function applyPoolEnv({ baseUrl, token, contextWindow = null }, paths = d
   // but unreadable state file is left alone (matches the original behaviour).
   const stateExists = fs.existsSync(paths.state);
   const state = stateExists ? readJson(paths.state) : null;
-  // Null only when the state file exists but won't parse — see the restore loop.
-  let prior = null;
   if (!stateExists) {
-    prior = {};
+    const prior = {};
     for (const k of POOL_ENV_KEYS) prior[k] = k in env ? env[k] : null;
     writeJson(paths.state, { managed: true, prior });
   } else if (state) {
-    prior = { ...(state.prior || {}) };
+    const prior = { ...(state.prior || {}) };
     let changed = false;
     for (const k of POOL_ENV_KEYS) {
       if (!(k in prior)) {
@@ -179,45 +135,7 @@ export function applyPoolEnv({ baseUrl, token, contextWindow = null }, paths = d
     if (changed) writeJson(paths.state, { ...state, prior });
   }
 
-  // Spread the block on, then UNSET every managed key the block chose not to
-  // set. poolEnvBlock omits the two window keys when contextWindow is null, and
-  // a spread cannot clear a value that is already there — so without this, a
-  // window the pool wrote on an earlier `up` survives a later `restart` that
-  // derived no window (every family mapped back to Claude, or a transient
-  // /api/status failure, which fetchContextWindow reports as null). Claude Code
-  // would keep compacting at a number nothing on the branch still believes in,
-  // and the picker descriptions — which DO get rewritten — would contradict it.
-  //
-  // "Unset" is `prior`'s value, not a delete — the same rule clearPoolEnv
-  // applies below, so the two functions share one semantic. A user with only
-  // Claude accounts and no Codex mapping has a null window *permanently*, so an
-  // unconditional delete would strip their own CLAUDE_CODE_AUTO_COMPACT_WINDOW
-  // on every `up`, `restart` and launch, and keep it stripped for as long as the
-  // pool is up. When prior holds a real value the key was the user's, so restore
-  // it; when it holds null the key was absent before the pool, so anything
-  // present can only be what the pool itself wrote — delete that.
-  //
-  // prior is null only when the state file exists but won't parse; delete then,
-  // matching clearPoolEnv, which bails out entirely on that file and so could
-  // not have restored the value either way.
-  //
-  // No risk of resurrecting a pool-written value: the backfill above only
-  // snapshots keys absent from prior, and both window keys joined POOL_ENV_KEYS
-  // in the same commit that first wrote them, so no bro version ever wrote one
-  // while it was unsnapshotted.
-  //
-  // (Unsetting is also why poolEnvBlock must keep omitting rather than emitting
-  // `undefined`: Object.assign into the launch env at pool.js would stringify an
-  // undefined to the literal string "undefined".)
-  const block = poolEnvBlock({ baseUrl, token, contextWindow });
-  const nextEnv = { ...env, ...block };
-  for (const k of POOL_ENV_KEYS) {
-    if (k in block) continue;
-    const was = prior ? prior[k] : null;
-    if (was === null || was === undefined) delete nextEnv[k];
-    else nextEnv[k] = was;
-  }
-  settings.env = nextEnv;
+  settings.env = { ...env, ...poolEnvBlock({ baseUrl, token }) };
   writeJson(paths.settings, settings);
 }
 
@@ -246,37 +164,4 @@ export function clearPoolEnv(paths = defaultPaths()) {
 
 export function isPoolEnvActive(paths = defaultPaths()) {
   return fs.existsSync(paths.state);
-}
-
-// The auto-compact window currently sitting in settings.json (the number Claude
-// Code is actually budgeting against), or null when the key is absent or isn't
-// a positive integer. Read through this module rather than re-reading the file
-// ad hoc, so `bro pool status` and applyPoolEnv can't disagree about which key
-// or which profile's settings.json holds it.
-//
-// It exists because the window only *reaches* Claude Code at `bro pool up` /
-// `restart` / a `bro` launch: a dashboard mapping or context edit moves what
-// the pool reports without moving this, and nothing else would tell the user.
-export function readPoolContextWindow(paths = defaultPaths()) {
-  return positiveInt(readJson(paths.settings)?.env?.CLAUDE_CODE_AUTO_COMPACT_WINDOW);
-}
-
-// The auto-compact window the *user* had set before the pool took the env over,
-// as snapshotted by applyPoolEnv — or null when they had none (or the snapshot
-// is missing/unreadable).
-//
-// applyPoolEnv restores this value whenever the pool derives no window of its
-// own, which is the permanent state for a Claude-only pool. Without a way to
-// recognise it, `bro pool status` would read it back as settings-vs-pool drift
-// and tell the user forever to run a restart that only writes it again.
-export function readPriorContextWindow(paths = defaultPaths()) {
-  return positiveInt(readJson(paths.state)?.prior?.CLAUDE_CODE_AUTO_COMPACT_WINDOW);
-}
-
-// Claude Code's env values are strings; a hand-edited settings.json may hold a
-// number. Anything else — absent, null, non-numeric, non-positive — is no window.
-function positiveInt(raw) {
-  if (typeof raw !== 'string' && typeof raw !== 'number') return null;
-  const n = Number.parseInt(String(raw), 10);
-  return Number.isFinite(n) && n > 0 ? n : null;
 }

@@ -9,11 +9,7 @@ import { rememberSelection, lastProvider, lastModelFor } from './state.js';
 
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 
-// Exported so the test suite can import this module at all: nothing else here
-// is importable, so a syntax error in this template literal — a literal
-// backtick or `${` slipping in — would ship a green suite and fail only when a
-// user ran the binary. That has happened twice.
-export const HELP = `bro — run Claude Code against any provider/model.
+const HELP = `bro — run Claude Code against any provider/model.
 
 Usage:
   bro                    Pick a provider, then a model (interactive)
@@ -28,10 +24,6 @@ Usage:
                          Copy this machine's current Claude login into the pool
   bro models list        List pool model routing entries
   bro models update      Refresh the pool's model list (Claude + OpenAI/gpt)
-  bro models context <id> <tokens|default>
-                         Set a pool model's context-window ceiling, or
-                         "default" to clear it. Applies immediately when the
-                         pool is running, else on the next start.
   bro image              Image generation — pick an API, then a self-hosted
                          web UI opens (images save to ./.bro/image-gen)
   bro image -p <api>     Skip the image API menu (e.g. bro image -p yunwu)

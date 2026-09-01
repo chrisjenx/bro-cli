@@ -57,11 +57,6 @@ The direct backend intentionally does not synthesize Anthropic protocol headers
 such as `anthropic-version` or `anthropic-beta`. Those come from the harness
 request. Claude Code already sends the OAuth beta header it needs.
 
-Before a Codex request leaves the pool, `context-guard.ts` estimates its input
-size (chars/4) and rejects anything past the route's effective window with a 400
-naming the model and the limit, rather than letting Codex answer with an opaque
-parameter error.
-
 ## Legacy CLI backend
 
 Set `CLAUDE_POOL_BACKEND=cli` to use the previous `/v1/messages` path. That path calls `runClaude(prompt, { configDir, model, ... })`, spawns the CLI with `--print --output-format stream-json --verbose --include-partial-messages`, parses newline-delimited CLI JSON into normalized `TurnEvent`s, and re-serializes those events through the Anthropic adapter.

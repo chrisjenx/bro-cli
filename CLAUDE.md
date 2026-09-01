@@ -55,8 +55,6 @@ The pool is a Bun TypeScript package that exposes Anthropic-compatible `/v1/mess
 - `pool/src/server/server.ts` wires Bun HTTP routes, proxy auth, model routing, status JSON, and the dashboard. `pool/src/server/failover.ts` contains retry/failover helpers used around initial rate-limit failures.
 - `pool/src/adapters/*` and `pool/src/subprocess/*` are the legacy compatibility path: `CLAUDE_POOL_BACKEND=cli` or OpenAI compatibility can flatten requests into `claude --print --output-format stream-json`, normalize CLI JSON into `TurnEvent`s, then serialize Anthropic/OpenAI-style responses.
 - `pool/src/models.ts` owns the pool model routing table: request model id -> upstream provider/model, with built-in Claude aliases and Codex ids plus user overrides.
-- `pool/src/models.ts` also owns context windows: per-route `contextWindow`/`maxContextWindow`, the `POOL_MAX_CONTEXT` house cap, and `sessionContextWindow()` — the minimum window across Codex-mapped families, which `src/pool.js` turns into `CLAUDE_CODE_AUTO_COMPACT_WINDOW` + `CLAUDE_CODE_MAX_CONTEXT_TOKENS`. Keep the `[1m]` pins in `poolEnvBlock()`: they raise Claude Code's ceiling to 1M so the auto-compact value can bind.
-- `applyContextEdits()` in `pool/src/models.ts` is the single validated seam for every context mutation. `POST /api/context` and `bun run src/index.ts models context` both go through it and must stay that way — the CLI posts to a running pool so edits hot-apply, and only writes `models.json` itself when no pool answers (or the pool is too old to know the route). Adding a third surface means calling that function, not restating its rules.
 
 See `pool/ARCHITECTURE.md` for the detailed pool request lifecycle and failure modes.
 

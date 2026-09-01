@@ -6,17 +6,14 @@ import path from 'node:path';
 import {
   applyPoolEnv,
   clearPoolEnv,
-  readPriorContextWindow,
   isPoolEnvActive,
   defaultPaths,
-  poolEnvBlock,
-  formatContextWindow,
   POOL_SONNET_MODEL,
   POOL_OPUS_MODEL,
   POOL_SONNET_MODEL_NAME,
+  POOL_SONNET_MODEL_DESCRIPTION,
   POOL_OPUS_MODEL_NAME,
-  sonnetDescriptionFor,
-  opusDescriptionFor,
+  POOL_OPUS_MODEL_DESCRIPTION
 } from './settings.js';
 
 function tmpPaths() {
@@ -115,9 +112,9 @@ test('apply names and describes the pinned models so the picker reads like the b
   applyPoolEnv(POOL, p);
   const { env } = read(p.settings);
   assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME, POOL_SONNET_MODEL_NAME);
-  assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION, sonnetDescriptionFor(null));
+  assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION, POOL_SONNET_MODEL_DESCRIPTION);
   assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME, POOL_OPUS_MODEL_NAME);
-  assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION, opusDescriptionFor(null));
+  assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION, POOL_OPUS_MODEL_DESCRIPTION);
   // A raw model id as the label is the exact symptom these keys exist to avoid.
   assert.ok(!env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME.includes('[1m]'));
   assert.ok(!env.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME.includes('[1m]'));
@@ -225,192 +222,4 @@ test('apply twice keeps the original snapshot', () => {
   applyPoolEnv({ baseUrl: 'http://127.0.0.1:9999', token: 'x' }, p);
   clearPoolEnv(p);
   assert.equal(read(p.settings).env.ANTHROPIC_BASE_URL, 'https://gw.example');
-});
-
-test('poolEnvBlock without a context window is unchanged (1M pins, no new keys)', () => {
-  const env = poolEnvBlock(POOL);
-  assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL, POOL_SONNET_MODEL);
-  assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL, POOL_OPUS_MODEL);
-  assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION, sonnetDescriptionFor(null));
-  assert.equal('CLAUDE_CODE_AUTO_COMPACT_WINDOW' in env, false);
-  assert.equal('CLAUDE_CODE_MAX_CONTEXT_TOKENS' in env, false);
-});
-
-// The [1m] pins stay: they raise Claude Code's ceiling to 1M so the
-// auto-compact window can bind at our number. Dropping them would floor the
-// ceiling at 200K and make the cap worse, not better.
-test('poolEnvBlock with a context window keeps the 1M pins and adds both knobs', () => {
-  const env = poolEnvBlock({ ...POOL, contextWindow: 272000 });
-  assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL, POOL_SONNET_MODEL);
-  assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL, POOL_OPUS_MODEL);
-  assert.equal(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '272000');
-  assert.equal(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '272000');
-});
-
-// A raw gpt-5.6-* id picked from gateway discovery is an unknown model to
-// Claude Code; MAX_CONTEXT_TOKENS is the only knob that sizes those, and it
-// applies only to non-claude- ids, so it can't disturb the aliases.
-test('poolEnvBlock restates the real window in the picker descriptions', () => {
-  const env = poolEnvBlock({ ...POOL, contextWindow: 500000 });
-  assert.match(env.ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION, /500K context/);
-  assert.match(env.ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION, /500K context/);
-  assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME, POOL_SONNET_MODEL_NAME);
-});
-
-// contextWindow: 0 must take the exact no-window path, not a half-applied one
-// where the description says "0M" but no env var backs it, or the reverse.
-test('poolEnvBlock treats a context window of 0 as no window at all', () => {
-  const env = poolEnvBlock({ ...POOL, contextWindow: 0 });
-  assert.match(env.ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION, /1M context/);
-  assert.match(env.ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION, /1M context/);
-  assert.equal('CLAUDE_CODE_AUTO_COMPACT_WINDOW' in env, false);
-  assert.equal('CLAUDE_CODE_MAX_CONTEXT_TOKENS' in env, false);
-});
-
-test('formatContextWindow renders round millions as M and the rest as K', () => {
-  assert.equal(formatContextWindow(1000000), '1M');
-  assert.equal(formatContextWindow(500000), '500K');
-  assert.equal(formatContextWindow(272000), '272K');
-});
-
-test('clearPoolEnv removes the context keys it added', () => {
-  const paths = tmpPaths();
-  applyPoolEnv({ ...POOL, contextWindow: 272000 }, paths);
-  assert.equal(read(paths.settings).env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '272000');
-  clearPoolEnv(paths);
-  const after = read(paths.settings);
-  assert.equal(after.env, undefined);
-});
-
-// The pool's own previously-written window must not outlive the mapping that
-// produced it. poolEnvBlock omits the two keys when the window is null, and a
-// spread can't clear what's already in the file — so applyPoolEnv has to delete
-// the managed keys the block didn't set. Reachable two ways: the user maps every
-// family back to Claude, or /api/status blips and fetchContextWindow returns null.
-test('a window returning to null clears the value the pool wrote earlier', () => {
-  const paths = tmpPaths();
-  applyPoolEnv({ ...POOL, contextWindow: 272000 }, paths);
-  assert.equal(read(paths.settings).env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '272000');
-
-  applyPoolEnv({ ...POOL, contextWindow: null }, paths);
-  const env = read(paths.settings).env;
-  assert.equal('CLAUDE_CODE_AUTO_COMPACT_WINDOW' in env, false);
-  assert.equal('CLAUDE_CODE_MAX_CONTEXT_TOKENS' in env, false);
-  // …and the picker descriptions agree with the env, rather than one of them
-  // still promising 272K while the other says 1M.
-  assert.match(env.ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION, /1M context/);
-  assert.match(env.ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION, /1M context/);
-  // The rest of the block is untouched.
-  assert.equal(env.ANTHROPIC_BASE_URL, POOL.baseUrl);
-});
-
-// Unsetting the pool's managed value must not destroy the snapshot/restore
-// contract: the user's own pre-pool window still comes back on `down`.
-test('a window returning to null still restores the user pre-pool value on clear', () => {
-  const paths = tmpPaths();
-  fs.writeFileSync(
-    paths.settings,
-    JSON.stringify({ env: { CLAUDE_CODE_AUTO_COMPACT_WINDOW: '400000', FOO: 'bar' } })
-  );
-  applyPoolEnv({ ...POOL, contextWindow: 272000 }, paths);
-  applyPoolEnv({ ...POOL, contextWindow: null }, paths);
-  assert.equal(read(paths.settings).env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '400000');
-
-  clearPoolEnv(paths);
-  const s = read(paths.settings);
-  assert.equal(s.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '400000');
-  assert.equal(s.env.FOO, 'bar');
-});
-
-// The regression this rule exists to stop. A pool with only Claude accounts and
-// no Codex mapping derives NO window, ever — so `bro pool up`, every `restart`
-// and every launch calls applyPoolEnv with null. Deleting on that path would
-// strip the user's own auto-compact window silently, on the most common
-// configuration this tool has, and keep it stripped for as long as the pool ran.
-// Restoring is the same rule clearPoolEnv applies, so the two now agree.
-test('a null window restores the user own auto-compact value instead of deleting it', () => {
-  const paths = tmpPaths();
-  fs.writeFileSync(
-    paths.settings,
-    JSON.stringify({ env: { CLAUDE_CODE_AUTO_COMPACT_WINDOW: '400000' } })
-  );
-  // First `up` with a window: the pool's number takes over, the user's is
-  // snapshotted. Then the mapping goes away and every later call passes null.
-  applyPoolEnv({ ...POOL, contextWindow: 272000 }, paths);
-  assert.equal(read(paths.settings).env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '272000');
-  // Pool-only key, never the user's — must still be cleared.
-  assert.equal(read(paths.settings).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '272000');
-
-  applyPoolEnv({ ...POOL, contextWindow: null }, paths);
-  let env = read(paths.settings).env;
-  assert.equal(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '400000');
-  assert.equal('CLAUDE_CODE_MAX_CONTEXT_TOKENS' in env, false);
-
-  // …and it survives the repeat calls a real Claude-only pool actually makes.
-  applyPoolEnv({ ...POOL, contextWindow: null }, paths);
-  applyPoolEnv({ ...POOL, contextWindow: null }, paths);
-  env = read(paths.settings).env;
-  assert.equal(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '400000');
-  assert.equal('CLAUDE_CODE_MAX_CONTEXT_TOKENS' in env, false);
-});
-
-// The very first call is the one that matters most: a Claude-only user never
-// gets an apply WITH a window, so the null path has to hold their value from
-// the start — the snapshot is written in this same call.
-test('a first apply with no window leaves the user own value in place', () => {
-  const paths = tmpPaths();
-  fs.writeFileSync(
-    paths.settings,
-    JSON.stringify({ env: { CLAUDE_CODE_AUTO_COMPACT_WINDOW: '400000' } })
-  );
-  applyPoolEnv({ ...POOL, contextWindow: null }, paths);
-  assert.equal(read(paths.settings).env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '400000');
-  // The snapshot records it as the user's, so `down` still restores it.
-  clearPoolEnv(paths);
-  assert.equal(read(paths.settings).env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '400000');
-});
-
-// `prior` only exists inside the two snapshot branches. A state file that is
-// present but unparseable gives neither, so there is nothing to restore from —
-// fall back to deleting, which is also all clearPoolEnv could have managed
-// (it returns false outright on an unreadable state file).
-test('an unreadable state file falls back to deleting the managed window', () => {
-  const paths = tmpPaths();
-  fs.writeFileSync(
-    paths.settings,
-    JSON.stringify({ env: { CLAUDE_CODE_AUTO_COMPACT_WINDOW: '400000' } })
-  );
-  fs.writeFileSync(paths.state, 'not json {');
-  applyPoolEnv({ ...POOL, contextWindow: null }, paths);
-  assert.equal('CLAUDE_CODE_AUTO_COMPACT_WINDOW' in read(paths.settings).env, false);
-});
-
-// The drift reporter asks this what the user's own window was, so it can tell a
-// legitimately-restored value apart from a stale pool-written one.
-test('readPriorContextWindow reports the user pre-pool window, and null without one', () => {
-  const withOwn = tmpPaths();
-  fs.writeFileSync(
-    withOwn.settings,
-    JSON.stringify({ env: { CLAUDE_CODE_AUTO_COMPACT_WINDOW: '400000' } })
-  );
-  applyPoolEnv({ ...POOL, contextWindow: 272000 }, withOwn);
-  assert.equal(readPriorContextWindow(withOwn), 400000);
-
-  const without = tmpPaths();
-  applyPoolEnv({ ...POOL, contextWindow: 272000 }, without);
-  assert.equal(readPriorContextWindow(without), null);
-  // No state file at all (pool never up) is also "no prior window".
-  assert.equal(readPriorContextWindow(tmpPaths()), null);
-});
-
-test('clearPoolEnv restores a pre-existing auto-compact window instead of deleting it', () => {
-  const paths = tmpPaths();
-  fs.writeFileSync(
-    paths.settings,
-    JSON.stringify({ env: { CLAUDE_CODE_AUTO_COMPACT_WINDOW: '400000' } })
-  );
-  applyPoolEnv({ ...POOL, contextWindow: 272000 }, paths);
-  assert.equal(read(paths.settings).env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '272000');
-  clearPoolEnv(paths);
-  assert.equal(read(paths.settings).env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '400000');
 });

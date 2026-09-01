@@ -14,7 +14,6 @@ import type { Account, OpenAIOauthCreds, RateLimitSnapshot, RateLimitWindow } fr
 import type { ModelRoute } from "../models.ts";
 import { refreshOpenAIToken } from "../accounts/openai-oauth.ts";
 import { anthropicToCodexRequest, CodexToAnthropicStream } from "./codex-translate.ts";
-import { checkContextWindow } from "./context-guard.ts";
 import { durationToWindowKey } from "./codex-windows.ts";
 import { CODEX_RESPONSES_URL, CODEX_ORIGINATOR, CODEX_ACCOUNT_ID_HEADER, CODEX_RATE_LIMIT_HEADERS } from "./codex-constants.ts";
 import { anthropicError, makeAbort, SseParser, isRateLimit, retryAfterMs, parseJson, stringProp, objectProp } from "./shared.ts";
@@ -50,9 +49,6 @@ export async function proxyCodexMessages(
   hooks: ProxyHooks = {},
   fetchFn: typeof fetch = fetch,
 ): Promise<Response> {
-  const overflow = checkContextWindow(body, route, config.contextWindowCap);
-  if (overflow) return anthropicError(400, "invalid_request_error", overflow);
-
   const anthropicBody = (body ?? {}) as Record<string, unknown>;
   const metadata = anthropicBody.metadata as Record<string, unknown> | undefined;
   const sessionKey =
@@ -581,14 +577,6 @@ export function describeCodexError(status: number, bodyText: string, accountName
     stringProp(parsed, "message") ??
     (bodyText.trim() ? bodyText.trim().slice(0, 300) : "");
   const cause = detail ? `: ${detail.slice(0, 300)}` : "";
-  // A context-length rejection reads like any other parameter error otherwise,
-  // which sends people hunting the wrong knob.
-  if (/context length|context window|too many tokens|maximum context/i.test(detail)) {
-    return (
-      `Codex backend rejected the request as too large (HTTP ${status})${cause} [account "${accountName}"]. ` +
-      `Compact the conversation, or lower POOL_MAX_CONTEXT so the pool compacts sooner.`
-    );
-  }
   return `Codex backend rejected the request (HTTP ${status})${cause} [account "${accountName}"]`;
 }
 

@@ -326,7 +326,7 @@ test("card() weight editor defaults to 1 when weight is missing (older /api/stat
   expect(html).toContain('value="1"');
 });
 
-function loadMappingCard(): (mapping: unknown, context?: unknown) => string {
+function loadMappingCard(): (mapping: unknown) => string {
   const html = dashboardHtml();
   const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
   if (!script) throw new Error("dashboard <script> block not found");
@@ -450,20 +450,6 @@ describe("model mapping card", () => {
     // Body content stays intact (enable toggle + save button live in the body).
     expect(html).toContain('id="mapping-enabled"');
     expect(html).toContain('id="mapping-save"');
-  });
-});
-
-describe("mapping panel context windows", () => {
-  test("the dashboard renders each family's window from status.context", () => {
-    const html = dashboardHtml();
-    expect(html).toContain("data-ctx-family");
-    expect(html).toContain("sessionWindow");
-  });
-
-  test("the context markup adds no unescaped backtick or interpolation", () => {
-    // dashboard.ts is one template literal; a stray ` or ${ breaks the build.
-    const html = dashboardHtml();
-    expect(html).not.toContain("${sessionWindow}");
   });
 });
 
@@ -633,170 +619,5 @@ describe("settings runtime: collapse persistence + anti-clobber", () => {
     await api.refresh();
 
     expect(grid.innerHTML).toBe("priority draft");
-  });
-});
-
-describe("context editor", () => {
-  test("renders the per-model ceiling inputs and the session window field", () => {
-    const html = dashboardHtml();
-    expect(html).toContain("data-ctx-model");
-    expect(html).toContain("context-save");
-    expect(html).toContain("/api/context");
-  });
-
-  test("honours the env lock by disabling the session-window field", () => {
-    expect(dashboardHtml()).toContain("envLocked");
-  });
-});
-
-// Behavioural coverage for the per-family ctx badge and session hint that
-// mappingCardHtml renders from status.context — extracted and executed via
-// loadMappingCard(), not just grepped for substrings, so a wiring mistake
-// (wrong field read, badge always empty, "undefined" leaking through) fails
-// a test instead of silently shipping.
-describe("mappingCardHtml renders context data (behavioural)", () => {
-  test("a family present in context.families shows its formatted window in the ctx badge", () => {
-    const mappingCardHtml = loadMappingCard();
-    const html = mappingCardHtml(
-      { enabled: true, targets: ["gpt-5.6-sol"], mappings: [{ from: "fable", to: "gpt-5.6-sol" }] },
-      { families: [{ family: "fable", target: "gpt-5.6-sol", window: 872_000 }], sessionWindow: null },
-    );
-    const fableRow = mapRow(html, "fable");
-    expect(fableRow).toContain('data-ctx-family="fable">872K ctx</span>');
-  });
-
-  test("a family absent from context.families renders an empty badge, not \"undefined\"", () => {
-    const mappingCardHtml = loadMappingCard();
-    const html = mappingCardHtml(
-      { enabled: true, targets: ["gpt-5.6-sol"], mappings: [{ from: "fable", to: "gpt-5.6-sol" }] },
-      { families: [], sessionWindow: null },
-    );
-    const fableRow = mapRow(html, "fable");
-    expect(fableRow).toContain('data-ctx-family="fable"></span>');
-    expect(fableRow).not.toContain("undefined");
-  });
-
-  test("the session hint line appears only when sessionWindow is set", () => {
-    const mappingCardHtml = loadMappingCard();
-    const withWindow = mappingCardHtml(
-      { enabled: true, targets: [], mappings: [] },
-      { families: [], sessionWindow: 400_000 },
-    );
-    expect(withWindow).toContain("Auto-compact window");
-    expect(withWindow).toContain("400K");
-
-    const withoutWindow = mappingCardHtml(
-      { enabled: true, targets: [], mappings: [] },
-      { families: [], sessionWindow: null },
-    );
-    expect(withoutWindow).not.toContain("Auto-compact window");
-  });
-
-  // The session window only reaches Claude Code via settings.json, which bro
-  // writes at pool up / pool restart / launch. A mapping change here moves this
-  // number without moving the client's budget, so the hint must say a restart
-  // is needed — otherwise the card reads as live state and a click can put the
-  // client back to budgeting 500K against a 272K model.
-  test("the session hint says a restart is needed to reach Claude Code", () => {
-    const mappingCardHtml = loadMappingCard();
-    const html = mappingCardHtml(
-      { enabled: true, targets: [], mappings: [] },
-      { families: [], sessionWindow: 400_000 },
-    );
-    expect(html).toContain("bro pool restart");
-  });
-});
-
-// Same execute-not-grep pattern as loadMappingCard(), for the new context-panel
-// renderer (per-model ceiling editor + session window field).
-function loadContextCard(): (context: unknown) => string {
-  const html = dashboardHtml();
-  const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
-  if (!script) throw new Error("dashboard <script> block not found");
-  const stubbed = script
-    .replace(/^refresh\(\);$/m, "")
-    .replace(/^setInterval\(refresh, 4000\);$/m, "");
-  const noopEl = { addEventListener() {}, setAttribute() {}, getAttribute() { return null; }, textContent: "", style: {} };
-  const doc = { getElementById: () => noopEl, querySelectorAll: () => [], documentElement: noopEl };
-  const factory = new Function("document", "localStorage", "matchMedia", `${stubbed}\nreturn contextCardHtml;`);
-  return factory(doc, { getItem: () => null, setItem() {} }, () => ({ matches: false }));
-}
-
-describe("contextCardHtml (behavioural)", () => {
-  test("renders a data-ctx-model input holding the ceiling for each openai model", () => {
-    const contextCardHtml = loadContextCard();
-    const html = contextCardHtml({
-      cap: 500_000,
-      sessionWindow: null,
-      envLocked: false,
-      families: [],
-      models: [{ id: "gpt-5.6-sol", ceiling: 872_000, window: 500_000, capped: true }],
-    });
-    expect(html).toContain('data-ctx-model="gpt-5.6-sol"');
-    expect(html).toContain('value="872000"');
-    expect(html).toContain("(capped)");
-  });
-
-  test("disables the session-window field when envLocked, enables it otherwise", () => {
-    const contextCardHtml = loadContextCard();
-    const locked = contextCardHtml({
-      cap: 500_000, sessionWindow: 300_000, envLocked: true, families: [], models: [],
-    });
-    expect(locked).toMatch(/id="context-window"[^>]*disabled/);
-
-    const unlocked = contextCardHtml({
-      cap: 500_000, sessionWindow: null, envLocked: false, families: [], models: [],
-    });
-    expect(unlocked).not.toMatch(/id="context-window"[^>]*disabled/);
-  });
-
-  // A DERIVED window is not a saved setting — it is whatever the mapping
-  // currently implies. Rendering it as `value` made every Save post it back as
-  // an explicit autoCompactWindow, flipping source derived→settings and pinning
-  // the window for good: remapping haiku off gpt-5.4-mini then silently stopped
-  // moving it. A placeholder shows the same number without submitting it.
-  test("a derived session window is a placeholder, not a value, so Save cannot pin it", () => {
-    const contextCardHtml = loadContextCard();
-    const derived = contextCardHtml({
-      cap: 500_000, sessionWindow: 272_000, source: "derived", envLocked: false, families: [], models: [],
-    });
-    expect(derived).not.toMatch(/id="context-window"[^>]*value="272000"/);
-    expect(derived).toMatch(/id="context-window"[^>]*placeholder="272000"/);
-
-    // An explicitly saved window IS a setting, and must stay editable in place.
-    const saved = contextCardHtml({
-      cap: 500_000, sessionWindow: 272_000, source: "settings", envLocked: false, families: [], models: [],
-    });
-    expect(saved).toMatch(/id="context-window"[^>]*value="272000"/);
-  });
-
-  test("surfaces the server's session-window warning, and omits it when there is none", () => {
-    const contextCardHtml = loadContextCard();
-    const warned = contextCardHtml({
-      cap: 500_000, sessionWindow: 500_000, source: "settings", envLocked: false,
-      warning: "session window 500,000 is larger than 272,000, the window of the smallest mapped model (gpt-5.4-mini)",
-      families: [], models: [],
-    });
-    expect(warned).toContain("gpt-5.4-mini");
-    expect(warned).toContain("ctx-warn");
-
-    const quiet = contextCardHtml({
-      cap: 500_000, sessionWindow: 272_000, source: "settings", envLocked: false,
-      warning: null, families: [], models: [],
-    });
-    expect(quiet).not.toContain("ctx-warn");
-  });
-
-  test("returns an empty string for a null context (panel stays hidden)", () => {
-    const contextCardHtml = loadContextCard();
-    expect(contextCardHtml(null)).toBe("");
-  });
-
-  test("the session hint says a restart is needed to reach Claude Code", () => {
-    const contextCardHtml = loadContextCard();
-    const html = contextCardHtml({
-      cap: 500_000, sessionWindow: 400_000, envLocked: false, families: [], models: [],
-    });
-    expect(html).toContain("bro pool restart");
   });
 });
