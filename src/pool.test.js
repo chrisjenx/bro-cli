@@ -57,3 +57,4 @@ test('start and stop are aliases for up and down', () => {
 test('an unknown pool subcommand still fails instead of silently doing nothing', async () => {
   assert.equal(await runPoolCommand(['bogus']), 1);
 });
+

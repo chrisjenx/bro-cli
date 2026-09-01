@@ -19,7 +19,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { which, globalBinDirs, runInherit } from './proc.js';
 import { permissionArgs } from './launch.js';
-import { applyPoolEnv, clearPoolEnv, isPoolEnvActive, poolEnvBlock, scrubLegacyPins } from './settings.js';
+import { applyPoolEnv, clearPoolEnv, isPoolEnvActive, poolEnvBlock, scrubLegacyPins, refreshCachedFableRowFile } from './settings.js';
 import { select, prompt, holdOrContinue } from './ui.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -383,7 +383,23 @@ export function reapplyPoolEnv(port, paths) {
   applyPoolEnv(poolEnvValues(port), paths);
 }
 
-// `bro pool up` — start the pool as the backend for ALL Claude Code sessions.
+// Refresh the active profile's cached Fable picker row from the running pool's
+// live catalog (see refreshCachedFableRow). Best effort: an unreachable pool
+// or catalog just leaves the row as it is.
+export async function syncFableRow(port) {
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 8000);
+    const res = await fetch(`http://127.0.0.1:${port}/v1/models`, { signal: ctrl.signal, headers: { connection: 'close' } });
+    clearTimeout(t);
+    if (!res.ok) return false;
+    const body = await res.json();
+    return refreshCachedFableRowFile(body?.data);
+  } catch {
+    return false;
+  }
+}
+
 export async function poolUp() {
   const port = poolPort();
   const baseUrl = `http://127.0.0.1:${port}`;
@@ -395,6 +411,7 @@ export async function poolUp() {
   }
   await ensureServer(bun, port, baseUrl);
   reapplyPoolEnv(port);
+  await syncFableRow(port);
   printStatus(await fetchStatus(port), baseUrl);
   console.log('  ' + C.green('Pool is now the backend for all Claude Code sessions') + C.dim(' (agents included).'));
   console.log('  ' + C.dim('Stop it with ') + 'bro pool down');
@@ -431,6 +448,7 @@ export async function poolRestart() {
   }
   await ensureServer(bun, port, baseUrl);
   reapplyPoolEnv(port);
+  await syncFableRow(port);
   printStatus(await fetchStatus(port), baseUrl);
   console.log('  ' + C.green('Pool restarted.') + '\n');
   return 0;
@@ -526,6 +544,7 @@ export async function runPool({ extraArgs = [], permissionMode = 'auto', dryRun 
   //    Claude Code session, including agents started from the agents view.
   await ensureServer(bun, port, baseUrl);
   applyPoolEnv({ baseUrl: b, token });
+  await syncFableRow(port);
 
   // 3) Flash the live status, then launch. Hold ~1.5s; enter launches now,
   //    any other key pauses so you can read it, esc cancels.

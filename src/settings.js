@@ -38,6 +38,68 @@ export function poolEnvBlock({ baseUrl, token }) {
   };
 }
 
+// Claude Code's Fable picker row is not built in: it is `additionalModelOptionsCache`
+// in the profile's .claude.json, written by a startup "bootstrap" call that only
+// runs when the profile has a live claude.ai login. Behind the pool (token auth)
+// it never refreshes, so the row goes stale and the picker offers an old Fable
+// beside the current one. Pinning ANTHROPIC_DEFAULT_FABLE_MODEL doesn't replace
+// that row — it adds a second one. So bro refreshes the cached row itself from
+// the pool's live GET /v1/models (Anthropic's catalog): newest claude-fable-* id,
+// only the version-bearing parts changed, everything else in the entry kept.
+export function newestFable(models) {
+  const fables = (Array.isArray(models) ? models : [])
+    .filter((m) => m && typeof m.id === 'string' && /^claude-fable-\d/.test(m.id))
+    .sort((a, b) => (b.created || 0) - (a.created || 0) || b.id.localeCompare(a.id, undefined, { numeric: true }));
+  const newest = fables[0];
+  if (!newest) return null;
+  return { id: newest.id, name: (newest.display_name || newest.id).replace(/^Claude\s+/, '') };
+}
+
+// Rewrites the cached Fable row in `claudeJson` (parsed .claude.json) to `fable`
+// ({ id, name } from newestFable). Returns true when something changed. Only
+// touches an existing claude-fable-* entry: with no cached row there is nothing
+// stale to fix, and inventing one is Claude Code's job.
+export function refreshCachedFableRow(claudeJson, fable) {
+  const rows = claudeJson?.additionalModelOptionsCache;
+  if (!fable || !Array.isArray(rows)) return false;
+  let changed = false;
+  for (const row of rows) {
+    if (!row || typeof row.value !== 'string' || !/^claude-fable-\d/.test(row.value)) continue;
+    const m = /^(claude-fable-[\w.-]*?)(\[1m\])?$/.exec(row.value);
+    if (!m || m[1] === fable.id) continue;
+    const oldName = oldFableName(row) ?? m[1];
+    row.value = `${fable.id}${m[2] || ''}`;
+    if (typeof row.description === 'string' && oldName && row.description.startsWith(oldName)) {
+      row.description = fable.name + row.description.slice(oldName.length);
+    }
+    changed = true;
+  }
+  return changed;
+}
+
+// "Fable 5 · Most capable…" → "Fable 5"; the description's leading version token.
+function oldFableName(row) {
+  const m = typeof row.description === 'string' ? /^(Fable[^·]*?)\s*·/.exec(row.description) : null;
+  return m ? m[1] : null;
+}
+
+// Path of the .claude.json Claude Code reads for the active profile.
+export function claudeJsonPath() {
+  const dir = process.env.CLAUDE_CONFIG_DIR;
+  return dir ? path.join(dir, '.claude.json') : path.join(os.homedir(), '.claude.json');
+}
+
+// Apply refreshCachedFableRow to the file on disk, atomically. Returns true when
+// it rewrote the file. Never throws: a missing or unparseable file is left alone.
+export function refreshCachedFableRowFile(models, file = claudeJsonPath()) {
+  const json = readJson(file);
+  if (!json || !refreshCachedFableRow(json, newestFable(models))) return false;
+  const tmp = `${file}.bro-tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(json, null, 2));
+  fs.renameSync(tmp, file);
+  return true;
+}
+
 // Every value an earlier bro ever wrote for a retired key. Closed, historical
 // list — bro writes no pins any more, so it never needs a new entry. Used where
 // there is no snapshot to consult (a wiped ~/.bro, or an exported shell env) to
@@ -52,12 +114,22 @@ const LEGACY_PIN_VALUES = new Set([
 
 // Deletes retired-key values that an earlier bro wrote; user values stay.
 export function scrubLegacyPins(env) {
-  for (const k of RETIRED_POOL_ENV_KEYS) if (LEGACY_PIN_VALUES.has(env[k])) delete env[k];
+  for (const k of RETIRED_POOL_ENV_KEYS) if (isBroPinValue(k, env[k])) delete env[k];
   return env;
 }
 
+// A value bro wrote for a retired key: one of the historical literals, or the
+// shape fablePinFromCatalog produces for any model version.
+function isBroPinValue(k, value) {
+  if (LEGACY_PIN_VALUES.has(value)) return true;
+  if (typeof value !== 'string') return false;
+  if (k === 'ANTHROPIC_DEFAULT_FABLE_MODEL') return /^claude-fable-\d[\w.-]*\[1m\]$/.test(value);
+  if (k === 'ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION') return value.endsWith(' · Most capable for your hardest and longest-running tasks');
+  return false;
+}
+
 function snapshotValue(env, k) {
-  if (!(k in env) || LEGACY_PIN_VALUES.has(env[k])) return null;
+  if (!(k in env) || isBroPinValue(k, env[k])) return null;
   return env[k];
 }
 

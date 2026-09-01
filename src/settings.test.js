@@ -9,6 +9,9 @@ import {
   isPoolEnvActive,
   defaultPaths,
   poolEnvBlock,
+  newestFable,
+  refreshCachedFableRow,
+  refreshCachedFableRowFile,
   RETIRED_POOL_ENV_KEYS
 } from './settings.js';
 
@@ -229,4 +232,51 @@ test('apply twice keeps the original snapshot', () => {
   applyPoolEnv({ baseUrl: 'http://127.0.0.1:9999', token: 'x' }, p);
   clearPoolEnv(p);
   assert.equal(read(p.settings).env.ANTHROPIC_BASE_URL, 'https://gw.example');
+});
+
+// Claude Code's Fable picker row is a cached bootstrap answer that never
+// refreshes behind the pool; bro refreshes it from the live catalog instead.
+test('newestFable picks the newest claude-fable-* id from the catalog', () => {
+  const models = [
+    { id: 'claude-fable-5', display_name: 'Claude Fable 5', created: 100 },
+    { id: 'claude-opus-5', display_name: 'Claude Opus 5', created: 300 },
+    { id: 'claude-fable-5-1', display_name: 'Claude Fable 5.1', created: 200 },
+    { id: 'gpt-5.6-sol' }
+  ];
+  assert.deepEqual(newestFable(models), { id: 'claude-fable-5-1', name: 'Fable 5.1' });
+  assert.equal(newestFable([{ id: 'claude-fable-5' }, { id: 'claude-fable-5-2' }]).id, 'claude-fable-5-2');
+  assert.equal(newestFable([{ id: 'claude-opus-5' }]), null);
+  assert.equal(newestFable(null), null);
+});
+
+test('refreshCachedFableRow rewrites only the version-bearing parts of a stale row', () => {
+  const json = { additionalModelOptionsCache: [
+    { value: 'claude-fable-5[1m]', label: 'Fable', description: 'Fable 5 · Most capable for your hardest and longest-running tasks · $10/$50 per Mtok' },
+    { value: 'claude-opus-5', label: 'Opus', description: 'Opus 5 · x' }
+  ], additionalModelOptionsAnsweredAt: 123 };
+  assert.equal(refreshCachedFableRow(json, { id: 'claude-fable-5-1', name: 'Fable 5.1' }), true);
+  assert.deepEqual(json.additionalModelOptionsCache[0], {
+    value: 'claude-fable-5-1[1m]', label: 'Fable',
+    description: 'Fable 5.1 · Most capable for your hardest and longest-running tasks · $10/$50 per Mtok'
+  });
+  assert.deepEqual(json.additionalModelOptionsCache[1], { value: 'claude-opus-5', label: 'Opus', description: 'Opus 5 · x' });
+  assert.equal(json.additionalModelOptionsAnsweredAt, 123);
+  // Already current, no cache, or no Fable in the catalog: untouched.
+  assert.equal(refreshCachedFableRow(json, { id: 'claude-fable-5-1', name: 'Fable 5.1' }), false);
+  assert.equal(refreshCachedFableRow({}, { id: 'claude-fable-5-1', name: 'Fable 5.1' }), false);
+  assert.equal(refreshCachedFableRow(json, null), false);
+});
+
+test('refreshCachedFableRowFile rewrites .claude.json in place and leaves a missing file alone', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bro-claude-json-'));
+  const file = path.join(dir, '.claude.json');
+  fs.writeFileSync(file, JSON.stringify({ other: true, additionalModelOptionsCache: [{ value: 'claude-fable-5[1m]', label: 'Fable', description: 'Fable 5 · Most capable' }] }));
+  const models = [{ id: 'claude-fable-5-1', display_name: 'Claude Fable 5.1' }];
+  assert.equal(refreshCachedFableRowFile(models, file), true);
+  const out = read(file);
+  assert.equal(out.other, true);
+  assert.equal(out.additionalModelOptionsCache[0].value, 'claude-fable-5-1[1m]');
+  assert.equal(out.additionalModelOptionsCache[0].description, 'Fable 5.1 · Most capable');
+  assert.equal(refreshCachedFableRowFile(models, file), false);
+  assert.equal(refreshCachedFableRowFile(models, path.join(dir, 'missing.json')), false);
 });
