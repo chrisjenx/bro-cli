@@ -10,6 +10,7 @@ import {
   defaultPaths,
   poolEnvBlock,
   newestFable,
+  sonnetPinFromCatalog,
   refreshCachedFableRow,
   refreshCachedFableRowFile,
   RETIRED_POOL_ENV_KEYS
@@ -102,7 +103,7 @@ test('apply adds env keys and preserves other settings', () => {
 // Claude Code renders its own picker rows behind the gateway (current Opus,
 // Sonnet, Fable, Haiku, with the 1M variants). Pinning ANTHROPIC_DEFAULT_*_MODEL
 // meant a bro release for every model release, so bro no longer touches them.
-test('apply sets only the base URL and token — no model pins', () => {
+test('apply sets only the base URL and token unless catalog-derived pins are given', () => {
   const p = tmpPaths();
   applyPoolEnv(POOL, p);
   const { env } = read(p.settings);
@@ -279,4 +280,44 @@ test('refreshCachedFableRowFile rewrites .claude.json in place and leaves a miss
   assert.equal(out.additionalModelOptionsCache[0].description, 'Fable 5.1 · Most capable');
   assert.equal(refreshCachedFableRowFile(models, file), false);
   assert.equal(refreshCachedFableRowFile(models, path.join(dir, 'missing.json')), false);
+});
+
+// Sonnet's built-in row shows twice behind the pool (200K + 1M); a pin replaces
+// it with one 1M row. The pin comes from the live catalog, never a literal.
+test('sonnetPinFromCatalog pins the newest Sonnet 1M with Claude Code\'s row wording', () => {
+  const pins = sonnetPinFromCatalog([
+    { id: 'claude-sonnet-4-6', display_name: 'Claude Sonnet 4.6', created: 100 },
+    { id: 'claude-sonnet-5', display_name: 'Claude Sonnet 5', created: 200 },
+    { id: 'claude-fable-5-1', display_name: 'Claude Fable 5.1', created: 300 }
+  ]);
+  assert.deepEqual(pins, {
+    ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-5[1m]',
+    ANTHROPIC_DEFAULT_SONNET_MODEL_NAME: 'Sonnet',
+    ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION: 'Sonnet 5 with 1M context · Efficient for routine tasks'
+  });
+  assert.deepEqual(sonnetPinFromCatalog([{ id: 'claude-opus-5' }]), {});
+});
+
+test('apply writes the derived Sonnet pin; an apply without one removes it; clear restores the user', () => {
+  const p = tmpPaths();
+  fs.writeFileSync(p.settings, JSON.stringify({ env: { ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-4-6' } }));
+  const pins = sonnetPinFromCatalog([{ id: 'claude-sonnet-5', display_name: 'Claude Sonnet 5' }]);
+  applyPoolEnv({ ...POOL, pins }, p);
+  assert.equal(read(p.settings).env.ANTHROPIC_DEFAULT_SONNET_MODEL, 'claude-sonnet-5[1m]');
+  assert.equal(read(p.settings).env.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME, 'Sonnet');
+  applyPoolEnv(POOL, p); // catalog unreachable this time
+  assert.equal(read(p.settings).env.ANTHROPIC_DEFAULT_SONNET_MODEL, 'claude-sonnet-4-6');
+  assert.ok(!('ANTHROPIC_DEFAULT_SONNET_MODEL_NAME' in read(p.settings).env));
+  clearPoolEnv(p);
+  assert.deepEqual(read(p.settings), { env: { ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-4-6' } });
+});
+
+test('a future derived Sonnet pin is recognised as bro\'s when no snapshot survived', () => {
+  const p = tmpPaths();
+  fs.writeFileSync(p.settings, JSON.stringify({ env: {
+    ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-6[1m]',
+    ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION: 'Sonnet 6 with 1M context · Efficient for routine tasks'
+  } }));
+  applyPoolEnv(POOL, p);
+  assert.ok(!('ANTHROPIC_DEFAULT_SONNET_MODEL' in read(p.settings).env));
 });

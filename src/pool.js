@@ -19,7 +19,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { which, globalBinDirs, runInherit } from './proc.js';
 import { permissionArgs } from './launch.js';
-import { applyPoolEnv, clearPoolEnv, isPoolEnvActive, poolEnvBlock, scrubLegacyPins, refreshCachedFableRowFile } from './settings.js';
+import { applyPoolEnv, clearPoolEnv, isPoolEnvActive, poolEnvBlock, scrubLegacyPins, refreshCachedFableRowFile, sonnetPinFromCatalog } from './settings.js';
 import { select, prompt, holdOrContinue } from './ui.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -379,25 +379,35 @@ function poolEnvValues(port) {
 // Point settings.json's env at the pool on <port>. Shared by `up` and `restart`
 // so a restart keeps the override in sync with `up` rather than drifting.
 // `paths` is injectable for tests.
-export function reapplyPoolEnv(port, paths) {
-  applyPoolEnv(poolEnvValues(port), paths);
+export function reapplyPoolEnv(port, paths, pins = {}) {
+  applyPoolEnv({ ...poolEnvValues(port), pins }, paths);
 }
 
-// Refresh the active profile's cached Fable picker row from the running pool's
-// live catalog (see refreshCachedFableRow). Best effort: an unreachable pool
-// or catalog just leaves the row as it is.
-export async function syncFableRow(port) {
+// The running pool's live catalog (Anthropic's GET /v1/models via the pool), or
+// null when the pool or its catalog can't be reached.
+async function liveCatalog(port) {
   try {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), 8000);
     const res = await fetch(`http://127.0.0.1:${port}/v1/models`, { signal: ctrl.signal, headers: { connection: 'close' } });
     clearTimeout(t);
-    if (!res.ok) return false;
+    if (!res.ok) return null;
     const body = await res.json();
-    return refreshCachedFableRowFile(body?.data);
+    return Array.isArray(body?.data) ? body.data : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+// Everything bro derives from the live catalog for one profile: the env pins to
+// write, and a refresh of Claude Code's cached Fable row (see settings.js for
+// why the two families need different treatment). Best effort: with no catalog
+// nothing is pinned and the cached row is left as it is.
+export async function catalogSync(port) {
+  const models = await liveCatalog(port);
+  if (!models) return { pins: {} };
+  refreshCachedFableRowFile(models);
+  return { pins: sonnetPinFromCatalog(models) };
 }
 
 export async function poolUp() {
@@ -410,8 +420,7 @@ export async function poolUp() {
     return 0;
   }
   await ensureServer(bun, port, baseUrl);
-  reapplyPoolEnv(port);
-  await syncFableRow(port);
+  reapplyPoolEnv(port, undefined, (await catalogSync(port)).pins);
   printStatus(await fetchStatus(port), baseUrl);
   console.log('  ' + C.green('Pool is now the backend for all Claude Code sessions') + C.dim(' (agents included).'));
   console.log('  ' + C.dim('Stop it with ') + 'bro pool down');
@@ -447,8 +456,7 @@ export async function poolRestart() {
     console.log('Pool server not running — starting it.');
   }
   await ensureServer(bun, port, baseUrl);
-  reapplyPoolEnv(port);
-  await syncFableRow(port);
+  reapplyPoolEnv(port, undefined, (await catalogSync(port)).pins);
   printStatus(await fetchStatus(port), baseUrl);
   console.log('  ' + C.green('Pool restarted.') + '\n');
   return 0;
@@ -515,6 +523,7 @@ export async function runPool({ extraArgs = [], permissionMode = 'auto', dryRun 
   const { baseUrl: b, token } = poolEnvValues(port);
 
   if (dryRun) {
+    const { pins } = await catalogSync(port);
     return {
       via: 'multiple-account pool',
       poolServer: `bun run ${POOL_ENTRY} serve`,
@@ -522,11 +531,11 @@ export async function runPool({ extraArgs = [], permissionMode = 'auto', dryRun 
       backend: process.env.CLAUDE_POOL_BACKEND || 'oauth',
       baseUrl,
       accounts: listAccounts(),
-      settingsEnv: poolEnvBlock({ baseUrl: b, token }),
+      settingsEnv: poolEnvBlock({ baseUrl: b, token, pins }),
       claude: {
         cmd: which('claude') || 'claude',
         args: [...permissionArgs(permissionMode), ...extraArgs],
-        env: poolEnvBlock({ baseUrl, token })
+        env: poolEnvBlock({ baseUrl, token, pins })
       }
     };
   }
@@ -543,8 +552,8 @@ export async function runPool({ extraArgs = [], permissionMode = 'auto', dryRun 
   // 2) Bring the (persistent) server up and make the pool the backend for every
   //    Claude Code session, including agents started from the agents view.
   await ensureServer(bun, port, baseUrl);
-  applyPoolEnv({ baseUrl: b, token });
-  await syncFableRow(port);
+  const { pins } = await catalogSync(port);
+  applyPoolEnv({ baseUrl: b, token, pins });
 
   // 3) Flash the live status, then launch. Hold ~1.5s; enter launches now,
   //    any other key pauses so you can read it, esc cancels.
@@ -576,7 +585,7 @@ export async function runPool({ extraArgs = [], permissionMode = 'auto', dryRun 
   // Model pins exported by an earlier bro (e.g. inherited from a shell it
   // launched) are dropped for the same reason; a pin the user set stays.
   scrubLegacyPins(env);
-  Object.assign(env, poolEnvBlock({ baseUrl: b, token }));
+  Object.assign(env, poolEnvBlock({ baseUrl: b, token, pins }));
   env.NODE_NO_WARNINGS = '1';
 
   const claudeArgs = [...permissionArgs(permissionMode), ...extraArgs];

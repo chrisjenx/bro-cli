@@ -58,3 +58,13 @@ test('an unknown pool subcommand still fails instead of silently doing nothing',
   assert.equal(await runPoolCommand(['bogus']), 1);
 });
 
+
+// `up`/`restart` pass the catalog-derived pins through reapplyPoolEnv.
+test('reapplyPoolEnv writes catalog-derived pins alongside the pool env', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bro-pool-pins-'));
+  const paths = { settings: path.join(dir, 'settings.json'), state: path.join(dir, 'pool-settings.json') };
+  reapplyPoolEnv(4321, paths, { ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-5[1m]', ANTHROPIC_DEFAULT_SONNET_MODEL_NAME: 'Sonnet' });
+  const { env } = JSON.parse(fs.readFileSync(paths.settings, 'utf8'));
+  assert.equal(env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:4321');
+  assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL, 'claude-sonnet-5[1m]');
+});

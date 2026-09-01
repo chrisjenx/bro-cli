@@ -11,10 +11,10 @@ import { createHash } from 'node:crypto';
 // Keys bro writes today: just enough to point Claude Code at the pool.
 const ACTIVE_KEYS = ['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN'];
 
-// Keys an earlier bro wrote and this one no longer does: Claude Code owns its
-// own model picker (behind the gateway it already renders the current Opus/
-// Sonnet/Fable/Haiku rows, 1M variants included). Still managed so `bro pool up`
-// scrubs old pins and `bro pool down` restores whatever the user had before.
+// Model-pin keys. Written only when derived from the live catalog at apply time
+// (sonnetPinFromCatalog — see there for why Sonnet is pinned and Fable is not);
+// otherwise they revert to the user's pre-pool value, which also scrubs pins an
+// earlier bro hard-coded. `bro pool down` restores whatever the user had.
 export const RETIRED_POOL_ENV_KEYS = [
   'ANTHROPIC_DEFAULT_SONNET_MODEL',
   'ANTHROPIC_DEFAULT_SONNET_MODEL_NAME',
@@ -31,10 +31,11 @@ const POOL_ENV_KEYS = [...ACTIVE_KEYS, ...RETIRED_POOL_ENV_KEYS];
 
 // The full settings.json `env` mutation, in one place so applyPoolEnv, the
 // `bro pool` launch env and `--dry-run`'s report can't drift apart.
-export function poolEnvBlock({ baseUrl, token }) {
+export function poolEnvBlock({ baseUrl, token, pins = {} }) {
   return {
     ANTHROPIC_BASE_URL: baseUrl,
-    ANTHROPIC_AUTH_TOKEN: token
+    ANTHROPIC_AUTH_TOKEN: token,
+    ...pins
   };
 }
 
@@ -46,13 +47,34 @@ export function poolEnvBlock({ baseUrl, token }) {
 // that row — it adds a second one. So bro refreshes the cached row itself from
 // the pool's live GET /v1/models (Anthropic's catalog): newest claude-fable-* id,
 // only the version-bearing parts changed, everything else in the entry kept.
-export function newestFable(models) {
-  const fables = (Array.isArray(models) ? models : [])
-    .filter((m) => m && typeof m.id === 'string' && /^claude-fable-\d/.test(m.id))
+export function newestOfFamily(models, family) {
+  const re = new RegExp(`^claude-${family}-\\d`);
+  const hits = (Array.isArray(models) ? models : [])
+    .filter((m) => m && typeof m.id === 'string' && re.test(m.id))
     .sort((a, b) => (b.created || 0) - (a.created || 0) || b.id.localeCompare(a.id, undefined, { numeric: true }));
-  const newest = fables[0];
+  const newest = hits[0];
   if (!newest) return null;
   return { id: newest.id, name: (newest.display_name || newest.id).replace(/^Claude\s+/, '') };
+}
+
+export function newestFable(models) {
+  return newestOfFamily(models, 'fable');
+}
+
+// Sonnet's picker row IS built in, and behind the pool (token auth) Claude Code
+// shows it twice: "Sonnet" (200K-budgeted) and "Sonnet 5 (1M context)". Unlike
+// Fable, pinning ANTHROPIC_DEFAULT_SONNET_MODEL replaces the built-in row, so a
+// pin collapses the pair into one 1M row. Derived from the live catalog (newest
+// claude-sonnet-*), wording copied from Claude Code's own row, so no release is
+// needed for the next Sonnet. {} when the catalog has no Sonnet: nothing pinned.
+export function sonnetPinFromCatalog(models) {
+  const sonnet = newestOfFamily(models, 'sonnet');
+  if (!sonnet) return {};
+  return {
+    ANTHROPIC_DEFAULT_SONNET_MODEL: `${sonnet.id}[1m]`,
+    ANTHROPIC_DEFAULT_SONNET_MODEL_NAME: 'Sonnet',
+    ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION: `${sonnet.name} with 1M context · Efficient for routine tasks`
+  };
 }
 
 // Rewrites the cached Fable row in `claudeJson` (parsed .claude.json) to `fable`
@@ -125,6 +147,8 @@ function isBroPinValue(k, value) {
   if (typeof value !== 'string') return false;
   if (k === 'ANTHROPIC_DEFAULT_FABLE_MODEL') return /^claude-fable-\d[\w.-]*\[1m\]$/.test(value);
   if (k === 'ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION') return value.endsWith(' · Most capable for your hardest and longest-running tasks');
+  if (k === 'ANTHROPIC_DEFAULT_SONNET_MODEL') return /^claude-sonnet-\d[\w.-]*\[1m\]$/.test(value);
+  if (k === 'ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION') return value.endsWith(' with 1M context · Efficient for routine tasks');
   return false;
 }
 
@@ -186,7 +210,7 @@ function restoreKeys(env, prior, keys) {
 
 // Point settings.json's env at the pool. Snapshots prior values once (so repeat
 // calls don't clobber the original snapshot) and preserves all other settings.
-export function applyPoolEnv({ baseUrl, token }, paths = defaultPaths()) {
+export function applyPoolEnv({ baseUrl, token, pins = {} }, paths = defaultPaths()) {
   const settings = readJson(paths.settings) || {};
   const env = { ...(settings.env || {}) };
 
@@ -217,7 +241,7 @@ export function applyPoolEnv({ baseUrl, token }, paths = defaultPaths()) {
   // Retired keys revert to the user's snapshot (null → removed), so pins an
   // earlier bro wrote disappear here.
   restoreKeys(env, prior, RETIRED_POOL_ENV_KEYS);
-  settings.env = { ...env, ...poolEnvBlock({ baseUrl, token }) };
+  settings.env = { ...env, ...poolEnvBlock({ baseUrl, token, pins }) };
   writeJson(paths.settings, settings);
 }
 
