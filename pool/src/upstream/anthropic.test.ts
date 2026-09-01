@@ -662,3 +662,80 @@ test("forwards a POST-commit SSE overloaded_error verbatim without retrying", as
     rmSync(poolDir, { recursive: true, force: true });
   }
 });
+
+test("a 403 (e.g. billing disabled / OAuth not allowed) sidelines the account and fails over", async () => {
+  const { poolDir, mgr, config } = tempPool(["a", "b"]);
+  try {
+    const failovers: string[] = [];
+    const calls = mockFetch((_, init) => {
+      const token = new Headers(init.headers).get("authorization");
+      if (token === "Bearer tok-a") {
+        return jsonResponse(
+          {
+            type: "error",
+            error: { type: "permission_error", message: "OAuth authentication is currently not allowed for this organization." },
+          },
+          403,
+        );
+      }
+      return jsonResponse({
+        type: "message",
+        content: [{ type: "text", text: "served by b" }],
+        usage: { input_tokens: 2, output_tokens: 4 },
+      });
+    });
+
+    const response = await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", max_tokens: 8, messages: [{ role: "user", content: "hi" }] },
+      new Headers(),
+      mgr,
+      config,
+      new AbortController().signal,
+      { onFailover: (from, to) => failovers.push(`${from}->${to}`) },
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-Pool-Account")).toBe("b");
+    expect(calls.map((c) => c.headers.get("authorization"))).toEqual(["Bearer tok-a", "Bearer tok-b"]);
+    expect(failovers).toEqual(["a->b"]);
+    const a = mgr.getAccount("a");
+    expect(a.available).toBe(false);
+    expect(a.unavailableReason).toContain("not allowed for this organization");
+    expect(a.unavailableReason).not.toContain("rate limited");
+    // Subsequent picks must skip the refused account entirely.
+    expect(mgr.pick(undefined, undefined, "anthropic", null)?.name).toBe("b");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("a 403 with no other account surfaces the upstream error faithfully", async () => {
+  const { poolDir, mgr, config } = tempPool(["a"]);
+  try {
+    mockFetch(() =>
+      jsonResponse(
+        {
+          type: "error",
+          error: { type: "permission_error", message: "OAuth authentication is currently not allowed for this organization." },
+        },
+        403,
+      ),
+    );
+
+    const response = await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", max_tokens: 8, messages: [{ role: "user", content: "hi" }] },
+      new Headers(),
+      mgr,
+      config,
+      new AbortController().signal,
+    );
+
+    expect(response.status).toBe(403);
+    const body = (await response.json()) as { error: { type: string; message: string } };
+    expect(body.error.type).toBe("permission_error");
+    expect(body.error.message).toContain("not allowed for this organization");
+    expect(mgr.getAccount("a").available).toBe(false);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});

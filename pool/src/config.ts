@@ -57,6 +57,8 @@ export interface Config {
   usageWindowMs: number;
   /** How long to sideline an account after it reports a rate limit, in ms. */
   rateLimitCooldownMs: number;
+  /** How long to sideline an account after Anthropic refuses it with a 403 (billing disabled etc.), in ms. */
+  accessDeniedCooldownMs: number;
   /** Max same-account backoff retries for a transient upstream overload (529/500/503). 0 disables. */
   overloadRetryMax: number;
   /** Base backoff delay for overload retries, doubled per attempt, in ms. */
@@ -155,6 +157,7 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
     streamKeepAliveMs: positiveIntEnv("STREAM_KEEPALIVE_MS", 1000, 100),
     usageWindowMs: intEnv("USAGE_WINDOW_MS", 5 * 60 * 60 * 1000),
     rateLimitCooldownMs: intEnv("RATE_LIMIT_COOLDOWN_MS", 60 * 60 * 1000),
+    accessDeniedCooldownMs: intEnv("ACCESS_DENIED_COOLDOWN_MS", 60 * 60 * 1000),
     overloadRetryMax: positiveIntEnv("OVERLOAD_RETRY_MAX", 4, 0),
     overloadRetryBaseMs: positiveIntEnv("OVERLOAD_RETRY_BASE_MS", 500, 0),
     overloadRetryMaxDelayMs: positiveIntEnv("OVERLOAD_RETRY_MAX_DELAY_MS", 8000, 0),

@@ -204,6 +204,7 @@ export class AccountManager {
         u.lastUsageCheckAt ??= null;
         u.lastUsageCheckError ??= null;
         u.deadRefreshToken ??= null;
+        u.accessDeniedUntil ??= null;
       }
     } catch {
       this.usage = {};
@@ -591,6 +592,7 @@ export class AccountManager {
     const now = Date.now();
     const cooling = usage.rateLimitedUntil != null && usage.rateLimitedUntil > now;
     const deadLogin = deadLoginReason(usage, oauth?.refreshToken);
+    const denied = usage.accessDeniedUntil != null && usage.accessDeniedUntil > now;
 
     let available = true;
     let reason: string | null = null;
@@ -602,6 +604,10 @@ export class AccountManager {
       // does not, so the re-login is the reason worth surfacing.
       available = false;
       reason = deadLogin;
+    } else if (denied) {
+      available = false;
+      const mins = Math.ceil((usage.accessDeniedUntil! - now) / 60000);
+      reason = `refused by Anthropic: ${usage.lastError ?? "access denied"} — retry in ~${mins} min`;
     } else if (cooling) {
       available = false;
       const mins = Math.ceil((usage.rateLimitedUntil! - now) / 60000);
@@ -1004,6 +1010,7 @@ export class AccountManager {
     u.totalCostUsd += costUsd;
     u.lastUsedAt = now;
     u.lastError = null;
+    u.accessDeniedUntil = null;
     this.saveState();
   }
 
@@ -1021,6 +1028,19 @@ export class AccountManager {
       resetAt ?? blockingWindowReset(u.rateLimitStatus, now) ?? now + this.config.rateLimitCooldownMs;
     u.lastError = RATE_LIMITED_LAST_ERROR;
     // Drop pins so sessions reroute away from this account.
+    this.sessions.evictAccount(name);
+    this.saveState();
+  }
+
+  /**
+   * Sideline an account Anthropic refused outright (403). Not a rate limit:
+   * there is no reset to wait for, so the cooldown just spaces out re-probes.
+   */
+  markAccessDenied(name: string, message: string): void {
+    const u = this.usageFor(name);
+    u.accessDeniedUntil = Date.now() + this.config.accessDeniedCooldownMs;
+    u.lastError = message.slice(0, 500);
+    u.lastUsedAt = Date.now();
     this.sessions.evictAccount(name);
     this.saveState();
   }

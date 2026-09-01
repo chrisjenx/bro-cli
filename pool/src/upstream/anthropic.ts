@@ -42,6 +42,8 @@ interface RetryReason {
   rateLimited: boolean;
   /** Transient upstream overload (529/500/503 or SSE overloaded_error) — retry same account with backoff. */
   transient: boolean;
+  /** Anthropic refused the account itself (HTTP 403) — sideline it and fail over. */
+  accessDenied?: boolean;
   resetAt?: number;
   /** Raw upstream error body + headers, captured so surfaceOverload can replay them verbatim (HTTP path only). */
   bodyText?: string;
@@ -209,6 +211,10 @@ async function attemptOnce(
       // Overload/5xx: let tryAccount's backoff loop retry the SAME account.
       // recordError is deferred to surface time so a healthy account isn't
       // spammed with "Overloaded" on every capacity blip.
+      return { kind: "retry", reason };
+    }
+    if (reason.accessDenied) {
+      mgr.markAccessDenied(account.name, reason.message);
       return { kind: "retry", reason };
     }
     mgr.recordError(account.name, reason.message);
@@ -482,12 +488,14 @@ function classifyHttpError(status: number, headers: Headers, text: string): Retr
   const message = stringProp(error, "message") ?? (text.slice(0, 500) || `Anthropic API returned HTTP ${status}`);
   const rateLimited = status === 429 || isRateLimit(type, message);
   const transient = !rateLimited && (status === 529 || status === 500 || status === 503);
+  const accessDenied = !rateLimited && status === 403;
   return {
     status,
     type,
     message,
     rateLimited,
     transient,
+    accessDenied,
     resetAt: resetAtFromHeaders(headers),
     bodyText: text,
     headers,

@@ -232,6 +232,15 @@ export interface AccountUsage {
    * stops matching, and the account returns to rotation with no manual reset.
    */
   deadRefreshToken: string | null;
+
+  /**
+   * If set and in the future, Anthropic refused this account outright (HTTP
+   * 403 — e.g. billing disabled, or OAuth not allowed for the org) and it is
+   * sidelined until then. Unlike a rate limit there is no reset to honor, so
+   * the cooldown is a probe interval: re-try once it lapses in case the org
+   * fixed billing, and re-sideline if the refusal persists.
+   */
+  accessDeniedUntil: number | null;
 }
 
 /** Fully-resolved view of an account for status/routing. */
@@ -276,5 +285,6 @@ export function emptyUsage(now: number): AccountUsage {
     lastUsageCheckAt: null,
     lastUsageCheckError: null,
     deadRefreshToken: null,
+    accessDeniedUntil: null,
   };
 }
