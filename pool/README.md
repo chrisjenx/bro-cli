@@ -127,6 +127,85 @@ Codex has no documented model-list endpoint, so `bro models update` can't auto-d
 
 `id` is what you send to the pool; `upstreamModel` is what the pool sends to OpenAI/Codex (usually identical). Entries in `models.json` are merged over the built-in defaults, so you only list ids you're adding or overriding. Run `bro models list` again to confirm.
 
+### Context windows
+
+Each entry in the model table carries `contextWindow` (upstream's default) and
+`maxContextWindow` (upstream's ceiling). The extended Codex window is a purely
+client-side budget — there is no request parameter to send — so the pool simply
+publishes the number and the client compacts against it.
+
+Bundled values, from `codex-rs/models-manager/models.json`:
+
+| model | default | ceiling |
+|---|---|---|
+| `gpt-5.6-sol` / `-terra` / `-luna` | 272,000 | 872,000 |
+| `gpt-5.5` | 272,000 | 272,000 |
+| `gpt-5.4` | 272,000 | 1,000,000 |
+| `gpt-5.4-mini` | 272,000 | 272,000 |
+
+`POOL_MAX_CONTEXT` (default `500000`) caps how much of a ceiling is handed out.
+
+Two different quantities are in play here, with two different rules:
+
+- **Per-model ceilings** (`maxContextWindow`, whether bundled, edited on the
+  dashboard, or set with the CLI) have **no upper bound** — 872,000 for the
+  `gpt-5.6` tiers is normal and correct, and these are upstream Codex budgets,
+  not something handed straight to Claude Code. They do have the same *lower*
+  bound as the session window, 100,000: the pool derives the session window
+  from these ceilings and always raises it up to that floor, so a ceiling set
+  below it could never be honoured — the pool would reject requests below the
+  ceiling that Claude Code, compacting no earlier than the floor, never even
+  tries to shrink. Setting one below 100,000 from the dashboard, the CLI, or
+  `POST /api/context` is rejected.
+- The **session auto-compact window** (below) *is* bounded to
+  `[100000, 1000000]`, because that's the range Claude Code actually honours
+  for `CLAUDE_CODE_AUTO_COMPACT_WINDOW`. Saving a value outside that range from
+  the dashboard or `POST /api/context` is rejected with a 400, so the dashboard
+  never shows a saved number the client doesn't actually use.
+
+Three ways to tune it, highest precedence first:
+
+| knob | scope | where |
+|---|---|---|
+| `POOL_AUTO_COMPACT_WINDOW` | session window | env; locks the dashboard field |
+| `POOL_MAX_CONTEXT` | house cap on every model | env |
+| Context windows panel | session window + per-model ceilings | dashboard |
+| `models context <id> <tokens\|default>` | per-model ceiling | CLI (`bun run src/index.ts models context <id> <tokens>`) |
+
+An explicit session window (env or saved) deliberately bypasses the
+minimum-across-mapped derivation. If you set it *larger* than the smallest
+mapped model can serve, the pool warns — on `bro pool up`, at launch, and in the
+dashboard panel — because requests to that model between the two sizes are
+rejected rather than compacted. It is a warning, not a refusal: the override is
+assumed intentional (you may be about to remap, or running with mapping off).
+
+Setting `POOL_AUTO_COMPACT_WINDOW` outranks whatever is saved in `models.json`,
+so the dashboard's **Session window** field is disabled whenever that env var
+is set (labeled "locked by POOL_AUTO_COMPACT_WINDOW") — unset the env var to
+edit the window from the dashboard again.
+
+The dashboard panel and the CLI are one seam, not two: both validate through
+`applyContextEdits` and write the same `maxContextWindow` field in
+`models.json`, so per-model ceilings are one source of truth — e.g. give
+`gpt-5.6-sol` its full 872,000 while holding `-terra`/`-luna` lower.
+
+`models context` posts to `/api/context` whenever a pool is answering, so the
+edit hot-applies to the running pool exactly as a dashboard save does, and the
+next dashboard save can't revert it. With no pool running it writes
+`models.json` directly, for the next start to pick up. `default` (or `clear`)
+clears a ceiling back to its bundled value — the CLI spelling of the
+dashboard's `null`. A running pool's rejection is final: the CLI reports it and
+writes nothing rather than applying an edit the pool refused.
+
+Because Claude Code's auto-compact threshold is per-session rather than
+per-model, `bro pool up` writes the **minimum** window across every
+Codex-mapped family unless you pin one explicitly. **With the default mapping
+this comes out to 272,000, not the 500,000 house cap** — `haiku` maps to
+`gpt-5.4-mini`, which has no headroom above its 272,000 default, and the
+session window is the minimum across every Codex-mapped family, not an
+average or the largest. If you expected 500K and see 272K, that's why, not a
+bug. Map `haiku` to a 5.6 tier (or to Claude only) if you want the full 500K.
+
 ## Run the server
 
 ```bash

@@ -170,6 +170,13 @@ describe("describeCodexError", () => {
     expect(msg).toContain("x".repeat(300));
     expect(msg).not.toContain("x".repeat(301));
   });
+
+  test("a backend context-length rejection is labelled, not left as a raw parameter error", () => {
+    const body = JSON.stringify({ detail: "Input exceeds the maximum context length for this model" });
+    const msg = describeCodexError(400, body, "work");
+    expect(msg).toContain("context");
+    expect(msg).toContain("POOL_MAX_CONTEXT");
+  });
 });
 
 describe("proxyCodexMessages", () => {

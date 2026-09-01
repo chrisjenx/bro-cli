@@ -19,7 +19,15 @@ import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { which, globalBinDirs, runInherit } from './proc.js';
 import { permissionArgs } from './launch.js';
-import { applyPoolEnv, clearPoolEnv, isPoolEnvActive, poolEnvBlock } from './settings.js';
+import {
+  applyPoolEnv,
+  clearPoolEnv,
+  isPoolEnvActive,
+  poolEnvBlock,
+  readPoolContextWindow,
+  readPriorContextWindow,
+  formatContextWindow
+} from './settings.js';
 import { select, prompt, holdOrContinue } from './ui.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -105,7 +113,16 @@ function findBun() {
 // Run a pool CLI sub-command (`accounts …`) with inherited stdio so interactive
 // logins work. Resolves with the child's exit code.
 function runPoolCli(bun, args) {
-  return runInherit(bun, ['run', POOL_ENTRY, ...args], { ...process.env, CLAUDE_POOL_DIR: POOL_DIR });
+  // HOST is pinned exactly as ensureServer pins it when starting the pool.
+  // `models context` now POSTs to the running pool, so the CLI has to resolve
+  // the same address the server bound; inheriting a user's exported HOST would
+  // make that POST miss and silently fall back to writing models.json behind a
+  // live pool — the divergence the pool-first path exists to prevent.
+  return runInherit(bun, ['run', POOL_ENTRY, ...args], {
+    ...process.env,
+    CLAUDE_POOL_DIR: POOL_DIR,
+    HOST: '127.0.0.1',
+  });
 }
 
 export function runPoolAccounts(args = []) {
@@ -328,6 +345,26 @@ async function fetchStatus(port) {
   }
 }
 
+// The session-safe context window the pool derived from the current mapping, or
+// null when no family is Codex-mapped (or the pool isn't answering — in which
+// case we leave Claude Code on its own tuning rather than guess).
+export function sessionWindowOf(status) {
+  const w = status && status.context && status.context.sessionWindow;
+  return typeof w === 'number' && w > 0 ? w : null;
+}
+
+/** The pool's advisory context warning, or null. Set when an explicit session
+ * window is larger than the smallest mapped model can serve — the band between
+ * them is rejected rather than compacted. */
+export function contextWarningOf(status) {
+  const w = status && status.context && status.context.warning;
+  return typeof w === 'string' && w ? w : null;
+}
+
+export async function fetchContextWindow(port) {
+  return sessionWindowOf(await fetchStatus(port));
+}
+
 function fmtTokens(n) {
   n = n || 0;
   if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
@@ -377,10 +414,30 @@ function poolEnvValues(port) {
 }
 
 // Point settings.json's env at the pool on <port>. Shared by `up` and `restart`
-// so a restart keeps the override — including the sonnet 1M pin — in sync with
-// `up` rather than drifting. `paths` is injectable for tests.
-export function reapplyPoolEnv(port, paths) {
-  applyPoolEnv(poolEnvValues(port), paths);
+// so a restart keeps the override — including the 1M pins and the auto-compact
+// window — in sync with `up` rather than drifting. `paths` is injectable for
+// tests; pass `contextWindow` explicitly to skip the status fetch.
+export function reapplyPoolEnv(port, paths, contextWindow) {
+  applyPoolEnv({ ...poolEnvValues(port), contextWindow }, paths);
+}
+
+// The one-line summary `up` and `restart` both print under the status panel.
+// Silent when the pool derived no window (no Codex-mapped family) — there is
+// nothing bro pushed, so Claude Code keeps its own tuning.
+function printAutoCompactLine(contextWindow) {
+  if (!contextWindow) return;
+  console.log(
+    '  ' + C.dim('Auto-compact window: ') + formatContextWindow(contextWindow) +
+    C.dim(' — sized for the smallest Codex model this mapping can reach (applies to Claude-family turns too).')
+  );
+}
+
+/** Advisory, not fatal: an explicit session window is a deliberate override,
+ * but the user should hear that part of it will 400 rather than compact. Its
+ * own function so every status-reading surface shows it the same way and none
+ * of them can gate it on an unrelated condition. */
+function printContextWarning(warning) {
+  if (warning) console.log('  ' + C.amber('⚠ ') + C.dim(warning));
 }
 
 // `bro pool up` — start the pool as the backend for ALL Claude Code sessions.
@@ -394,8 +451,13 @@ export async function poolUp() {
     return 0;
   }
   await ensureServer(bun, port, baseUrl);
-  reapplyPoolEnv(port);
-  printStatus(await fetchStatus(port), baseUrl);
+  // One /api/status round-trip feeds both the env write and the status panel.
+  const status = await fetchStatus(port);
+  const contextWindow = sessionWindowOf(status);
+  reapplyPoolEnv(port, undefined, contextWindow);
+  printStatus(status, baseUrl);
+  printAutoCompactLine(contextWindow);
+  printContextWarning(contextWarningOf(status));
   console.log('  ' + C.green('Pool is now the backend for all Claude Code sessions') + C.dim(' (agents included).'));
   console.log('  ' + C.dim('Stop it with ') + 'bro pool down');
   console.log('');
@@ -430,10 +492,42 @@ export async function poolRestart() {
     console.log('Pool server not running — starting it.');
   }
   await ensureServer(bun, port, baseUrl);
-  reapplyPoolEnv(port);
-  printStatus(await fetchStatus(port), baseUrl);
+  const status = await fetchStatus(port);
+  const contextWindow = sessionWindowOf(status);
+  reapplyPoolEnv(port, undefined, contextWindow);
+  printStatus(status, baseUrl);
+  printAutoCompactLine(contextWindow);
+  printContextWarning(contextWarningOf(status));
   console.log('  ' + C.green('Pool restarted.') + '\n');
   return 0;
+}
+
+// The two auto-compact numbers that are supposed to agree: what the pool would
+// derive right now (live — a dashboard mapping or context edit moves it
+// immediately) and what settings.json holds (only rewritten at `bro pool up` /
+// `restart` / a `bro` launch). A dashboard click can silently open a gap, and
+// budgeting 500K against a 272K model is the exact failure this branch exists
+// to close — so `bro pool status` names both numbers and says how to close it.
+// Pure and exported so the drift wording is testable without a live pool.
+export function sessionWindowLines(poolWindow, settingsWindow, priorWindow = null) {
+  if (poolWindow === null && settingsWindow === null) return [];
+  const show = (w) => (w === null ? C.dim('none') : formatContextWindow(w));
+  const lines = [
+    '  ' + C.dim('Auto-compact window: ') + show(poolWindow) + C.dim(' (pool)  ·  ') +
+      show(settingsWindow) + C.dim(' (settings.json — what Claude Code uses)')
+  ];
+  // Not drift when the settings value is the user's own pre-pool window and the
+  // pool has none to push: applyPoolEnv restores exactly that value rather than
+  // deleting it, so this is the steady state of every Claude-only pool. Warning
+  // here would fire forever, and the advice would be wrong — a restart re-runs
+  // applyPoolEnv(null), writes the same value back, and the warning returns.
+  const usersOwn = poolWindow === null && settingsWindow !== null && settingsWindow === priorWindow;
+  if (poolWindow !== settingsWindow && !usersOwn) {
+    lines.push(
+      '  ' + C.amber('These differ — run `bro pool restart` to push the pool’s window to Claude Code.')
+    );
+  }
+  return lines;
 }
 
 // `bro pool status` — server health + whether the global override is active.
@@ -442,14 +536,24 @@ export async function poolStatus() {
   const baseUrl = `http://127.0.0.1:${port}`;
   const up = await healthy(port);
   const active = isPoolEnvActive();
+  let status = null;
   if (up) {
-    printStatus(await fetchStatus(port), baseUrl);
+    status = await fetchStatus(port);
+    printStatus(status, baseUrl);
   } else {
     console.log('\n  ' + C.red('●') + ' Pool server not running on ' + baseUrl + '\n');
   }
   console.log(
     '  ' + C.dim('Claude backend override: ') + (active ? C.green('active (all sessions → pool)') : C.dim('off'))
   );
+  // Only meaningful while the override is live and the pool can answer: with
+  // either missing, the pool-down warning below is the actionable message.
+  if (active && up) {
+    for (const line of sessionWindowLines(sessionWindowOf(status), readPoolContextWindow(), readPriorContextWindow())) {
+      console.log(line);
+    }
+    printContextWarning(contextWarningOf(status));
+  }
   console.log('');
   if (active && !up) {
     console.log(
@@ -493,10 +597,17 @@ export async function selfHealPoolEnv() {
 
 export async function runPool({ extraArgs = [], permissionMode = 'auto', dryRun = false } = {}) {
   const port = poolPort();
-  const baseUrl = `http://127.0.0.1:${port}`;
-  const { baseUrl: b, token } = poolEnvValues(port);
+  // One name for one value: settings.json's block and the launch env are the
+  // SAME block below, and using two names for the same base URL is how the
+  // preview drifted from what the launch actually does.
+  const { baseUrl, token } = poolEnvValues(port);
 
   if (dryRun) {
+    // Fetch the window once and give it to both, exactly as the real path does
+    // (step 2 below): the preview used to build claude.env without a window, so
+    // it understated the launch env by both auto-compact keys.
+    const contextWindow = await fetchContextWindow(port);
+    const envBlock = poolEnvBlock({ baseUrl, token, contextWindow });
     return {
       via: 'multiple-account pool',
       poolServer: `bun run ${POOL_ENTRY} serve`,
@@ -504,11 +615,11 @@ export async function runPool({ extraArgs = [], permissionMode = 'auto', dryRun 
       backend: process.env.CLAUDE_POOL_BACKEND || 'oauth',
       baseUrl,
       accounts: listAccounts(),
-      settingsEnv: poolEnvBlock({ baseUrl: b, token }),
+      settingsEnv: envBlock,
       claude: {
         cmd: which('claude') || 'claude',
         args: [...permissionArgs(permissionMode), ...extraArgs],
-        env: poolEnvBlock({ baseUrl, token })
+        env: envBlock
       }
     };
   }
@@ -525,11 +636,21 @@ export async function runPool({ extraArgs = [], permissionMode = 'auto', dryRun 
   // 2) Bring the (persistent) server up and make the pool the backend for every
   //    Claude Code session, including agents started from the agents view.
   await ensureServer(bun, port, baseUrl);
-  applyPoolEnv({ baseUrl: b, token });
+  // One /api/status round-trip feeds both the env write and the status panel
+  // below, as poolUp/poolRestart do. The window is reused for the foreground
+  // process env — settings.json is what agents-view sessions read, so it needs
+  // the same window as this launch or they'd budget 1M against a much smaller
+  // Codex model.
+  const status = await fetchStatus(port);
+  const contextWindow = sessionWindowOf(status);
+  applyPoolEnv({ baseUrl, token, contextWindow });
 
   // 3) Flash the live status, then launch. Hold ~1.5s; enter launches now,
   //    any other key pauses so you can read it, esc cancels.
-  printStatus(await fetchStatus(port), baseUrl);
+  printStatus(status, baseUrl);
+  // This is where the window is actually applied to the launch, so it is the
+  // most important place to hear that part of it will 400 rather than compact.
+  printContextWarning(contextWarningOf(status));
   process.stdout.write('  ' + C.dim('Launching Claude…  ') + C.dim('enter = now · any key = pause · esc = cancel'));
   const go = await holdOrContinue({ ms: 1500 });
   process.stdout.write('\n');
@@ -556,7 +677,8 @@ export async function runPool({ extraArgs = [], permissionMode = 'auto', dryRun 
   // pins with the display name/description Claude Code shows for them. Set here
   // as well as in settings.json because process env outranks it, so a stale
   // exported value would otherwise win for this launch (see poolEnvBlock).
-  Object.assign(env, poolEnvBlock({ baseUrl: b, token }));
+  // Reuses the contextWindow fetched above (step 2) instead of fetching again.
+  Object.assign(env, poolEnvBlock({ baseUrl, token, contextWindow }));
   env.NODE_NO_WARNINGS = '1';
 
   const claudeArgs = [...permissionArgs(permissionMode), ...extraArgs];

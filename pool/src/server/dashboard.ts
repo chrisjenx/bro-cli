@@ -10,7 +10,7 @@
 
 import { TUNING_BOUNDS } from "../accounts/manager.ts";
 import { MODEL_FAMILIES } from "../accounts/types.ts";
-import { SOURCE_EFFORT_TIERS, CODEX_EFFORTS } from "../models.ts";
+import { SOURCE_EFFORT_TIERS, CODEX_EFFORTS, CLAUDE_MIN_AUTO_COMPACT, CLAUDE_MAX_CONTEXT } from "../models.ts";
 
 /** Presentation for each tuning knob; min/max come from the shared TUNING_BOUNDS. */
 const TUNING_LABELS: Record<keyof typeof TUNING_BOUNDS, { label: string; step: string }> = {
@@ -250,11 +250,13 @@ export function dashboardHtml(): string {
 
   .mapping-panel .muted { color: var(--muted); font-size: 12px; font-family: var(--sans); font-weight: 400; }
   .mapping-panel .hint { color: var(--muted); font-size: 12px; margin: 0 0 12px; }
+  .mapping-panel .hint.ctx-warn { color: var(--warn); }
   .mapping-panel .mapping-body > label { display: block; margin-bottom: 12px; font-size: 13px; }
   .mapping-panel .map-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
     padding: 8px 0; border-top: 1px solid var(--border); }
   .mapping-panel .map-row select { font: inherit; padding: 4px 8px; border: 1px solid var(--border);
     border-radius: 6px; background: var(--surface-2); color: var(--text); }
+  .mapping-panel .ctx { color: var(--muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
   .mapping-panel .efforts { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-left: auto; }
   .mapping-panel .efforts .tier { display: flex; align-items: center; gap: 5px; margin-bottom: 0; }
   .mapping-panel .efforts .tier label { color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: .04em; }
@@ -308,6 +310,7 @@ export function dashboardHtml(): string {
     <summary>Settings<span class="caret">▶</span></summary>
     <div class="settings-body">
       <details class="mapping-panel" id="mapping-panel"></details>
+      <details class="mapping-panel" id="context-panel"></details>
       <details class="tuning-panel" id="tuning-panel"></details>
     </div>
   </details>
@@ -383,14 +386,14 @@ export function dashboardHtml(): string {
 // flag (touched since its last render) and the JSON of the data last rendered;
 // renderSettings() consults both. A one-time delegated input/change listener
 // (wired below) sets dirty; Save clears it and forces a fresh render.
-var settingsDirty = { "mapping-panel": false, "tuning-panel": false };
-var settingsRendered = { "mapping-panel": null, "tuning-panel": null };
+var settingsDirty = { "mapping-panel": false, "context-panel": false, "tuning-panel": false };
+var settingsRendered = { "mapping-panel": null, "context-panel": null, "tuning-panel": null };
 var accountSettingsDirty = false;
 
 // Collapsible panels: restore each disclosure's open state (collapsed by
 // default) and persist it on toggle; wire the per-panel dirty flag.
 (function () {
-  ["settings-group", "mapping-panel", "tuning-panel"].forEach(function (id) {
+  ["settings-group", "mapping-panel", "context-panel", "tuning-panel"].forEach(function (id) {
     const el = document.getElementById(id);
     if (!el) return;
     if (localStorage.getItem("cmp-open-" + id) === "1") el.open = true;
@@ -398,7 +401,7 @@ var accountSettingsDirty = false;
       localStorage.setItem("cmp-open-" + id, el.open ? "1" : "0");
     });
   });
-  ["mapping-panel", "tuning-panel"].forEach(function (id) {
+  ["mapping-panel", "context-panel", "tuning-panel"].forEach(function (id) {
     const el = document.getElementById(id);
     if (!el) return;
     const mark = function () { settingsDirty[id] = true; };
@@ -499,6 +502,13 @@ function readEfforts(container) {
   });
   return out;
 }
+// Formats a token count for compact display: whole millions as "2M", else the
+// nearest thousand as "272K". Falls back to "" for a missing/zero window so
+// callers can drop the badge text without a stray "0" or "NaN".
+function fmtWindow(n) {
+  if (!n) return "";
+  return n % 1000000 === 0 ? (n / 1000000) + "M" : Math.round(n / 1000) + "K";
+}
 // Injected from MODEL_FAMILIES so the card renders (and round-trips) every
 // family the router recognizes — a hardcoded list silently drops mappings for
 // families it omits when Save posts the full set.
@@ -530,7 +540,7 @@ function effortsHtml(family, effort, targetModel) {
   return out;
 }
 
-function mappingCardHtml(mapping) {
+function mappingCardHtml(mapping, context) {
   if (!mapping) return "";
   var rows = "";
   for (var i = 0; i < FAMILIES.length; i++) {
@@ -542,20 +552,126 @@ function mappingCardHtml(mapping) {
       var id = mapping.targets[t];
       targetOpts += '<option value="' + esc(id) + '"' + (row.to === id ? " selected" : "") + ">" + esc(id) + "</option>";
     }
+    var ctx = ((context || {}).families || []).find(function (f) { return f.family === fam; });
+    var ctxBadge = '<span class="ctx" data-ctx-family="' + fam + '">'
+      + (ctx ? esc(fmtWindow(ctx.window)) + " ctx" : "") + "</span>";
     rows += '<div class="map-row" data-map-row="' + fam + '">'
       + "<b>" + fam + "</b> &rarr; "
       + '<select data-map-family="' + fam + '">' + targetOpts + "</select>"
+      + ctxBadge
       + '<div class="efforts"' + (inert ? ' style="display:none"' : "") + ">" + effortsHtml(fam, row.effort, row.to) + "</div>"
       + "</div>";
   }
+  var sessionWindow = (context || {}).sessionWindow;
+  // The trailing sentence is load-bearing, not decoration: this number only
+  // reaches Claude Code through settings.json, which bro writes at pool up,
+  // pool restart, or a bro launch. Changing a mapping here moves the number
+  // shown above without moving the one Claude Code is budgeting against, so
+  // the hint has to say so or the card reads as live state.
+  var sessionLine = sessionWindow
+    ? '<p class="hint">Auto-compact window: ' + esc(fmtWindow(sessionWindow))
+      + " — the smallest window any mapped model allows. Claude-family turns in the same session compact there too."
+      + " Run <code>bro pool restart</code> after a change here to push it to Claude Code.</p>"
+    : "";
   return '<summary>Model mapping<span class="caret">▶</span></summary>'
     + '<div class="mapping-body">'
     + '<div class="hint">Claude families served by Codex when pooled.</div>'
+    + sessionLine
     + '<label><input type="checkbox" id="mapping-enabled"' + (mapping.enabled ? " checked" : "") + "> Pool Claude + Codex capacity</label>"
     + rows
     + '<button id="mapping-save">Save mapping</button>'
     + '<span class="status" id="mapping-status"></span>'
     + "</div>";
+}
+
+// Injected from models.ts so the per-model ceiling input's min hint can't
+// drift from the server's own floor rule (POST /api/context rejects a lower
+// ceiling with a 400: Claude Code will not auto-compact below it, so the pool
+// would reject requests the client never compacts). There is no matching
+// max — a large ceiling like 872000 is a legitimate upstream budget.
+var CTX_MIN_WINDOW = ${CLAUDE_MIN_AUTO_COMPACT};
+var CTX_MAX_WINDOW = ${CLAUDE_MAX_CONTEXT};
+
+// Editable context windows: a per-model ceiling (maxContextWindow, tokens) for
+// every openai target plus the session auto-compact window. Two clicks instead
+// of an edit to models.json + a restart — the feature this whole task exists
+// for. Reuses fmtWindow() (defined above) for display; raw integers are kept
+// in the inputs so Save round-trips exact values instead of the rounded label.
+function contextCardHtml(context) {
+  if (!context) return "";
+  var locked = !!context.envLocked;
+  var win = context.sessionWindow;
+  // A derived window is not a saved setting, it is whatever the mapping implies
+  // right now. Rendering it as a value made an untouched Save post it back as
+  // an explicit autoCompactWindow and pin it for good.
+  var derived = context.source === "derived";
+  var models = context.models || [];
+  var rows = "";
+  for (var i = 0; i < models.length; i++) {
+    var m = models[i];
+    rows += '<div class="map-row">'
+      + "<span>" + esc(m.id) + "</span>"
+      + '<input data-ctx-model="' + esc(m.id) + '" type="number" step="1000" min="' + CTX_MIN_WINDOW + '" value="' + m.ceiling + '">'
+      + '<span class="ctx">' + esc(fmtWindow(m.window)) + " effective" + (m.capped ? " (capped)" : "") + "</span>"
+      + "</div>";
+  }
+  // Same caveat as the mapping card's hint: saving here changes what the pool
+  // reports, not what settings.json already handed Claude Code.
+  var sessionLine = win
+    ? '<p class="hint">Session auto-compact window: ' + esc(fmtWindow(win))
+      + ". Run <code>bro pool restart</code> after a change here to push it to Claude Code.</p>"
+    : "";
+  return '<summary>Context windows<span class="caret">▶</span></summary>'
+    + '<div class="mapping-body">'
+    + '<div class="hint">Per-model ceilings cap what a target may use; the house cap ('
+    + esc(fmtWindow(context.cap)) + ", POOL_MAX_CONTEXT) bounds them all.</div>"
+    + sessionLine
+    + (context.warning ? '<p class="hint ctx-warn">⚠ ' + esc(context.warning) + "</p>" : "")
+    + '<label>Session window <input id="context-window" type="number" step="1000" min="'
+    + CTX_MIN_WINDOW + '" max="' + CTX_MAX_WINDOW + '" '
+    + (derived ? 'placeholder="' : 'value="') + (win || "") + '"'
+    + (locked ? " disabled" : "") + '> <span class="muted">'
+    + esc(locked ? "locked by POOL_AUTO_COMPACT_WINDOW" : "blank = derive from the mapping")
+    + "</span></label>"
+    + rows
+    + '<button id="context-save">Save</button>'
+    + '<span class="status" id="context-status"></span>'
+    + "</div>";
+}
+
+// Attach the Save handler for the context panel. Reads the session-window
+// field (only when not env-locked) and every per-model ceiling input, POSTs
+// the batch to /api/context, then refreshes so the server's normalized state
+// (e.g. a materialized bundled default) comes back.
+function wireContext() {
+  var btn = document.getElementById("context-save");
+  if (!btn) return;
+  btn.onclick = function () {
+    var winEl = document.getElementById("context-window");
+    var payload = { models: [] };
+    if (winEl && !winEl.disabled) {
+      payload.autoCompactWindow = winEl.value === "" ? null : parseInt(winEl.value, 10);
+    }
+    document.querySelectorAll("[data-ctx-model]").forEach(function (el) {
+      payload.models.push({
+        id: el.getAttribute("data-ctx-model"),
+        maxContextWindow: el.value === "" ? null : parseInt(el.value, 10),
+      });
+    });
+    var status = document.getElementById("context-status");
+    if (status) status.textContent = "Saving…";
+    fetch("/api/context", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+      .then(function (res) {
+        if (finishSettingsSave("context-panel", { ok: res.ok }, status)) refresh();
+        else if (status) status.textContent = (res.body.error && res.body.error.message) || "Failed";
+      })
+      .catch(function () { if (status) status.textContent = "Failed"; });
+  };
 }
 
 // Editable weighted-score knobs (key/label/step/min/max), built server-side
@@ -815,9 +931,20 @@ async function refresh() {
       // safe (not mid-edit, and the data actually changed), so a poll tick can
       // never clobber in-progress edits. Show the Settings group iff either
       // config panel has content.
-      const mapVisible = renderSettings("mapping-panel", mappingCardHtml(d.mapping), d.mapping, wireMapping);
+      const mapVisible = renderSettings(
+        "mapping-panel",
+        mappingCardHtml(d.mapping, d.context),
+        { mapping: d.mapping, context: d.context },
+        wireMapping,
+      );
+      const ctxVisible = renderSettings(
+        "context-panel",
+        contextCardHtml(d.context),
+        { context: d.context },
+        wireContext,
+      );
       const tuneVisible = renderSettings("tuning-panel", tuningPanelHtml(d.tuning), d.tuning, wireTuning);
-      document.getElementById("settings-group").style.display = (mapVisible || tuneVisible) ? "block" : "none";
+      document.getElementById("settings-group").style.display = (mapVisible || ctxVisible || tuneVisible) ? "block" : "none";
 
       if (avail === 0) {
         const anyAuthed = accounts.some((a) => a.authenticated);

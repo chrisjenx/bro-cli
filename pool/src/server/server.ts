@@ -20,6 +20,11 @@ import {
   mappingFor,
   mergeMappingsOver,
   modelsForListing,
+  buildContextStatus,
+  effectiveContextWindow,
+  declaredCeiling,
+  applyContextEdits,
+  CLAUDE_DEFAULT_CONTEXT,
   type ModelRoute,
   type ModelConfig,
   type ModelMapping,
@@ -54,7 +59,10 @@ const APPEND_SYSTEM_PROMPT =
 export function startServer(config: Config): void {
   const mgr = new AccountManager(config);
   const modelConfig = loadModelConfig(config.modelsFile);
-  const modelTable = modelConfig.models;
+  // Deliberately NOT bound to a local `modelTable` const: handleContextUpdate
+  // REPLACES state.config.models (rather than mutating it), so a table captured
+  // here would keep serving pre-edit ceilings to /v1/models and to the request
+  // path until the pool restarted. Every read goes through mappingState.
   const mappingState: MappingState = { config: modelConfig };
 
   // Sweep idle session pins so load counts decay even when traffic stops.
@@ -95,8 +103,13 @@ export function startServer(config: Config): void {
           mapping: {
             enabled: mappingState.config.mappingEnabled,
             mappings: mappingState.config.mappings,
-            targets: modelTable.filter((m) => m.provider === "openai").map((m) => m.id),
+            targets: mappingState.config.models.filter((m) => m.provider === "openai").map((m) => m.id),
           },
+          context: buildContextStatus(
+            mappingState.config,
+            config.contextWindowCap,
+            config.autoCompactWindowOverride,
+          ),
           usageWindowMs: config.usageWindowMs,
           now: Date.now(),
         });
@@ -131,16 +144,24 @@ export function startServer(config: Config): void {
         }
         return handleMappingsUpdate(mappingState, config.modelsFile, body);
       }
+      if (path === "/api/context") {
+        if (req.method !== "POST") return json({ error: "method not allowed" }, 405);
+        let body: unknown;
+        try {
+          body = await req.json();
+        } catch {
+          return json({ error: { message: "Invalid JSON body" } }, 400);
+        }
+        return handleContextUpdate(
+          mappingState,
+          config.modelsFile,
+          body,
+          config.contextWindowCap,
+          config.autoCompactWindowOverride,
+        );
+      }
       if (req.method === "GET" && (path === "/v1/models" || path === "/models")) {
-        return json({
-          object: "list",
-          data: modelsForListing(modelTable).map((m) => ({
-            id: m.id,
-            object: "model",
-            created: 0,
-            owned_by: m.provider === "openai" ? "openai-chatgpt-pool" : "anthropic-claude-max-pool",
-          })),
-        });
+        return json(modelsListing(mappingState, config.contextWindowCap));
       }
 
       // ---- Inference endpoints (require proxy auth if configured) ----
@@ -157,8 +178,8 @@ export function startServer(config: Config): void {
         }
 
         return path === "/v1/chat/completions"
-          ? handleOpenAI(body as OpenAIChatRequest, mgr, config, req.signal, modelTable)
-          : handleAnthropic(body, req.headers, mgr, config, req.signal, modelTable, mappingState);
+          ? handleOpenAI(body as OpenAIChatRequest, mgr, config, req.signal, mappingState)
+          : handleAnthropic(body, req.headers, mgr, config, req.signal, mappingState);
       }
 
       return json({ error: "not found" }, 404);
@@ -216,6 +237,29 @@ export interface MappingState {
   config: ModelConfig;
 }
 
+/**
+ * The GET /v1/models payload, read off the shared state at call time.
+ *
+ * Exported so a test can assert what the listing actually serves after a
+ * dashboard context edit: /api/context replaces `state.config.models`, so
+ * anything that snapshots the table goes stale the moment a ceiling is edited.
+ */
+export function modelsListing(state: MappingState, cap: number): unknown {
+  return {
+    object: "list",
+    data: modelsForListing(state.config.models).map((m) => ({
+      id: m.id,
+      object: "model",
+      created: 0,
+      owned_by: m.provider === "openai" ? "openai-chatgpt-pool" : "anthropic-claude-max-pool",
+      // Advisory: clients that read a window from the listing get the
+      // capped value, not the raw upstream ceiling.
+      context_window: effectiveContextWindow(m, cap),
+      max_context_window: declaredCeiling(m) ?? CLAUDE_DEFAULT_CONTEXT,
+    })),
+  };
+}
+
 // ---- request handlers ----------------------------------------------------
 
 async function handleOpenAI(
@@ -223,12 +267,12 @@ async function handleOpenAI(
   mgr: AccountManager,
   config: Config,
   signal: AbortSignal,
-  modelTable: ModelRoute[],
+  mappingState: MappingState,
 ): Promise<Response> {
   const parsed = parseOpenAI(body);
   // OpenAI-provider models are only served on the Anthropic /v1/messages path
   // (this compat endpoint flattens tool structure); reject them clearly here.
-  const route = routeForRequest(modelTable, body);
+  const route = routeForRequest(mappingState.config.models, body);
   const rejection = openAIEndpointModelError(route, parsed.requestedModel);
   if (rejection) return rejection;
 
@@ -344,10 +388,11 @@ async function handleAnthropic(
   mgr: AccountManager,
   config: Config,
   signal: AbortSignal,
-  modelTable: ModelRoute[],
   mappingState: MappingState,
 ): Promise<Response> {
-  const route = routeForRequest(modelTable, body);
+  // Read the table off the shared state per request, never from a startup
+  // snapshot — a dashboard ceiling edit must bind on the very next request.
+  const route = routeForRequest(mappingState.config.models, body);
   const backendErr = nonOauthOpenAIBackendError(route, config.backend);
   if (backendErr) return backendErr;
 
@@ -471,6 +516,30 @@ export function handleMappingsUpdate(state: MappingState, modelsFile: string, bo
   if (mappings !== undefined) state.config.mappings = mergeMappingsOver(state.config.mappings, mappings);
   saveModelConfig(modelsFile, state.config);
   return json({ ok: true, mappingEnabled: state.config.mappingEnabled, mappings: state.config.mappings });
+}
+
+/**
+ * Apply a context edit from the dashboard: per-model ceilings and/or the
+ * session auto-compact window.
+ *
+ * Every rule lives in applyContextEdits, which `models context` uses too — this
+ * function only decides what committing means on this surface: swap the
+ * validated config into the live MappingState (hot-applied, no pool restart)
+ * and persist it. Unauthenticated by design, matching the other dashboard
+ * routes.
+ */
+export function handleContextUpdate(
+  state: MappingState,
+  modelsFile: string,
+  body: unknown,
+  cap: number,
+  envOverride: number | null,
+): Response {
+  const result = applyContextEdits(state.config, body, envOverride);
+  if (!result.ok) return json({ error: { message: result.message } }, result.status);
+  state.config = result.config;
+  saveModelConfig(modelsFile, state.config);
+  return json({ ok: true, context: buildContextStatus(state.config, cap, envOverride) });
 }
 
 /** Returns an error message, or null when the row is valid. */

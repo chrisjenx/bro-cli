@@ -41,6 +41,8 @@ Usage:
   bun run src/index.ts accounts import <name> --provider openai
   bun run src/index.ts models list
   bun run src/index.ts models update
+  bun run src/index.ts models context gpt-5.6-sol 872000
+  bun run src/index.ts models context gpt-5.6-sol default
 
 Environment:
   CLAUDE_POOL_DIR     Pool directory (default ~/.claude-max-pool)
