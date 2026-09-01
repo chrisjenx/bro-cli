@@ -51,9 +51,19 @@ export async function loadModels() {
       /* offline / not published yet — fall back to the bundled copy */
     }
   }
-  if (!data) data = readJson(BUNDLED);
-  if (!data) data = { providers: [] };
-  return stripHash(data);
+  const bundled = readJson(BUNDLED);
+  return stripHash(overlayNativeProvider(data || bundled || { providers: [] }, bundled));
+}
+
+// The native Claude provider always comes from the bundled file, whatever the
+// remote catalog says (it may rename, drop, or list dated ids for it). The
+// bundled entries are family aliases (opus/sonnet/fable/haiku) that Claude Code
+// itself resolves to the current version, so nothing here tracks releases.
+export function overlayNativeProvider(data, bundled) {
+  const native = bundled?.providers?.find((p) => p.mode === 'native');
+  if (!native) return data;
+  const rest = (data.providers || []).filter((p) => p.mode !== 'native' && p.id !== native.id);
+  return { ...data, providers: [native, ...rest] };
 }
 
 // Force a refresh from REMOTE_URL (used by `bro update`).

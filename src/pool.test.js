@@ -5,12 +5,6 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { waitForExit, reapplyPoolEnv, POOL_SUBCOMMANDS, runPoolCommand } from './pool.js';
-import {
-  POOL_SONNET_MODEL,
-  POOL_OPUS_MODEL,
-  POOL_SONNET_MODEL_NAME,
-  POOL_OPUS_MODEL_NAME
-} from './settings.js';
 
 test('waitForExit resolves true once the process exits', async () => {
   const child = spawn('sleep', ['0.3']);
@@ -37,9 +31,10 @@ test('waitForExit resolves true immediately for a dead pid', async () => {
 });
 
 // `bro pool up` and `bro pool restart` both go through reapplyPoolEnv, so a
-// restart writes the same settings.json override as up — including the sonnet
-// 1M pin. Guards against restart silently drifting from up again.
-test('reapplyPoolEnv writes the pool env, including the sonnet and opus 1M pins', () => {
+// restart writes the same settings.json override as up. Guards against restart
+// silently drifting from up again — and against model pins creeping back in
+// (Claude Code owns its picker; bro only points it at the pool).
+test('reapplyPoolEnv writes the pool env and nothing else', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bro-pool-restart-'));
   const paths = {
     settings: path.join(dir, 'settings.json'),
@@ -48,10 +43,7 @@ test('reapplyPoolEnv writes the pool env, including the sonnet and opus 1M pins'
   reapplyPoolEnv(4321, paths);
   const { env } = JSON.parse(fs.readFileSync(paths.settings, 'utf8'));
   assert.equal(env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:4321');
-  assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL, POOL_SONNET_MODEL);
-  assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL, POOL_OPUS_MODEL);
-  assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME, POOL_SONNET_MODEL_NAME);
-  assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME, POOL_OPUS_MODEL_NAME);
+  assert.ok(!Object.keys(env).some((k) => k.startsWith('ANTHROPIC_DEFAULT_')), Object.keys(env).join());
 });
 
 // `start`/`stop` are the verbs people reach for once `restart` exists. They used

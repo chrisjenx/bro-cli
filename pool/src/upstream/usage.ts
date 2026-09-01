@@ -6,7 +6,7 @@
 
 import type { RateLimitSnapshot, RateLimitWindow } from "../accounts/types.ts";
 import { MODEL_FAMILIES, modelFamilyOf, sortRateLimitWindows, windowDurationMs } from "../accounts/types.ts";
-import { asObject, objectProp, stringProp, numberProp, parseJson } from "./shared.ts";
+import { asObject, objectProp, stringProp, numberProp, parseJson, oauthHeaders } from "./shared.ts";
 import type { Config } from "../config.ts";
 import { AccountManager } from "../accounts/manager.ts";
 import type { Account } from "../accounts/types.ts";
@@ -143,12 +143,7 @@ export async function fetchUsageSnapshot(
     const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
     res = await fetch(usageUrl(config), {
       method: "GET",
-      headers: {
-        authorization: `Bearer ${token}`,
-        "anthropic-beta": "oauth-2025-04-20",
-        "content-type": "application/json",
-        "user-agent": config.usageUserAgent,
-      },
+      headers: { ...oauthHeaders(token, config.usageUserAgent), "content-type": "application/json" },
       signal: combined,
     });
   } catch {

@@ -19,7 +19,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { which, globalBinDirs, runInherit } from './proc.js';
 import { permissionArgs } from './launch.js';
-import { applyPoolEnv, clearPoolEnv, isPoolEnvActive, poolEnvBlock } from './settings.js';
+import { applyPoolEnv, clearPoolEnv, isPoolEnvActive, poolEnvBlock, scrubLegacyPins } from './settings.js';
 import { select, prompt, holdOrContinue } from './ui.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -377,8 +377,8 @@ function poolEnvValues(port) {
 }
 
 // Point settings.json's env at the pool on <port>. Shared by `up` and `restart`
-// so a restart keeps the override — including the sonnet 1M pin — in sync with
-// `up` rather than drifting. `paths` is injectable for tests.
+// so a restart keeps the override in sync with `up` rather than drifting.
+// `paths` is injectable for tests.
 export function reapplyPoolEnv(port, paths) {
   applyPoolEnv(poolEnvValues(port), paths);
 }
@@ -417,8 +417,8 @@ export async function poolDown() {
 
 // `bro pool restart` — drain + stop, then start again, holding the terminal
 // until the server is healthy. Re-applies the settings.json override (like
-// `up`) so a restart picks up pool env changes, e.g. the sonnet 1M pin, instead
-// of leaving a stale block behind.
+// `up`) so a restart picks up pool env changes instead of leaving a stale
+// block behind.
 export async function poolRestart() {
   const port = poolPort();
   const baseUrl = `http://127.0.0.1:${port}`;
@@ -552,10 +552,11 @@ export async function runPool({ extraArgs = [], permissionMode = 'auto', dryRun 
   const env = { ...process.env };
   delete env.ANTHROPIC_API_KEY;
   delete env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
-  // The same block settings.json gets: base URL, token, and the sonnet/opus 1M
-  // pins with the display name/description Claude Code shows for them. Set here
-  // as well as in settings.json because process env outranks it, so a stale
-  // exported value would otherwise win for this launch (see poolEnvBlock).
+  // Same block settings.json gets. Set here as well because process env outranks
+  // settings.json, so a stale exported value would otherwise win for this launch.
+  // Model pins exported by an earlier bro (e.g. inherited from a shell it
+  // launched) are dropped for the same reason; a pin the user set stays.
+  scrubLegacyPins(env);
   Object.assign(env, poolEnvBlock({ baseUrl: b, token }));
   env.NODE_NO_WARNINGS = '1';
 

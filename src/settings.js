@@ -8,51 +8,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 
-// Pin Claude Code's `sonnet` alias to its 1M-context variant. Behind a custom
-// ANTHROPIC_BASE_URL (Claude Code treats the pool as an "LLM gateway") it can't
-// verify 1M support, so plain Sonnet is budgeted at 200K and auto-compacts
-// there; the `[1m]` suffix selects the full ~1M window. Claude Code strips the
-// `[1m]` before sending the request, so the pool still receives `claude-sonnet-5`.
-// Bump this when the Sonnet default version changes.
-export const POOL_SONNET_MODEL = 'claude-sonnet-5[1m]';
+// Keys bro writes today: just enough to point Claude Code at the pool.
+const ACTIVE_KEYS = ['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN'];
 
-// Behind a custom base URL Claude Code renders the Sonnet picker row *from*
-// ANTHROPIC_DEFAULT_SONNET_MODEL, defaulting the label to the raw id and the
-// description to "Custom Sonnet model" — so an unnamed pin shows up as
-// `claude-sonnet-5[1m]  Custom Sonnet model (1M context)`. The _NAME/
-// _DESCRIPTION keys are Claude Code's own opt-out; these mirror its built-in
-// row wording. Bump alongside POOL_SONNET_MODEL.
-export const POOL_SONNET_MODEL_NAME = 'Sonnet';
-export const POOL_SONNET_MODEL_DESCRIPTION = 'Sonnet 5 with 1M context · Efficient for routine tasks';
-
-// Pin Claude Code's `opus` alias to the 1M-context Opus 5, for the same reason
-// as Sonnet above: the bare id is budgeted at 200K behind the gateway and
-// auto-compacts there, and pinning it would *downgrade* a user who had picked
-// the 1M Opus row themselves. Bump when the Opus default version changes.
-export const POOL_OPUS_MODEL = 'claude-opus-5[1m]';
-
-// As POOL_SONNET_MODEL_NAME above. Bump alongside POOL_OPUS_MODEL.
-export const POOL_OPUS_MODEL_NAME = 'Opus';
-export const POOL_OPUS_MODEL_DESCRIPTION = 'Opus 5 with 1M context · Best for everyday, complex tasks';
-
-// Pin Claude Code's `fable` alias to Fable 5.1. Without this the row resolves
-// via the model catalog's `fable` alias, which behind the gateway still points
-// at Fable 5 — so the picker offers "Fable 5" on a client that has a built-in
-// Fable 5.1 row. `[1m]` for the same reason as Opus/Sonnet above: behind a
-// custom base URL Claude Code can't verify 1M support and budgets the bare id
-// at 200K. Bump when the Fable default version changes.
-export const POOL_FABLE_MODEL = 'claude-fable-5-1[1m]';
-
-// As POOL_OPUS_MODEL_NAME above. The description is Claude Code's own built-in
-// Fable 5.1 row wording verbatim — no context figure, because unlike the Opus
-// and Sonnet rows there is no pool-side cap to disclose here.
-export const POOL_FABLE_MODEL_NAME = 'Fable';
-export const POOL_FABLE_MODEL_DESCRIPTION =
-  'Fable 5.1 · Most capable for your hardest and longest-running tasks';
-
-const POOL_ENV_KEYS = [
-  'ANTHROPIC_BASE_URL',
-  'ANTHROPIC_AUTH_TOKEN',
+// Keys an earlier bro wrote and this one no longer does: Claude Code owns its
+// own model picker (behind the gateway it already renders the current Opus/
+// Sonnet/Fable/Haiku rows, 1M variants included). Still managed so `bro pool up`
+// scrubs old pins and `bro pool down` restores whatever the user had before.
+export const RETIRED_POOL_ENV_KEYS = [
   'ANTHROPIC_DEFAULT_SONNET_MODEL',
   'ANTHROPIC_DEFAULT_SONNET_MODEL_NAME',
   'ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION',
@@ -64,22 +27,38 @@ const POOL_ENV_KEYS = [
   'ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION'
 ];
 
+const POOL_ENV_KEYS = [...ACTIVE_KEYS, ...RETIRED_POOL_ENV_KEYS];
+
 // The full settings.json `env` mutation, in one place so applyPoolEnv, the
 // `bro pool` launch env and `--dry-run`'s report can't drift apart.
 export function poolEnvBlock({ baseUrl, token }) {
   return {
     ANTHROPIC_BASE_URL: baseUrl,
-    ANTHROPIC_AUTH_TOKEN: token,
-    ANTHROPIC_DEFAULT_SONNET_MODEL: POOL_SONNET_MODEL,
-    ANTHROPIC_DEFAULT_SONNET_MODEL_NAME: POOL_SONNET_MODEL_NAME,
-    ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION: POOL_SONNET_MODEL_DESCRIPTION,
-    ANTHROPIC_DEFAULT_OPUS_MODEL: POOL_OPUS_MODEL,
-    ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: POOL_OPUS_MODEL_NAME,
-    ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION: POOL_OPUS_MODEL_DESCRIPTION,
-    ANTHROPIC_DEFAULT_FABLE_MODEL: POOL_FABLE_MODEL,
-    ANTHROPIC_DEFAULT_FABLE_MODEL_NAME: POOL_FABLE_MODEL_NAME,
-    ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION: POOL_FABLE_MODEL_DESCRIPTION
+    ANTHROPIC_AUTH_TOKEN: token
   };
+}
+
+// Every value an earlier bro ever wrote for a retired key. Closed, historical
+// list — bro writes no pins any more, so it never needs a new entry. Used where
+// there is no snapshot to consult (a wiped ~/.bro, or an exported shell env) to
+// tell bro's leftovers from a value the user chose.
+const LEGACY_PIN_VALUES = new Set([
+  'claude-sonnet-5[1m]', 'claude-opus-5[1m]', 'claude-fable-5-1[1m]',
+  'Sonnet', 'Opus', 'Fable',
+  'Sonnet 5 with 1M context · Efficient for routine tasks',
+  'Opus 5 with 1M context · Best for everyday, complex tasks',
+  'Fable 5.1 · Most capable for your hardest and longest-running tasks'
+]);
+
+// Deletes retired-key values that an earlier bro wrote; user values stay.
+export function scrubLegacyPins(env) {
+  for (const k of RETIRED_POOL_ENV_KEYS) if (LEGACY_PIN_VALUES.has(env[k])) delete env[k];
+  return env;
+}
+
+function snapshotValue(env, k) {
+  if (!(k in env) || LEGACY_PIN_VALUES.has(env[k])) return null;
+  return env[k];
 }
 
 // The snapshot file for one Claude profile. Profiles must not share one: with a
@@ -126,6 +105,13 @@ function writeJson(file, obj) {
   fs.writeFileSync(file, JSON.stringify(obj, null, 2) + '\n');
 }
 
+function restoreKeys(env, prior, keys) {
+  for (const k of keys) {
+    if (prior[k] === null || prior[k] === undefined) delete env[k];
+    else env[k] = prior[k];
+  }
+}
+
 // Point settings.json's env at the pool. Snapshots prior values once (so repeat
 // calls don't clobber the original snapshot) and preserves all other settings.
 export function applyPoolEnv({ baseUrl, token }, paths = defaultPaths()) {
@@ -140,22 +126,25 @@ export function applyPoolEnv({ baseUrl, token }, paths = defaultPaths()) {
   // but unreadable state file is left alone (matches the original behaviour).
   const stateExists = fs.existsSync(paths.state);
   const state = stateExists ? readJson(paths.state) : null;
+  let prior = {};
   if (!stateExists) {
-    const prior = {};
-    for (const k of POOL_ENV_KEYS) prior[k] = k in env ? env[k] : null;
+    for (const k of POOL_ENV_KEYS) prior[k] = snapshotValue(env, k);
     writeJson(paths.state, { managed: true, prior });
   } else if (state) {
-    const prior = { ...(state.prior || {}) };
+    prior = { ...(state.prior || {}) };
     let changed = false;
     for (const k of POOL_ENV_KEYS) {
       if (!(k in prior)) {
-        prior[k] = k in env ? env[k] : null;
+        prior[k] = snapshotValue(env, k);
         changed = true;
       }
     }
     if (changed) writeJson(paths.state, { ...state, prior });
   }
 
+  // Retired keys revert to the user's snapshot (null → removed), so pins an
+  // earlier bro wrote disappear here.
+  restoreKeys(env, prior, RETIRED_POOL_ENV_KEYS);
   settings.env = { ...env, ...poolEnvBlock({ baseUrl, token }) };
   writeJson(paths.settings, settings);
 }
@@ -168,11 +157,7 @@ export function clearPoolEnv(paths = defaultPaths()) {
 
   const settings = readJson(paths.settings) || {};
   const env = { ...(settings.env || {}) };
-  const prior = state.prior || {};
-  for (const k of POOL_ENV_KEYS) {
-    if (prior[k] === null || prior[k] === undefined) delete env[k];
-    else env[k] = prior[k];
-  }
+  restoreKeys(env, state.prior || {}, POOL_ENV_KEYS);
   if (Object.keys(env).length === 0) delete settings.env;
   else settings.env = env;
   writeJson(paths.settings, settings);

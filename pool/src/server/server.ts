@@ -31,6 +31,8 @@ import { runWithFailover, type FailoverHooks } from "./failover.ts";
 import { dashboardHtml } from "./dashboard.ts";
 import { proxyAnthropicMessages, extractSessionKey } from "../upstream/anthropic.ts";
 import { sweepUsageRefresh } from "../upstream/usage.ts";
+import { anyAnthropicAccessToken } from "../upstream/oauth-token.ts";
+import { buildModelListing, fetchAnthropicModels } from "../upstream/models-list.ts";
 import { proxyCodexMessages } from "../upstream/openai-codex.ts";
 import {
   parseOpenAI,
@@ -132,15 +134,16 @@ export function startServer(config: Config): void {
         return handleMappingsUpdate(mappingState, config.modelsFile, body);
       }
       if (req.method === "GET" && (path === "/v1/models" || path === "/models")) {
-        return json({
-          object: "list",
-          data: modelsForListing(modelTable).map((m) => ({
-            id: m.id,
-            object: "model",
-            created: 0,
-            owned_by: m.provider === "openai" ? "openai-chatgpt-pool" : "anthropic-claude-max-pool",
-          })),
+        // Claude entries come from Anthropic's own catalog (via any available
+        // account's OAuth token) so new models list without a pool release;
+        // the routing table only stands in when upstream can't be reached.
+        const live = await fetchAnthropicModels({
+          baseUrl: config.anthropicApiBaseUrl,
+          userAgent: config.usageUserAgent,
+          timeoutMs: config.usageFetchTimeoutMs,
+          token: () => anyAnthropicAccessToken(mgr, config),
         });
+        return json({ object: "list", data: buildModelListing(live, modelsForListing(modelTable)) });
       }
 
       // ---- Inference endpoints (require proxy auth if configured) ----

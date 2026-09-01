@@ -97,6 +97,29 @@ export function makeAbort(config: Config, signal: AbortSignal): { signal: AbortS
   };
 }
 
+/** Headers for a Claude Code OAuth request (usage, model list, …). One place to
+ * bump the beta version. */
+export function oauthHeaders(token: string, userAgent: string): Record<string, string> {
+  return {
+    authorization: `Bearer ${token}`,
+    "anthropic-version": "2023-06-01",
+    "anthropic-beta": "oauth-2025-04-20",
+    "user-agent": userAgent,
+  };
+}
+
+/**
+ * Joins an Anthropic API path onto the configured base URL, tolerating a base
+ * that already ends in `/v1` or in the path itself (e.g. an LLM gateway that
+ * is configured as https://gw.example/anthropic/v1). Never `new URL(path, base)`,
+ * which would drop such a prefix.
+ */
+export function anthropicUrl(baseUrl: string, path: `/v1/${string}`): string {
+  const clean = baseUrl.replace(/\/+$/, "");
+  if (clean.endsWith(path)) return clean;
+  return clean.endsWith("/v1") ? `${clean}${path.slice(3)}` : `${clean}${path}`;
+}
+
 export function parseJson(text: string): Record<string, unknown> | null {
   try {
     const parsed = JSON.parse(text) as unknown;

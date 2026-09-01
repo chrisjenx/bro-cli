@@ -10,12 +10,10 @@
       "keyUrl": "https://claude.com/claude-code",
       "models": [
         { "name": "Default (your Claude login)" },
-        { "id": "claude-opus-5", "name": "Claude Opus 5" },
-        { "id": "claude-opus-4-8", "name": "Claude Opus 4.8" },
-        { "id": "claude-sonnet-5", "name": "Claude Sonnet 5" },
-        { "id": "claude-haiku-4-5-20251001", "name": "Claude Haiku 4.5" },
-        { "id": "claude-fable-5", "name": "Claude Fable 5" },
-        { "id": "claude-fable-5-1", "name": "Claude Fable 5.1" }
+        { "id": "fable", "name": "Fable (latest)" },
+        { "id": "opus", "name": "Opus (latest)" },
+        { "id": "sonnet", "name": "Sonnet (latest)" },
+        { "id": "haiku", "name": "Haiku (latest)" }
       ]
     },
     {

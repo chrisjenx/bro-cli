@@ -121,3 +121,19 @@ function safeErrorText(text: string): string {
   const error = objectProp(json, "error");
   return stringProp(error, "message") ?? (text.slice(0, 500) || "unknown OAuth error");
 }
+
+/**
+ * A valid access token from any logged-in Claude account, for read-only calls
+ * that aren't tied to a request (model list, …). Deliberately not pick(): that
+ * is the inference selector and returns null once every account is in a spent
+ * window, even though their tokens are still perfectly usable.
+ */
+export async function anyAnthropicAccessToken(mgr: AccountManager, config: Config): Promise<string | null> {
+  for (const a of mgr.listAccounts()) {
+    if (a.provider !== "anthropic" || !a.authenticated) continue;
+    try {
+      return await accessTokenFor(a, mgr, config, false);
+    } catch {}
+  }
+  return null;
+}

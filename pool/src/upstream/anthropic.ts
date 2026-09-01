@@ -25,6 +25,7 @@ import {
   retryAfterMs,
   overloadBackoffMs,
   sleepWithAbort,
+  anthropicUrl,
 } from "./shared.ts";
 import type { SseEvent } from "./shared.ts";
 import { accessTokenFor } from "./oauth-token.ts";
@@ -698,9 +699,7 @@ function noAccountMessage(mgr: AccountManager): string {
 }
 
 function messagesUrl(baseUrl: string): string {
-  const clean = baseUrl.replace(/\/+$/, "");
-  if (clean.endsWith("/v1/messages")) return clean;
-  return clean.endsWith("/v1") ? `${clean}/messages` : `${clean}/v1/messages`;
+  return anthropicUrl(baseUrl, "/v1/messages");
 }
 
 

@@ -8,15 +8,8 @@ import {
   clearPoolEnv,
   isPoolEnvActive,
   defaultPaths,
-  POOL_SONNET_MODEL,
-  POOL_OPUS_MODEL,
-  POOL_SONNET_MODEL_NAME,
-  POOL_SONNET_MODEL_DESCRIPTION,
-  POOL_OPUS_MODEL_NAME,
-  POOL_OPUS_MODEL_DESCRIPTION,
-  POOL_FABLE_MODEL,
-  POOL_FABLE_MODEL_NAME,
-  POOL_FABLE_MODEL_DESCRIPTION
+  poolEnvBlock,
+  RETIRED_POOL_ENV_KEYS
 } from './settings.js';
 
 function tmpPaths() {
@@ -98,78 +91,96 @@ test('apply adds env keys and preserves other settings', () => {
   const s = read(p.settings);
   assert.equal(s.env.ANTHROPIC_BASE_URL, POOL.baseUrl);
   assert.equal(s.env.ANTHROPIC_AUTH_TOKEN, POOL.token);
-  assert.equal(s.env.ANTHROPIC_DEFAULT_SONNET_MODEL, POOL_SONNET_MODEL);
-  assert.equal(s.env.ANTHROPIC_DEFAULT_OPUS_MODEL, POOL_OPUS_MODEL);
   assert.equal(s.model, 'opus');
   assert.deepEqual(s.permissions, { defaultMode: 'auto' });
   assert.equal(isPoolEnvActive(p), true);
 });
 
-// Behind a custom ANTHROPIC_BASE_URL, Claude Code builds its Opus/Sonnet picker
-// rows *from* ANTHROPIC_DEFAULT_{OPUS,SONNET}_MODEL, and falls back to the raw
-// model id for the label and "Custom Opus model" for the description. Without
-// the companion _NAME/_DESCRIPTION keys the picker reads `claude-opus-5[1m]`
-// instead of `Opus`.
-test('apply names and describes the pinned models so the picker reads like the built-in rows', () => {
+// Claude Code renders its own picker rows behind the gateway (current Opus,
+// Sonnet, Fable, Haiku, with the 1M variants). Pinning ANTHROPIC_DEFAULT_*_MODEL
+// meant a bro release for every model release, so bro no longer touches them.
+test('apply sets only the base URL and token — no model pins', () => {
   const p = tmpPaths();
   applyPoolEnv(POOL, p);
   const { env } = read(p.settings);
-  assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME, POOL_SONNET_MODEL_NAME);
-  assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION, POOL_SONNET_MODEL_DESCRIPTION);
-  assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME, POOL_OPUS_MODEL_NAME);
-  assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION, POOL_OPUS_MODEL_DESCRIPTION);
-  // A raw model id as the label is the exact symptom these keys exist to avoid.
-  assert.ok(!env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME.includes('[1m]'));
-  assert.ok(!env.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME.includes('[1m]'));
+  assert.deepEqual(Object.keys(env).sort(), ['ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL']);
+  assert.deepEqual(poolEnvBlock(POOL), { ANTHROPIC_BASE_URL: POOL.baseUrl, ANTHROPIC_AUTH_TOKEN: POOL.token });
+  for (const k of RETIRED_POOL_ENV_KEYS) assert.match(k, /^ANTHROPIC_DEFAULT_/);
 });
 
-// Claude Code 2.1.257 ships a built-in Fable 5.1 row, but resolves the Fable
-// alias as ANTHROPIC_DEFAULT_FABLE_MODEL ?? <catalog "fable" alias> ?? fable51.
-// Behind the gateway that catalog alias still points at Fable 5, so without
-// this pin the picker offers "Fable 5" on a client that knows about 5.1.
-test('apply pins Fable to 5.1 so the picker stops resolving the alias to Fable 5', () => {
+// An earlier bro wrote the pins into settings.json; re-applying must scrub them
+// (back to the user's snapshotted value) rather than leave them behind.
+test('apply scrubs model pins written by an earlier bro', () => {
   const p = tmpPaths();
+  fs.writeFileSync(p.settings, JSON.stringify({
+    env: {
+      ANTHROPIC_BASE_URL: POOL.baseUrl,
+      ANTHROPIC_AUTH_TOKEN: POOL.token,
+      ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-5[1m]',
+      ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: 'Opus',
+      ANTHROPIC_DEFAULT_FABLE_MODEL: 'claude-fable-5-1[1m]'
+    }
+  }));
+  fs.writeFileSync(p.state, JSON.stringify({
+    managed: true,
+    prior: {
+      ANTHROPIC_BASE_URL: null,
+      ANTHROPIC_AUTH_TOKEN: null,
+      ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-4-8',
+      ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: null,
+      ANTHROPIC_DEFAULT_FABLE_MODEL: null
+    }
+  }));
   applyPoolEnv(POOL, p);
   const { env } = read(p.settings);
-  assert.equal(env.ANTHROPIC_DEFAULT_FABLE_MODEL, POOL_FABLE_MODEL);
-  assert.equal(env.ANTHROPIC_DEFAULT_FABLE_MODEL_NAME, POOL_FABLE_MODEL_NAME);
-  assert.equal(env.ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION, POOL_FABLE_MODEL_DESCRIPTION);
-  // The pin must name 5.1 specifically — a bare `claude-fable-5` pin would be
-  // indistinguishable from the catalog fallback this key exists to override.
-  assert.match(env.ANTHROPIC_DEFAULT_FABLE_MODEL, /^claude-fable-5-1/);
-  assert.ok(!env.ANTHROPIC_DEFAULT_FABLE_MODEL_NAME.includes('[1m]'));
+  assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL, 'claude-opus-4-8');
+  assert.ok(!('ANTHROPIC_DEFAULT_OPUS_MODEL_NAME' in env));
+  assert.ok(!('ANTHROPIC_DEFAULT_FABLE_MODEL' in env));
+  assert.equal(env.ANTHROPIC_BASE_URL, POOL.baseUrl);
 });
 
-// The Fable keys joined POOL_ENV_KEYS, so `bro pool down` owes them the same
-// exact-restore treatment as every other managed key.
-test('clear restores a user ANTHROPIC_DEFAULT_FABLE_MODEL added before the key was managed', () => {
+// No state file (say ~/.bro was wiped) but an earlier bro's pins are still in
+// settings.json: they must not be snapshotted as the user's baseline.
+test('apply scrubs old bro pins even when no state file survived', () => {
+  const p = tmpPaths();
+  fs.writeFileSync(p.settings, JSON.stringify({
+    env: {
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-5[1m]',
+      ANTHROPIC_DEFAULT_SONNET_MODEL_NAME: 'Sonnet',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'my-haiku' // not bro's: untouched
+    }
+  }));
+  applyPoolEnv(POOL, p);
+  const { env } = read(p.settings);
+  assert.ok(!('ANTHROPIC_DEFAULT_SONNET_MODEL' in env));
+  assert.ok(!('ANTHROPIC_DEFAULT_SONNET_MODEL_NAME' in env));
+  assert.equal(env.ANTHROPIC_DEFAULT_HAIKU_MODEL, 'my-haiku');
+  clearPoolEnv(p);
+  assert.deepEqual(read(p.settings), { env: { ANTHROPIC_DEFAULT_HAIKU_MODEL: 'my-haiku' } });
+});
+
+// A user's own pin is theirs: apply leaves it alone and clear keeps it.
+test('apply and clear leave a user-set ANTHROPIC_DEFAULT_FABLE_MODEL alone', () => {
   const p = tmpPaths();
   fs.writeFileSync(p.settings, JSON.stringify({ env: { ANTHROPIC_DEFAULT_FABLE_MODEL: 'claude-fable-5' } }));
   applyPoolEnv(POOL, p);
-  assert.equal(read(p.settings).env.ANTHROPIC_DEFAULT_FABLE_MODEL, POOL_FABLE_MODEL);
+  assert.equal(read(p.settings).env.ANTHROPIC_DEFAULT_FABLE_MODEL, 'claude-fable-5');
   clearPoolEnv(p);
   assert.deepEqual(read(p.settings), { env: { ANTHROPIC_DEFAULT_FABLE_MODEL: 'claude-fable-5' } });
 });
 
-test('clear removes the name/description keys the user never set', () => {
+// `bro pool down` after an older bro's `pool up`: the pins it wrote are gone.
+test('clear removes pins an earlier bro wrote and the user never set', () => {
   const p = tmpPaths();
-  fs.writeFileSync(p.settings, JSON.stringify({ model: 'opus' }));
-  applyPoolEnv(POOL, p);
+  fs.writeFileSync(p.settings, JSON.stringify({
+    model: 'opus',
+    env: { ANTHROPIC_BASE_URL: POOL.baseUrl, ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-5[1m]' }
+  }));
+  fs.writeFileSync(p.state, JSON.stringify({
+    managed: true, prior: { ANTHROPIC_BASE_URL: null, ANTHROPIC_DEFAULT_SONNET_MODEL: null }
+  }));
   clearPoolEnv(p);
   assert.deepEqual(read(p.settings), { model: 'opus' });
-});
-
-test('clear restores a user ANTHROPIC_DEFAULT_OPUS_MODEL_NAME added before the key was managed', () => {
-  const p = tmpPaths();
-  // Older bro: state file exists but predates the name key, user has their own.
-  fs.writeFileSync(p.settings, JSON.stringify({
-    env: { ANTHROPIC_BASE_URL: POOL.baseUrl, ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: 'My Opus' }
-  }));
-  fs.writeFileSync(p.state, JSON.stringify({ managed: true, prior: { ANTHROPIC_BASE_URL: null } }));
-  applyPoolEnv(POOL, p);
-  assert.equal(read(p.settings).env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME, POOL_OPUS_MODEL_NAME);
-  clearPoolEnv(p);
-  assert.equal(read(p.settings).env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME, 'My Opus');
 });
 
 test('clear restores a file that had no env block', () => {
@@ -209,41 +220,6 @@ test('apply creates settings.json when absent, clear removes empty env', () => {
   clearPoolEnv(p);
   const s = read(p.settings);
   assert.ok(!('env' in s)); // empty env removed
-});
-
-test('clear restores a user ANTHROPIC_DEFAULT_SONNET_MODEL added before the key was managed', () => {
-  const p = tmpPaths();
-  // Simulate an older bro: the pool is already active (state file exists) but its
-  // snapshot predates the sonnet key, while the user has their own value set.
-  fs.writeFileSync(p.settings, JSON.stringify({
-    env: { ANTHROPIC_BASE_URL: POOL.baseUrl, ANTHROPIC_AUTH_TOKEN: POOL.token, ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-4-5' }
-  }));
-  fs.writeFileSync(p.state, JSON.stringify({ managed: true, prior: { ANTHROPIC_BASE_URL: null, ANTHROPIC_AUTH_TOKEN: null } }));
-
-  applyPoolEnv(POOL, p);
-  assert.equal(read(p.settings).env.ANTHROPIC_DEFAULT_SONNET_MODEL, POOL_SONNET_MODEL); // overridden while active
-
-  clearPoolEnv(p);
-  const s = read(p.settings);
-  assert.equal(s.env.ANTHROPIC_DEFAULT_SONNET_MODEL, 'claude-sonnet-4-5'); // user value backfilled + restored
-  assert.ok(!('ANTHROPIC_BASE_URL' in s.env)); // was absent pre-pool → stays absent
-});
-
-test('clear restores a user ANTHROPIC_DEFAULT_OPUS_MODEL added before the key was managed', () => {
-  const p = tmpPaths();
-  // Same shape as the sonnet case above: the opus key is newer than the state
-  // file, so applying must backfill the user's value rather than snapshot ours.
-  fs.writeFileSync(p.settings, JSON.stringify({
-    env: { ANTHROPIC_BASE_URL: POOL.baseUrl, ANTHROPIC_AUTH_TOKEN: POOL.token, ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-4-8' }
-  }));
-  fs.writeFileSync(p.state, JSON.stringify({ managed: true, prior: { ANTHROPIC_BASE_URL: null, ANTHROPIC_AUTH_TOKEN: null } }));
-
-  applyPoolEnv(POOL, p);
-  assert.equal(read(p.settings).env.ANTHROPIC_DEFAULT_OPUS_MODEL, POOL_OPUS_MODEL); // overridden while active
-
-  clearPoolEnv(p);
-  const s = read(p.settings);
-  assert.equal(s.env.ANTHROPIC_DEFAULT_OPUS_MODEL, 'claude-opus-4-8'); // user value backfilled + restored
 });
 
 test('apply twice keeps the original snapshot', () => {
