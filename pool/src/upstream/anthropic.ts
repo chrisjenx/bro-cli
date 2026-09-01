@@ -41,6 +41,10 @@ interface RetryReason {
   type: string;
   message: string;
   rateLimited: boolean;
+  /** HTTP 429 that is NOT an account quota hit (no unified rate-limit headers,
+   * no retry-after, no quota wording) — Anthropic rejecting this particular
+   * request. Same on every account, so never bench or fail over. */
+  rejected?: boolean;
   /** Transient upstream overload (529/500/503 or SSE overloaded_error) — retry same account with backoff. */
   transient: boolean;
   /** Anthropic refused the account itself (HTTP 403) — sideline it and fail over. */
@@ -204,6 +208,19 @@ async function attemptOnce(
     const text = await upstream.response.text().catch(() => "");
     upstream.cleanup();
     const reason = classifyHttpError(upstream.response.status, upstream.response.headers, text);
+    if (reason.rejected) {
+      // Benching here would sideline every account for rateLimitCooldownMs on
+      // a request Anthropic refuses regardless of account. Hand it straight
+      // back; the marker header stops the cross-provider hop as well.
+      console.warn(
+        `  ⚠ upstream rejected a request on "${account.name}" (429 without rate-limit headers) — ` +
+          `system prompt: ${JSON.stringify(systemPromptPreview(bodyText))}`,
+      );
+      return {
+        kind: "terminal",
+        response: responseFromUpstreamText(text, upstream.response, account.name, { [UPSTREAM_REJECTED_HEADER]: "1" }),
+      };
+    }
     if (reason.rateLimited) {
       mgr.markRateLimited(account.name, reason.resetAt);
       return { kind: "retry", reason };
@@ -482,12 +499,35 @@ function recordJsonUsage(text: string, mgr: AccountManager, accountName: string)
   );
 }
 
+/** Marks a pass-through 429 that is a per-request refusal, not pool exhaustion. */
+export const UPSTREAM_REJECTED_HEADER = "x-pool-upstream-rejected";
+
+/** First ~80 chars of the request's system prompt, for the rejection log. */
+function systemPromptPreview(bodyText: string): string {
+  const body = parseJson(bodyText);
+  const system = body?.system;
+  const text =
+    typeof system === "string"
+      ? system
+      : Array.isArray(system)
+        ? (stringProp(asObject(system[0]), "text") ?? "")
+        : "";
+  return text.length > 80 ? `${text.slice(0, 80)}…` : text || "(none)";
+}
+
 function classifyHttpError(status: number, headers: Headers, text: string): RetryReason {
   const json = parseJson(text);
   const error = objectProp(json, "error");
   const type = stringProp(error, "type") ?? (status === 429 ? "rate_limit_error" : "api_error");
   const message = stringProp(error, "message") ?? (text.slice(0, 500) || `Anthropic API returned HTTP ${status}`);
-  const rateLimited = status === 429 || isRateLimit(type, message);
+  // A quota 429 carries the unified window headers (or at least retry-after)
+  // or says so in the body. Anthropic also answers 429 {"message":"Error"}
+  // with none of those for requests it refuses outright (e.g. OAuth traffic
+  // without Claude Code's system prompt); that is per-request, not per-account.
+  // The type alone proves nothing: the refusal is also "rate_limit_error".
+  const quotaSignal = hasRateLimitHeaders(headers) || headers.has("retry-after") || isRateLimitShared(message);
+  const rateLimited = status === 429 ? quotaSignal : isRateLimit(type, message);
+  const rejected = status === 429 && !rateLimited;
   const transient = !rateLimited && (status === 529 || status === 500 || status === 503);
   const accessDenied = !rateLimited && status === 403;
   return {
@@ -495,6 +535,7 @@ function classifyHttpError(status: number, headers: Headers, text: string): Retr
     type,
     message,
     rateLimited,
+    rejected,
     transient,
     accessDenied,
     resetAt: resetAtFromHeaders(headers),
@@ -619,12 +660,15 @@ const HOP_BY_HOP_REQUEST_HEADERS = [
   "upgrade",
 ];
 
-function responseFromUpstreamText(text: string, upstream: Response, accountName: string): Response {
-  return new Response(text, {
-    status: upstream.status,
-    statusText: upstream.statusText,
-    headers: responseHeaders(upstream.headers, accountName),
-  });
+function responseFromUpstreamText(
+  text: string,
+  upstream: Response,
+  accountName: string,
+  extraHeaders: Record<string, string> = {},
+): Response {
+  const headers = responseHeaders(upstream.headers, accountName);
+  for (const [k, v] of Object.entries(extraHeaders)) headers.set(k, v);
+  return new Response(text, { status: upstream.status, statusText: upstream.statusText, headers });
 }
 
 /**

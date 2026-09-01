@@ -277,6 +277,68 @@ test("fails over to another account on a start-of-request rate limit", async () 
   }
 });
 
+// Anthropic answers 429 {"type":"rate_limit_error","message":"Error"} with no
+// unified headers for requests it refuses outright (OAuth traffic without Claude
+// Code's system prompt). Treating that as a quota hit benched every account for
+// rateLimitCooldownMs (an hour by default) and cascaded to the OpenAI pool —
+// "everything 529". It must pass straight through instead.
+test("a 429 without rate-limit headers is a per-request refusal: no benching, no failover", async () => {
+  const { poolDir, mgr, config } = tempPool(["a", "b"]);
+  try {
+    const failovers: string[] = [];
+    const calls = mockFetch(() =>
+      jsonResponse({ type: "error", error: { type: "rate_limit_error", message: "Error" } }, 429, {
+        "request-id": "req_x",
+        "x-should-retry": "true",
+      }),
+    );
+
+    const response = await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", max_tokens: 8, system: "You are a title generator.", messages: [{ role: "user", content: "hi" }] },
+      new Headers(),
+      mgr,
+      config,
+      new AbortController().signal,
+      { onFailover: (from, to) => failovers.push(`${from}->${to}`) },
+    );
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get("x-pool-upstream-rejected")).toBe("1");
+    expect(JSON.parse(await drain(response)).error.message).toBe("Error");
+    expect(calls.length).toBe(1);
+    expect(failovers).toEqual([]);
+    expect(mgr.getAccount("a").available).toBe(true);
+    expect(mgr.getAccount("b").available).toBe(true);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("a 429 with unified rate-limit headers but a bland message still benches the account", async () => {
+  const { poolDir, mgr, config } = tempPool(["a", "b"]);
+  try {
+    const resetSec = Math.floor(Date.now() / 1000) + 3600;
+    mockFetch((_, init) =>
+      new Headers(init.headers).get("authorization") === "Bearer tok-a"
+        ? jsonResponse({ type: "error", error: { type: "rate_limit_error", message: "Error" } }, 429, {
+            "anthropic-ratelimit-unified-status": "rejected",
+            "anthropic-ratelimit-unified-5h-status": "rejected",
+            "anthropic-ratelimit-unified-5h-utilization": "1",
+            "anthropic-ratelimit-unified-5h-reset": String(resetSec),
+          })
+        : jsonResponse({ type: "message", content: [{ type: "text", text: "b" }], usage: { input_tokens: 1, output_tokens: 1 } }),
+    );
+    const response = await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", max_tokens: 8, messages: [{ role: "user", content: "hi" }] },
+      new Headers(), mgr, config, new AbortController().signal, {},
+    );
+    expect(response.status).toBe(200);
+    expect(mgr.getAccount("a").available).toBe(false);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
 test("captures Anthropic's unified rate-limit headers into the account's live snapshot", async () => {
   const { poolDir, mgr, config } = tempPool(["a"]);
   try {

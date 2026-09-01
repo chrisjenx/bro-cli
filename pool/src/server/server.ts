@@ -29,7 +29,7 @@ import type { Account } from "../accounts/types.ts";
 import { modelFamilyOf, MODEL_FAMILIES } from "../accounts/types.ts";
 import { runWithFailover, type FailoverHooks } from "./failover.ts";
 import { dashboardHtml } from "./dashboard.ts";
-import { proxyAnthropicMessages, extractSessionKey } from "../upstream/anthropic.ts";
+import { proxyAnthropicMessages, extractSessionKey, UPSTREAM_REJECTED_HEADER } from "../upstream/anthropic.ts";
 import { sweepUsageRefresh } from "../upstream/usage.ts";
 import { anyAnthropicAccessToken } from "../upstream/oauth-token.ts";
 import { buildModelListing, fetchAnthropicModels } from "../upstream/models-list.ts";
@@ -335,6 +335,9 @@ export async function serveWithCrossProviderFallback(
 ): Promise<Response> {
   const res = await serve(first);
   if (!CROSS_PROVIDER_RETRY_STATUSES.has(res.status)) return res;
+  // A per-request upstream refusal is not exhaustion; the other pool would
+  // refuse it just the same.
+  if (res.headers.get(UPSTREAM_REJECTED_HEADER)) return res;
   const other = first === "anthropic" ? "openai" : "anthropic";
   hooks.onFailover?.(`${first} pool`, `${other} pool`);
   const retry = await serve(other);

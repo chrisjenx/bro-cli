@@ -136,6 +136,19 @@ describe("CROSS_PROVIDER_RETRY_STATUSES", () => {
 });
 
 describe("serveWithCrossProviderFallback", () => {
+  test("does not hop providers for a per-request upstream refusal", async () => {
+    const failoverCalls: [string, string][] = [];
+    const served: string[] = [];
+    const serve = async (svc: "anthropic" | "openai") => {
+      served.push(svc);
+      return new Response("{}", { status: 429, headers: { "x-pool-upstream-rejected": "1" } });
+    };
+    const res = await serveWithCrossProviderFallback("anthropic", serve, trackingHooks(failoverCalls));
+    expect(res.status).toBe(429);
+    expect(served).toEqual(["anthropic"]);
+    expect(failoverCalls).toEqual([]);
+  });
+
   /** Records which providers were served, in order. */
   function trackingHooks(calls: Array<[string, string]>): FailoverHooks {
     return { onFailover: (from, to) => calls.push([from, to]) };
