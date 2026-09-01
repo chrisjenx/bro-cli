@@ -13,6 +13,17 @@ describe("model table", () => {
     expect(resolveModel(DEFAULT_MODEL_TABLE, "some-future-model").provider).toBe("anthropic");
   });
 
+  test("Fable 5.1 routes to anthropic under its own id", () => {
+    // Claude Code strips the `[1m]` suffix, so the pool receives the bare id.
+    const r = resolveModel(DEFAULT_MODEL_TABLE, "claude-fable-5-1");
+    expect(r.provider).toBe("anthropic");
+    expect(r.upstreamModel).toBe("claude-fable-5-1");
+    // 5.1 must not be swallowed by the 5 route — distinct upstream ids.
+    expect(resolveModel(DEFAULT_MODEL_TABLE, "claude-fable-5").upstreamModel).toBe("claude-fable-5");
+    // ...but both still belong to the `fable` family for account/limit purposes.
+    expect(modelFamilyOf("claude-fable-5-1")).toBe("fable");
+  });
+
   test("openai models route to openai with the mapped upstream id", () => {
     const table = [...DEFAULT_MODEL_TABLE, { id: "gpt", provider: "openai" as const, upstreamModel: "gpt-5.2-codex" }];
     const r = resolveModel(table, "gpt");
@@ -36,7 +47,7 @@ describe("model table", () => {
     const ids = modelsForListing(DEFAULT_MODEL_TABLE).map((m) => m.id);
     // one alias per Claude family, and no bundled full-id duplicates
     for (const alias of ["opus", "sonnet", "haiku", "fable"]) expect(ids).toContain(alias);
-    for (const full of ["claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5", "claude-fable-5"]) {
+    for (const full of ["claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5", "claude-fable-5", "claude-fable-5-1"]) {
       expect(ids).not.toContain(full);
     }
     // exactly one Sonnet in the listing

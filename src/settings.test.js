@@ -13,7 +13,10 @@ import {
   POOL_SONNET_MODEL_NAME,
   POOL_SONNET_MODEL_DESCRIPTION,
   POOL_OPUS_MODEL_NAME,
-  POOL_OPUS_MODEL_DESCRIPTION
+  POOL_OPUS_MODEL_DESCRIPTION,
+  POOL_FABLE_MODEL,
+  POOL_FABLE_MODEL_NAME,
+  POOL_FABLE_MODEL_DESCRIPTION
 } from './settings.js';
 
 function tmpPaths() {
@@ -118,6 +121,34 @@ test('apply names and describes the pinned models so the picker reads like the b
   // A raw model id as the label is the exact symptom these keys exist to avoid.
   assert.ok(!env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME.includes('[1m]'));
   assert.ok(!env.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME.includes('[1m]'));
+});
+
+// Claude Code 2.1.257 ships a built-in Fable 5.1 row, but resolves the Fable
+// alias as ANTHROPIC_DEFAULT_FABLE_MODEL ?? <catalog "fable" alias> ?? fable51.
+// Behind the gateway that catalog alias still points at Fable 5, so without
+// this pin the picker offers "Fable 5" on a client that knows about 5.1.
+test('apply pins Fable to 5.1 so the picker stops resolving the alias to Fable 5', () => {
+  const p = tmpPaths();
+  applyPoolEnv(POOL, p);
+  const { env } = read(p.settings);
+  assert.equal(env.ANTHROPIC_DEFAULT_FABLE_MODEL, POOL_FABLE_MODEL);
+  assert.equal(env.ANTHROPIC_DEFAULT_FABLE_MODEL_NAME, POOL_FABLE_MODEL_NAME);
+  assert.equal(env.ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION, POOL_FABLE_MODEL_DESCRIPTION);
+  // The pin must name 5.1 specifically — a bare `claude-fable-5` pin would be
+  // indistinguishable from the catalog fallback this key exists to override.
+  assert.match(env.ANTHROPIC_DEFAULT_FABLE_MODEL, /^claude-fable-5-1/);
+  assert.ok(!env.ANTHROPIC_DEFAULT_FABLE_MODEL_NAME.includes('[1m]'));
+});
+
+// The Fable keys joined POOL_ENV_KEYS, so `bro pool down` owes them the same
+// exact-restore treatment as every other managed key.
+test('clear restores a user ANTHROPIC_DEFAULT_FABLE_MODEL added before the key was managed', () => {
+  const p = tmpPaths();
+  fs.writeFileSync(p.settings, JSON.stringify({ env: { ANTHROPIC_DEFAULT_FABLE_MODEL: 'claude-fable-5' } }));
+  applyPoolEnv(POOL, p);
+  assert.equal(read(p.settings).env.ANTHROPIC_DEFAULT_FABLE_MODEL, POOL_FABLE_MODEL);
+  clearPoolEnv(p);
+  assert.deepEqual(read(p.settings), { env: { ANTHROPIC_DEFAULT_FABLE_MODEL: 'claude-fable-5' } });
 });
 
 test('clear removes the name/description keys the user never set', () => {

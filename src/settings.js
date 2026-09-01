@@ -35,6 +35,21 @@ export const POOL_OPUS_MODEL = 'claude-opus-5[1m]';
 export const POOL_OPUS_MODEL_NAME = 'Opus';
 export const POOL_OPUS_MODEL_DESCRIPTION = 'Opus 5 with 1M context · Best for everyday, complex tasks';
 
+// Pin Claude Code's `fable` alias to Fable 5.1. Without this the row resolves
+// via the model catalog's `fable` alias, which behind the gateway still points
+// at Fable 5 — so the picker offers "Fable 5" on a client that has a built-in
+// Fable 5.1 row. `[1m]` for the same reason as Opus/Sonnet above: behind a
+// custom base URL Claude Code can't verify 1M support and budgets the bare id
+// at 200K. Bump when the Fable default version changes.
+export const POOL_FABLE_MODEL = 'claude-fable-5-1[1m]';
+
+// As POOL_OPUS_MODEL_NAME above. The description is Claude Code's own built-in
+// Fable 5.1 row wording verbatim — no context figure, because unlike the Opus
+// and Sonnet rows there is no pool-side cap to disclose here.
+export const POOL_FABLE_MODEL_NAME = 'Fable';
+export const POOL_FABLE_MODEL_DESCRIPTION =
+  'Fable 5.1 · Most capable for your hardest and longest-running tasks';
+
 const POOL_ENV_KEYS = [
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_AUTH_TOKEN',
@@ -43,7 +58,10 @@ const POOL_ENV_KEYS = [
   'ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION',
   'ANTHROPIC_DEFAULT_OPUS_MODEL',
   'ANTHROPIC_DEFAULT_OPUS_MODEL_NAME',
-  'ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION'
+  'ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION',
+  'ANTHROPIC_DEFAULT_FABLE_MODEL',
+  'ANTHROPIC_DEFAULT_FABLE_MODEL_NAME',
+  'ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION'
 ];
 
 // The full settings.json `env` mutation, in one place so applyPoolEnv, the
@@ -57,7 +75,10 @@ export function poolEnvBlock({ baseUrl, token }) {
     ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION: POOL_SONNET_MODEL_DESCRIPTION,
     ANTHROPIC_DEFAULT_OPUS_MODEL: POOL_OPUS_MODEL,
     ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: POOL_OPUS_MODEL_NAME,
-    ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION: POOL_OPUS_MODEL_DESCRIPTION
+    ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION: POOL_OPUS_MODEL_DESCRIPTION,
+    ANTHROPIC_DEFAULT_FABLE_MODEL: POOL_FABLE_MODEL,
+    ANTHROPIC_DEFAULT_FABLE_MODEL_NAME: POOL_FABLE_MODEL_NAME,
+    ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION: POOL_FABLE_MODEL_DESCRIPTION
   };
 }
 
