@@ -151,6 +151,7 @@ function loadFns(): {
   card: (a: unknown, isNext?: boolean) => string;
   tierLabel: (p: number) => string;
   summaryTableHtml: (accounts: unknown[], nextAcct: string | null) => string;
+  groupAccountsByPriority: (accounts: any[]) => { priority: number; accounts: any[]; available: number }[];
 } {
   const html = dashboardHtml();
   const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
@@ -162,7 +163,7 @@ function loadFns(): {
     "document",
     "localStorage",
     "matchMedia",
-    `${stubbed}\nreturn { card, tierLabel, summaryTableHtml };`,
+    `${stubbed}\nreturn { card, tierLabel, summaryTableHtml, groupAccountsByPriority };`,
   );
   const noopEl = { addEventListener() {}, setAttribute() {}, getAttribute() { return null; }, textContent: "", style: {} };
   const doc = {
@@ -178,6 +179,23 @@ test("tierLabel names the first two bands and numbers the rest", () => {
   expect(tierLabel(1)).toBe("Priority 1 — Primary");
   expect(tierLabel(2)).toBe("Priority 2 — Fallback");
   expect(tierLabel(3)).toBe("Priority 3");
+});
+
+test("mixed providers are grouped in numeric priority order", () => {
+  const { groupAccountsByPriority } = loadFns();
+  const groups = groupAccountsByPriority([
+    baseAccount({ name: "claude-reserve", provider: "anthropic", priority: 110 }),
+    baseAccount({ name: "codex-primary", provider: "openai", priority: 100 }),
+  ]);
+
+  expect(groups.map((group) => ({
+    priority: group.priority,
+    accounts: group.accounts.map((account) => account.name),
+    available: group.available,
+  }))).toEqual([
+    { priority: 100, accounts: ["codex-primary"], available: 1 },
+    { priority: 110, accounts: ["claude-reserve"], available: 1 },
+  ]);
 });
 
 test("card() marks the next-pick account and shows its priority", () => {
@@ -602,6 +620,27 @@ describe("settings runtime: collapse persistence + anti-clobber", () => {
     expect(status.textContent).toBe("rejected");
   });
 
+  test("global priority headings do not label an Anthropic-only tier as universally active", async () => {
+    const status = {
+      accounts: [
+        baseAccount({ name: "claude-reserve", provider: "anthropic", priority: 110 }),
+        baseAccount({ name: "codex-primary", provider: "openai", priority: 100 }),
+      ],
+      routing: { tiers: [], nextPick: { account: "claude-reserve" }, activeTier: 110 },
+      tuning: { fiveHourExp: 1, loadSlope: 1, urgencyDecay: 0.5, minHeadroom: 0.1 },
+      mapping: { enabled: false, targets: [], mappings: [] },
+      usageWindowMs: 18_000_000,
+    };
+    const fetchImpl = async () => ({ json: async () => status });
+    const { api, document } = loadRuntime(undefined, fetchImpl);
+
+    await api.refresh();
+
+    const html = document.getElementById("grid").innerHTML;
+    expect(html.indexOf("Priority 100")).toBeLessThan(html.indexOf("Priority 110"));
+    expect(html).not.toContain(" · active");
+  });
+
   test("an account priority edit survives a status poll until it is explicitly saved", async () => {
     const status = {
       accounts: [baseAccount()],
@@ -619,5 +658,6 @@ describe("settings runtime: collapse persistence + anti-clobber", () => {
     await api.refresh();
 
     expect(grid.innerHTML).toBe("priority draft");
+    expect(document.getElementById("p-available").innerHTML).toBe("available <b>1</b>");
   });
 });

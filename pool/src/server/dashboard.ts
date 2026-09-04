@@ -434,6 +434,17 @@ function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<
 function dotState(a) { return a.available ? "ok" : (a.authenticated ? "warn" : "err"); }
 function priorityOf(a) { return a.priority == null ? 100 : a.priority; }
 function weightOf(a) { return a.weight == null ? 1 : a.weight; }
+function groupAccountsByPriority(accounts) {
+  const byPriority = new Map();
+  accounts.forEach((a) => {
+    const priority = priorityOf(a);
+    const group = byPriority.get(priority) || { priority, accounts: [], available: 0 };
+    group.accounts.push(a);
+    if (a.available) group.available += 1;
+    byPriority.set(priority, group);
+  });
+  return Array.from(byPriority.values()).sort((a, b) => a.priority - b.priority);
+}
 // Utilization fraction [0,1] -> clamped percent [0,100]; 0 when unknown.
 function pct(w) { return w && w.utilization != null ? Math.min(100, Math.max(0, w.utilization * 100)) : 0; }
 // Duration of a window from its key ("5h", "7d", "7d-fable" -> ms); null if
@@ -770,35 +781,21 @@ async function refresh() {
       onboard.style.display = "none";
       const routing = d.routing || { tiers: [], nextPick: null, activeTier: null };
       const nextAcct = routing.nextPick && routing.nextPick.account;
-      const byName = Object.fromEntries(accounts.map((a) => [a.name, a]));
-      const tieredNames = new Set((routing.tiers || []).flatMap((t) => t.accounts));
-      const untiered = accounts.filter((a) => !tieredNames.has(a.name));
-      const groups = routing.tiers && routing.tiers.length
-        ? routing.tiers.concat(
-            untiered.length
-              ? [{ priority: null, accounts: untiered.map((a) => a.name), available: untiered.filter((a) => a.available).length }]
-              : [],
-          )
-        : [{ priority: null, accounts: accounts.map((a) => a.name), available: avail }];
+      const groups = groupAccountsByPriority(accounts);
       if (!accountSettingsDirty && !grid.contains(document.activeElement)) {
         grid.innerHTML = groups.map((t) => {
           const cardsHtml = t.accounts
-            .map((n) => byName[n])
-            .filter(Boolean)
             .map((a) => card(a, a.name === nextAcct))
             .join("");
-          const head = t.priority == null
-            ? ""
-            : '<div class="tier-head' + (t.available === 0 ? " dim" : "") + '">' + esc(tierLabel(t.priority))
-              + ' <span class="tier-meta">' + t.available + " available"
-              + (t.priority === routing.activeTier ? " · active" : "") + "</span></div>";
+          const head = '<div class="tier-head' + (t.available === 0 ? " dim" : "") + '">' + esc(tierLabel(t.priority))
+            + ' <span class="tier-meta">' + t.available + " available</span></div>";
           return '<section class="tier">' + head + '<div class="tier-grid">' + cardsHtml + "</div></section>";
         }).join("");
         accountCardsRendered = true;
       }
 
       const summary = document.getElementById("summary");
-      const ordered = groups.flatMap((t) => t.accounts).map((n) => byName[n]).filter(Boolean);
+      const ordered = groups.flatMap((t) => t.accounts);
       summary.innerHTML = summaryTableHtml(ordered, nextAcct);
       summary.style.display = ordered.length ? "block" : "none";
 
