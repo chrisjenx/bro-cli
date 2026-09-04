@@ -233,6 +233,276 @@ describe("proxyCodexMessages", () => {
     }
   });
 
+  test("streaming carries and replaces terminal context for the same session and route", async () => {
+    const { poolDir, mgr } = tempOpenAIPool(["gpt1"]);
+    try {
+      const config = loadConfig({
+        poolDir,
+        accountsDir: join(poolDir, "accounts"),
+        usageFile: join(poolDir, "usage.json"),
+      });
+      let call = 0;
+      const fakeFetch = (async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) => {
+        call += 1;
+        const body = call === 2
+          ? sse.replace('"input_tokens":3,"output_tokens":1', '"input_tokens":7,"output_tokens":2')
+          : sse;
+        return new Response(body, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        });
+      }) as typeof fetch;
+      const route = { id: "gpt", provider: "openai" as const, upstreamModel: "gpt-5.2-codex" };
+      const request = {
+        model: "gpt",
+        messages: [{ role: "user", content: "hi" }],
+        metadata: { user_id: "session-a" },
+        stream: true,
+      };
+
+      const first = await proxyCodexMessages(
+        request, mgr, config, new AbortController().signal, route, {}, fakeFetch,
+      );
+      await first.text();
+
+      const second = await proxyCodexMessages(
+        request, mgr, config, new AbortController().signal, route, {}, fakeFetch,
+      );
+      const secondText = await second.text();
+      const secondStart = secondText.split("\n\n").find((block) => block.includes("message_start"))!;
+      expect(JSON.parse(secondStart.split("data: ")[1]!).message.usage)
+        .toEqual({ input_tokens: 4, output_tokens: 0 });
+
+      const third = await proxyCodexMessages(
+        request, mgr, config, new AbortController().signal, route, {}, fakeFetch,
+      );
+      const thirdStart = (await third.text()).split("\n\n").find((block) => block.includes("message_start"))!;
+      expect(JSON.parse(thirdStart.split("data: ")[1]!).message.usage)
+        .toEqual({ input_tokens: 9, output_tokens: 0 });
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("non-stream terminal usage seeds the next streaming opening", async () => {
+    const { poolDir, mgr } = tempOpenAIPool(["gpt1"]);
+    try {
+      const config = loadConfig({
+        poolDir,
+        accountsDir: join(poolDir, "accounts"),
+        usageFile: join(poolDir, "usage.json"),
+      });
+      const fakeFetch = (async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) =>
+        new Response(sse, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        })) as typeof fetch;
+      const route = {
+        id: "gpt",
+        provider: "openai" as const,
+        upstreamModel: "gpt-5.2-codex",
+      };
+      const baseRequest = {
+        model: "gpt",
+        messages: [{ role: "user", content: "hi" }],
+        metadata: { user_id: "session-a" },
+      };
+
+      const first = await proxyCodexMessages(
+        baseRequest,
+        mgr,
+        config,
+        new AbortController().signal,
+        route,
+        {},
+        fakeFetch,
+      );
+      await first.text();
+
+      const second = await proxyCodexMessages(
+        { ...baseRequest, stream: true },
+        mgr,
+        config,
+        new AbortController().signal,
+        route,
+        {},
+        fakeFetch,
+      );
+      const start = (await second.text())
+        .split("\n\n")
+        .find((block) => block.includes("message_start"))!;
+      expect(JSON.parse(start.split("data: ")[1]!).message.usage)
+        .toEqual({ input_tokens: 4, output_tokens: 0 });
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("carried context is isolated by session and route", async () => {
+    const { poolDir, mgr } = tempOpenAIPool(["gpt1"]);
+    try {
+      const config = loadConfig({
+        poolDir,
+        accountsDir: join(poolDir, "accounts"),
+        usageFile: join(poolDir, "usage.json"),
+      });
+      const fakeFetch = (async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) =>
+        new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch;
+      const requestFor = (session: string) => ({
+        model: "gpt",
+        messages: [{ role: "user", content: "hi" }],
+        metadata: { user_id: session },
+        stream: true,
+      });
+      const routeFor = (id: string) => ({
+        id,
+        provider: "openai" as const,
+        upstreamModel: "gpt-5.2-codex",
+      });
+      const openingInput = async (session: string, routeId: string) => {
+        const res = await proxyCodexMessages(
+          requestFor(session), mgr, config, new AbortController().signal,
+          routeFor(routeId), {}, fakeFetch,
+        );
+        const start = (await res.text()).split("\n\n").find((block) => block.includes("message_start"))!;
+        return JSON.parse(start.split("data: ")[1]!).message.usage.input_tokens;
+      };
+
+      expect(await openingInput("session-a", "gpt")).toBe(0);
+      expect(await openingInput("session-b", "gpt")).toBe(0);
+      expect(await openingInput("session-a", "gpt-other")).toBe(0);
+      expect(await openingInput("session-a", "gpt")).toBe(4);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a failed stream does not replace carried context", async () => {
+    const { poolDir, mgr } = tempOpenAIPool(["gpt1"]);
+    try {
+      const config = loadConfig({
+        poolDir,
+        accountsDir: join(poolDir, "accounts"),
+        usageFile: join(poolDir, "usage.json"),
+      });
+      const failedSse = [
+        'data: {"type":"response.created","response":{"id":"failed"}}',
+        "",
+        'data: {"type":"response.failed","response":{"error":{"code":"boom","message":"backend broke"}}}',
+        "",
+        "",
+      ].join("\n");
+      let call = 0;
+      const fakeFetch = (async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) => {
+        call += 1;
+        const body = call === 2 ? failedSse : sse;
+        return new Response(body, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        });
+      }) as typeof fetch;
+      const route = {
+        id: "gpt",
+        provider: "openai" as const,
+        upstreamModel: "gpt-5.2-codex",
+      };
+      const request = {
+        model: "gpt",
+        messages: [{ role: "user", content: "hi" }],
+        metadata: { user_id: "session-a" },
+        stream: true,
+      };
+      const send = () => proxyCodexMessages(
+        request,
+        mgr,
+        config,
+        new AbortController().signal,
+        route,
+        {},
+        fakeFetch,
+      );
+
+      await (await send()).text();
+      await (await send()).text();
+      const afterFailure = await (await send()).text();
+      const start = afterFailure
+        .split("\n\n")
+        .find((block) => block.includes("message_start"))!;
+      expect(JSON.parse(start.split("data: ")[1]!).message.usage.input_tokens).toBe(4);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a cancelled stream does not replace carried context", async () => {
+    const { poolDir, mgr } = tempOpenAIPool(["gpt1"]);
+    try {
+      const config = loadConfig({
+        poolDir,
+        accountsDir: join(poolDir, "accounts"),
+        usageFile: join(poolDir, "usage.json"),
+      });
+      let call = 0;
+      const fakeFetch = (async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) => {
+        call += 1;
+        if (call !== 2) {
+          return new Response(sse, {
+            status: 200,
+            headers: { "content-type": "text/event-stream" },
+          });
+        }
+        const cancelledUpstream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode([
+              'data: {"type":"response.created","response":{"id":"cancelled"}}',
+              "",
+              "",
+            ].join("\n")));
+          },
+        });
+        return new Response(cancelledUpstream, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        });
+      }) as typeof fetch;
+      const route = {
+        id: "gpt",
+        provider: "openai" as const,
+        upstreamModel: "gpt-5.2-codex",
+      };
+      const request = {
+        model: "gpt",
+        messages: [{ role: "user", content: "hi" }],
+        metadata: { user_id: "session-a" },
+        stream: true,
+      };
+      const send = () => proxyCodexMessages(
+        request,
+        mgr,
+        config,
+        new AbortController().signal,
+        route,
+        {},
+        fakeFetch,
+      );
+
+      await (await send()).text();
+      const cancelled = await send();
+      const reader = cancelled.body!.getReader();
+      const first = await reader.read();
+      expect(new TextDecoder().decode(first.value)).toContain("message_start");
+      await reader.cancel();
+
+      const afterCancellation = await (await send()).text();
+      const start = afterCancellation
+        .split("\n\n")
+        .find((block) => block.includes("message_start"))!;
+      expect(JSON.parse(start.split("data: ")[1]!).message.usage.input_tokens).toBe(4);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
   test("a successful response with no rate-limit headers preserves prior windows", async () => {
     const { poolDir, mgr } = tempOpenAIPool(["gpt1"]);
     try {
@@ -570,4 +840,96 @@ describe("proxyCodexMessages", () => {
       rmSync(poolDir, { recursive: true, force: true });
     }
   });
+
+
+  for (const stream of [true, false]) {
+    test(`${stream ? "streaming" : "non-stream"}: cached terminal input remains split for clients but records the full Codex input`, async () => {
+      const { poolDir, mgr } = tempOpenAIPool(["gpt1"]);
+      try {
+        const config = loadConfig({ poolDir, accountsDir: join(poolDir, "accounts"), usageFile: join(poolDir, "usage.json") });
+        const cachedUsageSse = [
+          'data: {"type":"response.created","response":{"id":"cached"}}',
+          "",
+          'data: {"type":"response.completed","response":{"usage":{"input_tokens":100,"output_tokens":5,"input_tokens_details":{"cached_tokens":80}}}}',
+          "",
+          "",
+        ].join("\n");
+        const fakeFetch = (async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) =>
+          new Response(cachedUsageSse, { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch;
+        const res = await proxyCodexMessages(
+          { model: "gpt", messages: [{ role: "user", content: "hi" }], stream },
+          mgr,
+          config,
+          new AbortController().signal,
+          { id: "gpt", provider: "openai", upstreamModel: "gpt-5.2-codex" },
+          {},
+          fakeFetch,
+        );
+        expect(res.status).toBe(200);
+
+        const usage = stream
+          ? JSON.parse((await res.text()).split("\n\n").find((block) => block.includes("message_delta"))!.split("data: ")[1]!).usage
+          : (await res.json() as { usage: unknown }).usage;
+        expect(usage).toMatchObject({ input_tokens: 20, cache_read_input_tokens: 80, output_tokens: 5 });
+
+        const accountUsage = mgr.getAccount("gpt1").usage;
+        expect(accountUsage.windowInputTokens).toBe(100);
+        expect(accountUsage.totalInputTokens).toBe(100);
+        expect(accountUsage.windowOutputTokens).toBe(5);
+        expect(accountUsage.totalOutputTokens).toBe(5);
+      } finally {
+        rmSync(poolDir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  for (const stream of [true, false]) {
+    test(`${stream ? "streaming" : "non-stream"}: missing terminal input keeps prior context without recounting its carried baseline`, async () => {
+      const { poolDir, mgr } = tempOpenAIPool(["gpt1"]);
+      try {
+        const config = loadConfig({ poolDir, accountsDir: join(poolDir, "accounts"), usageFile: join(poolDir, "usage.json") });
+        const missingInputSse = [
+          'data: {"type":"response.created","response":{"id":"missing-input"}}',
+          "",
+          'data: {"type":"response.completed","response":{"usage":{"output_tokens":5}}}',
+          "",
+          "",
+        ].join("\n");
+        let call = 0;
+        const fakeFetch = (async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) => {
+          call += 1;
+          return new Response(call === 2 ? missingInputSse : sse, {
+            status: 200,
+            headers: { "content-type": "text/event-stream" },
+          });
+        }) as typeof fetch;
+        const route = { id: "gpt", provider: "openai" as const, upstreamModel: "gpt-5.2-codex" };
+        const request = {
+          model: "gpt",
+          messages: [{ role: "user", content: "hi" }],
+          metadata: { user_id: "session-a" },
+          stream,
+        };
+
+        await (await proxyCodexMessages(request, mgr, config, new AbortController().signal, route, {}, fakeFetch)).text();
+        await (await proxyCodexMessages(request, mgr, config, new AbortController().signal, route, {}, fakeFetch)).text();
+
+        const accountUsage = mgr.getAccount("gpt1").usage;
+        expect(accountUsage.windowInputTokens).toBe(3);
+        expect(accountUsage.totalInputTokens).toBe(3);
+        expect(accountUsage.windowOutputTokens).toBe(6);
+        expect(accountUsage.totalOutputTokens).toBe(6);
+
+        const next = await proxyCodexMessages(
+          { ...request, stream: true }, mgr, config, new AbortController().signal, route, {}, fakeFetch,
+        );
+        const start = (await next.text()).split("\n\n").find((block) => block.includes("message_start"))!;
+        expect(JSON.parse(start.split("data: ")[1]!).message.usage)
+          .toEqual({ input_tokens: 4, output_tokens: 0 });
+      } finally {
+        rmSync(poolDir, { recursive: true, force: true });
+      }
+    });
+  }
+
 });

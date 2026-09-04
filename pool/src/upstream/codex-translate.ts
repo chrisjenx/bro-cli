@@ -272,10 +272,8 @@ function mapToolChoice(choice: unknown): unknown {
 }
 
 export class CodexToAnthropicStream {
-  usage: { input_tokens: number; output_tokens: number; cache_read_input_tokens?: number } = {
-    input_tokens: 0,
-    output_tokens: 0,
-  };
+  usage: { input_tokens: number; output_tokens: number; cache_read_input_tokens?: number };
+  hasTerminalUsage = false;
   stopReason: string | null = null;
   sawError: { type: string; message: string } | null = null;
 
@@ -298,7 +296,15 @@ export class CodexToAnthropicStream {
   private content: Array<Record<string, unknown>> = [];
   private argsAccum = new Map<number, string>();
 
-  constructor(private modelId: string) {}
+  constructor(private modelId: string, initialInputTokens = 0) {
+    this.usage = {
+      input_tokens:
+        Number.isFinite(initialInputTokens) && initialInputTokens >= 0
+          ? Math.floor(initialInputTokens)
+          : 0,
+      output_tokens: 0,
+    };
+  }
 
   /** True once the message_start envelope has been emitted (real or forced). */
   get hasStarted(): boolean {
@@ -375,11 +381,27 @@ export class CodexToAnthropicStream {
       case "response.incomplete": {
         const response = (data.response ?? {}) as Record<string, unknown>;
         const usage = (response.usage ?? {}) as Record<string, unknown>;
-        if (typeof usage.input_tokens === "number") this.usage.input_tokens = usage.input_tokens;
-        if (typeof usage.output_tokens === "number") this.usage.output_tokens = usage.output_tokens;
+        const totalInput = usage.input_tokens;
+        const output = usage.output_tokens;
         const inputDetails = (usage.input_tokens_details ?? {}) as Record<string, unknown>;
-        if (typeof inputDetails.cached_tokens === "number") {
-          this.usage.cache_read_input_tokens = inputDetails.cached_tokens;
+        const rawCached = inputDetails.cached_tokens;
+
+        if (typeof totalInput === "number" && Number.isFinite(totalInput) && totalInput >= 0) {
+          const normalizedTotal = Math.floor(totalInput);
+          const cached =
+            typeof rawCached === "number" && Number.isFinite(rawCached)
+              ? Math.min(normalizedTotal, Math.max(0, Math.floor(rawCached)))
+              : 0;
+          this.usage.input_tokens = normalizedTotal - cached;
+          if (typeof rawCached === "number" && Number.isFinite(rawCached)) {
+            this.usage.cache_read_input_tokens = cached;
+          } else {
+            delete this.usage.cache_read_input_tokens;
+          }
+          this.hasTerminalUsage = true;
+        }
+        if (typeof output === "number" && Number.isFinite(output) && output >= 0) {
+          this.usage.output_tokens = Math.floor(output);
         }
         const incomplete = (response.incomplete_details ?? {}) as Record<string, unknown>;
         if (response.status === "incomplete" || type === "response.incomplete") {
@@ -433,7 +455,10 @@ export class CodexToAnthropicStream {
       message: {
         id: this.msgId, type: "message", role: "assistant", model: this.modelId,
         content: [], stop_reason: null, stop_sequence: null,
-        usage: { input_tokens: 0, output_tokens: 0 },
+        usage: {
+          input_tokens: this.usage.input_tokens,
+          output_tokens: 0,
+        },
       },
     })];
   }

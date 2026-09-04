@@ -299,6 +299,38 @@ describe("CodexToAnthropicStream", () => {
     expect(parse(delta).delta.stop_reason).toBe("end_turn");
   });
 
+  test("message_start carries the prior turn context until terminal usage arrives", () => {
+    const s = new CodexToAnthropicStream("gpt", 42);
+    const [start] = s.handleEvent(ev("response.created", { response: { id: "r1" } }));
+
+    expect(parse(start!).message.usage).toEqual({ input_tokens: 42, output_tokens: 0 });
+    expect(s.hasTerminalUsage).toBe(false);
+
+    s.handleEvent(ev("response.completed", {
+      response: { usage: { input_tokens: 10, output_tokens: 5 } },
+    }));
+    expect(s.hasTerminalUsage).toBe(true);
+    expect(s.usage).toEqual({ input_tokens: 10, output_tokens: 5 });
+  });
+
+  test("forced message_start carries the same prior turn context", () => {
+    const s = new CodexToAnthropicStream("gpt", 42);
+    const [start] = s.forceMessageStart();
+
+    expect(parse(start!).message.usage).toEqual({ input_tokens: 42, output_tokens: 0 });
+    expect(s.handleEvent(ev("response.created", { response: { id: "r1" } }))).toEqual([]);
+  });
+
+  test("missing terminal input usage is not authoritative", () => {
+    const s = new CodexToAnthropicStream("gpt", 42);
+    s.handleEvent(ev("response.created", { response: { id: "r1" } }));
+    s.handleEvent(ev("response.completed", {
+      response: { usage: { output_tokens: 5 } },
+    }));
+
+    expect(s.hasTerminalUsage).toBe(false);
+  });
+
   test("function call maps to tool_use block and stop_reason tool_use", () => {
     const s = new CodexToAnthropicStream("gpt");
     const frames = [
@@ -489,10 +521,43 @@ describe("CodexToAnthropicStream", () => {
       })),
       ...s.finish(),
     ];
-    expect(s.usage.cache_read_input_tokens).toBe(80);
+    expect(s.hasTerminalUsage).toBe(true);
+    expect(s.usage).toEqual({
+      input_tokens: 20,
+      output_tokens: 5,
+      cache_read_input_tokens: 80,
+    });
     const delta = frames.map(parse).find((d) => d.type === "message_delta")!;
-    expect(delta.usage.cache_read_input_tokens).toBe(80);
-    expect((s.toAnthropicMessage().usage as Record<string, unknown>).cache_read_input_tokens).toBe(80);
+    expect(delta.usage).toEqual({
+      input_tokens: 20,
+      output_tokens: 5,
+      cache_read_input_tokens: 80,
+    });
+    expect(s.toAnthropicMessage().usage).toEqual({
+      input_tokens: 20,
+      output_tokens: 5,
+      cache_read_input_tokens: 80,
+    });
+  });
+
+  test("cached input tokens are clamped inside total input", () => {
+    for (const [cached_tokens, expected] of [[-10, 0], [150, 100]] as const) {
+      const s = new CodexToAnthropicStream("gpt");
+      s.handleEvent(ev("response.completed", {
+        response: {
+          usage: {
+            input_tokens: 100,
+            output_tokens: 5,
+            input_tokens_details: { cached_tokens },
+          },
+        },
+      }));
+      expect(s.usage).toEqual({
+        input_tokens: 100 - expected,
+        output_tokens: 5,
+        cache_read_input_tokens: expected,
+      });
+    }
   });
 
   test("no events are translated after an upstream error (error is terminal for handleEvent)", () => {
@@ -554,12 +619,13 @@ describe("CodexToAnthropicStream", () => {
       response: {
         status: "incomplete",
         incomplete_details: { reason: "max_output_tokens" },
-        usage: { input_tokens: 2, output_tokens: 50 },
+        usage: { input_tokens: 5, output_tokens: 100 },
       },
     }));
     s.finish();
     expect(s.stopReason).toBe("max_tokens");
-    expect(s.usage.output_tokens).toBe(50);
+    expect(s.hasTerminalUsage).toBe(true);
+    expect(s.usage).toEqual({ input_tokens: 5, output_tokens: 100 });
   });
 
   test("content_filter incompleteness maps to stop_reason refusal, not a clean finish", () => {

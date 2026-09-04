@@ -39,6 +39,57 @@ const refreshLocks = new Map<string, Promise<OpenAIOauthCreds>>();
 
 /** Anthropic SSE keep-alive frame, emitted during no-content phases (e.g. reasoning). */
 const PING_FRAME = `event: ping\ndata: ${JSON.stringify({ type: "ping" })}\n\n`;
+const MAX_CONTEXT_USAGE_ENTRIES = 1_000;
+
+class ContextUsageCache {
+  private values = new Map<string, number>();
+
+  constructor(private maxEntries = MAX_CONTEXT_USAGE_ENTRIES) {}
+
+  get(sessionKey: string | undefined, routeId: string): number {
+    if (!sessionKey) return 0;
+    const key = JSON.stringify([sessionKey, routeId]);
+    const value = this.values.get(key);
+    if (value === undefined) return 0;
+    this.values.delete(key);
+    this.values.set(key, value);
+    return value;
+  }
+
+  set(sessionKey: string | undefined, routeId: string, tokens: number): void {
+    if (!sessionKey || !Number.isFinite(tokens) || tokens < 0) return;
+    const key = JSON.stringify([sessionKey, routeId]);
+    this.values.delete(key);
+    this.values.set(key, Math.floor(tokens));
+    while (this.values.size > this.maxEntries) {
+      const oldest = this.values.keys().next().value;
+      if (oldest === undefined) break;
+      this.values.delete(oldest);
+    }
+  }
+}
+
+const contextUsageByManager = new WeakMap<AccountManager, ContextUsageCache>();
+
+function contextUsageFor(mgr: AccountManager): ContextUsageCache {
+  let cache = contextUsageByManager.get(mgr);
+  if (!cache) {
+    cache = new ContextUsageCache();
+    contextUsageByManager.set(mgr, cache);
+  }
+  return cache;
+}
+
+/** Keep account totals on Codex's full input count without changing client usage. */
+function recordCodexSuccess(mgr: AccountManager, accountName: string, translator: CodexToAnthropicStream): void {
+  const usage = {
+    ...translator.usage,
+    input_tokens: translator.hasTerminalUsage
+      ? translator.usage.input_tokens + (translator.usage.cache_read_input_tokens ?? 0)
+      : 0,
+  };
+  mgr.recordSuccess(accountName, usage, 0);
+}
 
 export async function proxyCodexMessages(
   body: unknown,
@@ -64,7 +115,9 @@ export async function proxyCodexMessages(
 
   while (account) {
     tried.add(account.name);
-    const attempt = await tryCodexAccount(account, codexBody, route, mgr, config, signal, streamRequested, fetchFn);
+    const attempt = await tryCodexAccount(
+      account, codexBody, route, mgr, config, signal, streamRequested, fetchFn, sessionKey,
+    );
 
     if (attempt.kind === "response") {
       if (sessionKey) mgr.setAffinity(sessionKey, account.name, "openai");
@@ -99,6 +152,7 @@ async function tryCodexAccount(
   signal: AbortSignal,
   streamRequested: boolean,
   fetchFn: typeof fetch,
+  sessionKey: string | undefined,
 ): Promise<AttemptResult> {
   let creds: OpenAIOauthCreds | null;
   try {
@@ -201,7 +255,16 @@ async function tryCodexAccount(
     return { kind: "terminal", response: anthropicError(502, "api_error", message) };
   }
 
-  return streamCodexResponse(res.body, account, mgr, route, streamRequested, abortCleanup, config);
+  return streamCodexResponse(
+    res.body,
+    account,
+    mgr,
+    route,
+    streamRequested,
+    abortCleanup,
+    config,
+    sessionKey,
+  );
 }
 
 async function fetchCodex(
@@ -276,8 +339,23 @@ async function streamCodexResponse(
   streamRequested: boolean,
   cleanup: () => void,
   config: Config,
+  sessionKey: string | undefined,
 ): Promise<AttemptResult> {
-  const translator = new CodexToAnthropicStream(route.id);
+  const contextUsage = contextUsageFor(mgr);
+  const translator = new CodexToAnthropicStream(
+    route.id,
+    contextUsage.get(sessionKey, route.id),
+  );
+  const recordTerminalContext = () => {
+    if (translator.sawError || !translator.hasTerminalUsage) return;
+    contextUsage.set(
+      sessionKey,
+      route.id,
+      translator.usage.input_tokens
+        + (translator.usage.cache_read_input_tokens ?? 0)
+        + translator.usage.output_tokens,
+    );
+  };
   const reader = body.getReader();
   const encoder = new TextEncoder();
 
@@ -391,8 +469,12 @@ async function streamCodexResponse(
           stopKeepAlive();
           parser.end();
           for (const frame of translator.finish()) controller.enqueue(encoder.encode(frame));
-          if (translator.sawError) mgr.recordError(account.name, translator.sawError.message);
-          else mgr.recordSuccess(account.name, translator.usage, 0);
+          if (translator.sawError) {
+            mgr.recordError(account.name, translator.sawError.message);
+          } else {
+            recordTerminalContext();
+            recordCodexSuccess(mgr, account.name, translator);
+          }
           cleanup();
           controller.close();
         };
@@ -475,7 +557,8 @@ async function streamCodexResponse(
   }
 
   const message = translator.toAnthropicMessage();
-  mgr.recordSuccess(account.name, translator.usage, 0);
+  recordTerminalContext();
+  recordCodexSuccess(mgr, account.name, translator);
   return {
     kind: "response",
     response: new Response(JSON.stringify(message), {
