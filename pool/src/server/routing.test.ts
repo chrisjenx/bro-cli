@@ -13,6 +13,10 @@ describe("routeForRequest", () => {
     expect(routeForRequest(DEFAULT_MODEL_TABLE, { model: "whatever-new" }).provider).toBe("anthropic");
     expect(routeForRequest(DEFAULT_MODEL_TABLE, {}).provider).toBe("anthropic");
     expect(routeForRequest(DEFAULT_MODEL_TABLE, { model: "gpt-5.5" }).provider).toBe("openai");
+    expect(routeForRequest(DEFAULT_MODEL_TABLE, { model: "gpt-6-astra" })).toMatchObject({
+      provider: "openai",
+      upstreamModel: "gpt-6-astra",
+    });
   });
 });
 

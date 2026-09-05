@@ -173,6 +173,39 @@ describe("describeCodexError", () => {
 });
 
 describe("proxyCodexMessages", () => {
+  test("passes the route's max-effort capability into the Codex request", async () => {
+    const { poolDir, mgr } = tempOpenAIPool(["gpt1"]);
+    try {
+      const config = loadConfig({ poolDir, accountsDir: join(poolDir, "accounts"), usageFile: join(poolDir, "usage.json") });
+      let sent: Record<string, unknown> | undefined;
+      const fakeFetch = (async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        sent = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return new Response(JSON.stringify({ detail: "probe complete" }), { status: 400 });
+      }) as typeof fetch;
+      await proxyCodexMessages(
+        {
+          model: "gpt-6-astra",
+          messages: [{ role: "user", content: "hi" }],
+          output_config: { effort: "max" },
+        },
+        mgr,
+        config,
+        new AbortController().signal,
+        {
+          id: "gpt-6-astra",
+          provider: "openai",
+          upstreamModel: "gpt-6-astra",
+          supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+        },
+        {},
+        fakeFetch,
+      );
+      expect(sent).toMatchObject({ model: "gpt-6-astra", reasoning: { effort: "max" } });
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
   test("a backend 400 is terminal with a legible message, not a raw-JSON passthrough", async () => {
     const { poolDir, mgr } = tempOpenAIPool(["gpt1", "gpt2"]);
     try {

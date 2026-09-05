@@ -7,10 +7,24 @@ import { modelFamilyOf } from "./accounts/types.ts";
 export const SOURCE_EFFORT_TIERS = ["default", "low", "medium", "high", "xhigh", "max"] as const;
 export type SourceEffortTier = (typeof SOURCE_EFFORT_TIERS)[number];
 
-/** Codex Responses API reasoning.effort values (gpt-5.6). "ultra" is a
- * Codex-app-only delegated mode, not an API value — never emitted here. */
+/** Codex Responses API reasoning.effort values. "ultra" is a Codex-app-only
+ * delegated mode, not an API value — never emitted here. */
 export const CODEX_EFFORTS = ["none", "low", "medium", "high", "xhigh", "max"] as const;
 export type CodexEffort = (typeof CODEX_EFFORTS)[number];
+
+/** Conservative capabilities for legacy/custom routes with no explicit list. */
+export const DEFAULT_CODEX_SUPPORTED_EFFORTS: readonly CodexEffort[] = [
+  "none", "low", "medium", "high", "xhigh",
+];
+const FRONTIER_CODEX_SUPPORTED_EFFORTS: readonly CodexEffort[] = [
+  "low", "medium", "high", "xhigh", "max",
+];
+const FRONTIER_CODEX_UPSTREAMS = new Set([
+  "gpt-6-astra",
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
+]);
 
 export type EffortMap = Partial<Record<SourceEffortTier, CodexEffort>>;
 
@@ -38,6 +52,15 @@ export interface ModelRoute {
   maxContextWindow?: number;
   /** Per-route effort overrides; mapped routes attach this at request time. */
   effortMap?: EffortMap;
+  /** Reasoning efforts accepted by this upstream; excludes Codex-app-only ultra. */
+  supportedEfforts?: CodexEffort[];
+}
+
+export function supportedEffortsFor(route: ModelRoute): readonly CodexEffort[] {
+  if (route.supportedEfforts !== undefined) return route.supportedEfforts;
+  return FRONTIER_CODEX_UPSTREAMS.has(route.upstreamModel)
+    ? FRONTIER_CODEX_SUPPORTED_EFFORTS
+    : DEFAULT_CODEX_SUPPORTED_EFFORTS;
 }
 
 const CODEX_DEFAULT_CONTEXT_WINDOW = 272_000;
@@ -58,18 +81,21 @@ const openai = (id: string, maxContextWindow: number, upstreamModel = id): Model
   contextWindow: CODEX_DEFAULT_CONTEXT_WINDOW,
   maxContextWindow,
 });
+const frontierOpenAI = (id: string, upstreamModel = id): ModelRoute =>
+  openai(id, 872_000, upstreamModel);
 
 export const DEFAULT_MODEL_TABLE: ModelRoute[] = [
   claude("opus"), claude("sonnet"), claude("haiku"), claude("fable"),
   claude("claude-opus-5"), claude("claude-opus-4-8"),
   claude("claude-sonnet-5"), claude("claude-haiku-4-5"),
   claude("claude-fable-5"), claude("claude-fable-5-1"),
-  // Authenticated Codex catalog values checked 2026-09-04. GPT-5.6's 872K
-  // maximum is its input/history side of the opt-in 1M total budget.
-  openai("gpt-5.6-sol", 872_000),
-  openai("gpt-5.6-terra", 872_000),
-  openai("gpt-5.6-luna", 872_000),
-  openai("gpt-5.6", 872_000, "gpt-5.6-sol"),
+  // Authenticated Codex catalog values checked 2026-09-04. Astra and GPT-5.6's
+  // 872K maximums are their input/history side of the opt-in 1M total budget.
+  frontierOpenAI("gpt-6-astra"),
+  frontierOpenAI("gpt-5.6-sol"),
+  frontierOpenAI("gpt-5.6-terra"),
+  frontierOpenAI("gpt-5.6-luna"),
+  frontierOpenAI("gpt-5.6", "gpt-5.6-sol"),
   openai("gpt-5.5", 272_000),
   openai("gpt-5.4", 1_000_000),
   openai("gpt-5.4-mini", 272_000),
@@ -118,11 +144,17 @@ function sanitizeEffortMap(value: unknown): EffortMap | undefined {
   return Object.keys(effort).length ? effort : undefined;
 }
 
+function sanitizeSupportedEfforts(value: unknown): CodexEffort[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return [...new Set(value.filter(isCodexEffort))];
+}
+
 function normalizeModelRoute(m: ModelRoute): ModelRoute {
   const out: ModelRoute = { id: m.id, provider: m.provider, upstreamModel: m.upstreamModel };
   const contextWindow = positiveInteger(m.contextWindow);
   const maxContextWindow = positiveInteger(m.maxContextWindow);
   const effortMap = sanitizeEffortMap(m.effortMap);
+  const supportedEfforts = sanitizeSupportedEfforts(m.supportedEfforts);
   const contradictoryContext =
     contextWindow !== undefined &&
     maxContextWindow !== undefined &&
@@ -130,13 +162,25 @@ function normalizeModelRoute(m: ModelRoute): ModelRoute {
   if (!contradictoryContext && contextWindow !== undefined) out.contextWindow = contextWindow;
   if (!contradictoryContext && maxContextWindow !== undefined) out.maxContextWindow = maxContextWindow;
   if (effortMap !== undefined) out.effortMap = effortMap;
+  if (supportedEfforts !== undefined) out.supportedEfforts = supportedEfforts;
   return out;
 }
 
 /** Merges on-disk model routes over the bundled defaults (on-disk ids shadow). */
 function mergeModelTable(parsed: Record<string, unknown> | null): ModelRoute[] {
+  const seen = new Set<string>();
   const fromFile = Array.isArray(parsed?.models)
-    ? parsed.models.filter(isModelRoute).map(normalizeModelRoute)
+    ? parsed.models
+        .filter(isModelRoute)
+        .map(normalizeModelRoute)
+        .filter((route) => {
+          if (seen.has(route.id)) {
+            console.warn(`duplicate model id "${route.id}"; ignoring later entry`);
+            return false;
+          }
+          seen.add(route.id);
+          return true;
+        })
     : [];
   const defaults = new Map(DEFAULT_MODEL_TABLE.map((m) => [m.id, m]));
   const merged = fromFile.map((route) => {
@@ -216,10 +260,10 @@ export interface ModelConfig {
 }
 
 export const DEFAULT_MAPPINGS: ModelMapping[] = [
-  { from: "fable", to: "gpt-5.6-sol" },
-  { from: "opus", to: "gpt-5.6-terra" },
-  { from: "sonnet", to: "gpt-5.6-luna" },
-  { from: "haiku", to: "gpt-5.4-mini" },
+  { from: "fable", to: "gpt-6-astra" },
+  { from: "opus", to: "gpt-5.6-sol" },
+  { from: "sonnet", to: "gpt-5.6-terra" },
+  { from: "haiku", to: "gpt-5.6-luna" },
 ];
 
 /** Overlays `rows` onto `base`: a row replaces the `base` row for the same
@@ -237,6 +281,34 @@ export function mergeMappingsOverDefaults(rows: ModelMapping[]): ModelMapping[] 
   return mergeMappingsOver(DEFAULT_MAPPINGS, rows);
 }
 
+/** Whether an otherwise valid effort value is incompatible with an OpenAI target. */
+export function routeRejectsEffort(target: ModelRoute | undefined, effort: CodexEffort): boolean {
+  return target?.provider === "openai" && !supportedEffortsFor(target).includes(effort);
+}
+
+function sanitizeMappingForTable(
+  mapping: ModelMapping,
+  table: ModelRoute[],
+  modelsFile: string,
+): ModelMapping {
+  if (!mapping.effort) return mapping;
+  const target = resolveModel(table, mapping.to);
+  const effort: EffortMap = {};
+  for (const [tier, value] of Object.entries(mapping.effort)) {
+    if (!routeRejectsEffort(target, value)) {
+      effort[tier as SourceEffortTier] = value;
+    } else {
+      console.warn(
+        `${modelsFile}: target model "${mapping.to}" does not support effort "${value}"; ` +
+          `ignoring override for tier "${tier}"`,
+      );
+    }
+  }
+  return Object.keys(effort).length
+    ? { from: mapping.from, to: mapping.to, effort }
+    : { from: mapping.from, to: mapping.to };
+}
+
 export function loadModelConfig(modelsFile: string): ModelConfig {
   const parsed = parseModelsFile(modelsFile);
   const models = mergeModelTable(parsed);
@@ -252,7 +324,10 @@ export function loadModelConfig(modelsFile: string): ModelConfig {
     }
     if (parsed.mappings !== undefined) {
       if (Array.isArray(parsed.mappings)) {
-        fromFile = parsed.mappings.filter(isModelMapping).map(sanitizeMapping);
+        fromFile = parsed.mappings
+          .filter(isModelMapping)
+          .map(sanitizeMapping)
+          .map((mapping) => sanitizeMappingForTable(mapping, models, modelsFile));
       } else {
         console.warn(`${modelsFile}: "mappings" is not an array; ignoring (using defaults)`);
       }
@@ -264,7 +339,11 @@ export function loadModelConfig(modelsFile: string): ModelConfig {
 export function saveModelConfig(modelsFile: string, cfg: ModelConfig): void {
   writeFileSync(
     modelsFile,
-    JSON.stringify({ models: cfg.models, mappingEnabled: cfg.mappingEnabled, mappings: cfg.mappings }, null, 2),
+    JSON.stringify({
+      models: cfg.models,
+      mappingEnabled: cfg.mappingEnabled,
+      mappings: cfg.mappings,
+    }, null, 2),
   );
 }
 

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { anthropicToCodexRequest, CodexToAnthropicStream, stripCodexThinking, deriveEffortTier, codexEffortFor, clampEffortForModel } from "./codex-translate.ts";
+import { anthropicToCodexRequest, CodexToAnthropicStream, stripCodexThinking, deriveEffortTier, codexEffortFor, clampEffortToSupported } from "./codex-translate.ts";
 
 const parse = (frame: string) => JSON.parse(frame.split("\ndata: ")[1]!.trim());
 
@@ -694,25 +694,49 @@ describe("codexEffortFor", () => {
   });
 });
 
-describe("clampEffortForModel", () => {
-  test("only gpt-5.6* keeps max; every earlier model clamps to xhigh", () => {
-    expect(clampEffortForModel("max", "gpt-5.6-sol")).toBe("max");
-    expect(clampEffortForModel("max", "gpt-5.6-luna")).toBe("max");
-    // gpt-5.5, gpt-5.4, and gpt-5.4-mini all top out at xhigh (no max).
-    expect(clampEffortForModel("max", "gpt-5.5")).toBe("xhigh");
-    expect(clampEffortForModel("max", "gpt-5.4")).toBe("xhigh");
-    expect(clampEffortForModel("max", "gpt-5.4-mini")).toBe("xhigh");
-    // Non-max efforts and undefined pass through untouched on any model.
-    expect(clampEffortForModel("high", "gpt-5.4-mini")).toBe("high");
-    expect(clampEffortForModel(undefined, "gpt-5.4")).toBeUndefined();
+describe("clampEffortToSupported", () => {
+  const frontier = ["low", "medium", "high", "xhigh", "max"] as const;
+  const limited = ["none", "low", "medium", "high", "xhigh"] as const;
+
+  test("route capabilities determine supported efforts", () => {
+    expect(clampEffortToSupported("max", frontier)).toBe("max");
+    expect(clampEffortToSupported("max", limited)).toBe("xhigh");
+    expect(clampEffortToSupported("none", frontier)).toBeUndefined();
+    expect(clampEffortToSupported("none", limited)).toBe("none");
+    // Supported non-max efforts and undefined pass through untouched.
+    expect(clampEffortToSupported("high", limited)).toBe("high");
+    expect(clampEffortToSupported(undefined, limited)).toBeUndefined();
   });
 });
 
 describe("anthropicToCodexRequest reasoning.effort", () => {
   const msg = { messages: [{ role: "user", content: "hi" }] };
   test("output_config.effort flows through with mapping override", () => {
-    const out = anthropicToCodexRequest({ ...msg, output_config: { effort: "medium" } }, "gpt-5.6-sol", { medium: "high" });
+    const out = anthropicToCodexRequest(
+      { ...msg, output_config: { effort: "medium" } },
+      "gpt-5.6-sol",
+      { effortMap: { medium: "high" } },
+    );
     expect(out.reasoning).toEqual({ effort: "high" });
+  });
+  test("Astra route capability preserves max reasoning", () => {
+    const out = anthropicToCodexRequest(
+      { ...msg, output_config: { effort: "max" } },
+      "gpt-6-astra",
+      { supportedEfforts: ["low", "medium", "high", "xhigh", "max"] },
+    );
+    expect(out.reasoning).toEqual({ effort: "max" });
+  });
+  test("unsupported none from a persisted Astra effort map is omitted", () => {
+    const out = anthropicToCodexRequest(
+      { ...msg, output_config: { effort: "high" } },
+      "gpt-6-astra",
+      {
+        effortMap: { high: "none" },
+        supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+      },
+    );
+    expect(out.reasoning).toBeUndefined();
   });
   test("no effort signal leaves reasoning unset", () => {
     const out = anthropicToCodexRequest({ ...msg }, "gpt-5.6-sol");
@@ -726,12 +750,12 @@ describe("anthropicToCodexRequest reasoning.effort", () => {
     const out = anthropicToCodexRequest(
       { ...msg, output_config: { effort: "high" } },
       "gpt-5.5",
-      { high: "max" },
+      { effortMap: { high: "max" } },
     );
     expect(out.reasoning).toEqual({ effort: "xhigh" });
   });
-  test("pass-through max on the default haiku->gpt-5.4-mini target clamps to xhigh (5.4-mini has no max)", () => {
-    // No effort map: source tier "max" passes through 1:1, then the per-model
+  test("pass-through max on a limited gpt-5.4-mini route clamps to xhigh", () => {
+    // No effort map: source tier "max" passes through 1:1, then the per-route
     // clamp saves it from a 400 on a model that tops out at xhigh.
     const out = anthropicToCodexRequest({ ...msg, output_config: { effort: "max" } }, "gpt-5.4-mini");
     expect(out.reasoning).toEqual({ effort: "xhigh" });

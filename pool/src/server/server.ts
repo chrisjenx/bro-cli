@@ -17,6 +17,8 @@ import {
   isModelMapping,
   isSourceEffortTier,
   isCodexEffort,
+  supportedEffortsFor,
+  routeRejectsEffort,
   mappingFor,
   mergeMappingsOver,
   modelsForListing,
@@ -58,6 +60,10 @@ export function startServer(config: Config): void {
   const modelConfig = loadModelConfig(config.modelsFile);
   const modelTable = modelConfig.models;
   const mappingState: MappingState = { config: modelConfig };
+  const mappingTargets = modelTable
+    .filter((route) => route.provider === "openai")
+    .map((route) => ({ id: route.id, supportedEfforts: supportedEffortsFor(route) }));
+  const dashboard = dashboardHtml();
 
   // Sweep idle session pins so load counts decay even when traffic stops.
   setInterval(() => mgr.pruneSessions(), 60_000);
@@ -77,7 +83,7 @@ export function startServer(config: Config): void {
       const path = url.pathname;
 
       if (req.method === "GET" && path === "/") {
-        return html(dashboardHtml());
+        return html(dashboard);
       }
       if (req.method === "GET" && (path === "/health" || path === "/healthz")) {
         const accounts = mgr.listAccounts();
@@ -97,7 +103,7 @@ export function startServer(config: Config): void {
           mapping: {
             enabled: mappingState.config.mappingEnabled,
             mappings: mappingState.config.mappings,
-            targets: modelTable.filter((m) => m.provider === "openai").map((m) => m.id),
+            targets: mappingTargets,
           },
           usageWindowMs: config.usageWindowMs,
           now: Date.now(),
@@ -488,14 +494,17 @@ function validateMapping(raw: unknown, table: ModelRoute[]): string | null {
   }
   // An anthropic-routed target (incl. to === from) is a valid Claude-only opt-out;
   // an id that isn't in the table at all and doesn't look like a claude model is a typo.
-  const inTable = table.some((r) => r.id === m.to);
+  const target = table.find((r) => r.id === m.to);
   const claudeFamily = modelFamilyOf(m.to) !== null;
-  if (!inTable && !claudeFamily) return `unknown target model '${m.to}'`;
+  if (!target && !claudeFamily) return `unknown target model '${m.to}'`;
   if (m.effort !== undefined) {
     if (typeof m.effort !== "object" || m.effort === null) return "effort must be an object";
     for (const [k, v] of Object.entries(m.effort)) {
       if (!isSourceEffortTier(k)) return `unknown effort tier '${k}'`;
       if (!isCodexEffort(v)) return `invalid effort value '${String(v)}' for tier '${k}'`;
+      if (routeRejectsEffort(target, v)) {
+        return `target model '${m.to}' does not support effort '${v}'`;
+      }
     }
   }
   return null;

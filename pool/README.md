@@ -102,16 +102,23 @@ bro models list
 # sonnet               → anthropic:sonnet
 # fable                → anthropic:fable
 # claude-opus-4-8      → anthropic:claude-opus-4-8
-# claude-fable-5       → anthropic:claude-fable-5
+# claude-fable-5-1     → anthropic:claude-fable-5-1
+# gpt-6-astra          → openai:gpt-6-astra
+# gpt-5.6-sol          → openai:gpt-5.6-sol
+# gpt-5.6-terra        → openai:gpt-5.6-terra
+# gpt-5.6-luna         → openai:gpt-5.6-luna
+# gpt-5.6              → openai:gpt-5.6-sol
 # gpt-5.5              → openai:gpt-5.5
 # gpt-5.4              → openai:gpt-5.4
 # gpt-5.4-mini         → openai:gpt-5.4-mini
 ```
 
-- **Left column = the `"model"` string you put in your request.** Send `gpt-5.5` (or any id in the table) to route to a Codex account; send `sonnet`/`opus`/`fable`/etc. for Claude.
-- Built-in Codex ids ship in the default table: **`gpt-5.5`**, **`gpt-5.4`**, and **`gpt-5.4-mini`** (OpenAI's current Codex CLI defaults; the older `-codex`-suffixed ids like `gpt-5.2-codex`/`gpt-5.1-codex-max` were dropped from the ChatGPT-sign-in picker OpenAI's side in April 2026 and no longer work over this pool's OAuth login — don't reuse them). Claude ids include the aliases `opus`/`sonnet`/`haiku`/`fable` and the full `claude-opus-4-8` / `claude-sonnet-5` / `claude-haiku-4-5` / `claude-fable-5`.
+- **Left column = the `"model"` string you put in your request.** Send `gpt-6-astra` (or any id in the table) to route to a Codex account; send `sonnet`/`opus`/`fable`/etc. for Claude.
+- Built-in Codex ids ship in the default table: **`gpt-6-astra`**, **`gpt-5.6-sol`**, **`gpt-5.6-terra`**, **`gpt-5.6-luna`**, the **`gpt-5.6` → Sol** alias, **`gpt-5.5`**, **`gpt-5.4`**, and **`gpt-5.4-mini`**. Claude ids include the aliases `opus`/`sonnet`/`haiku`/`fable` and their bundled full ids.
+- **Extended context:** Astra, GPT-5.6, and other verified extended routes appear once in Claude Code's model picker with a trailing `[1m]`. Claude Code sends the bare id in the request; the pool also strips the selector defensively. Astra and GPT-5.6 use Codex's 272K normal and 872K extended input/history ceilings.
+- **Cross-provider defaults:** when **Pool Claude + Codex capacity** is enabled on the dashboard, Fable maps to Astra, Opus to Sol, Sonnet to Terra, and Haiku to Luna. Mapping is off by default. Saved rows are always treated as user choices; the current defaults fill only families missing from the file. Astra and GPT-5.6 expose `low` through `max` (not `none`), including custom aliases whose `upstreamModel` names one of those models. Other routes without explicit capability metadata default to `none` through `xhigh`; incompatible persisted overrides are dropped with a warning rather than sent upstream.
 - **Fable has its own scoped usage window** — routing sidelines an account for Fable requests only once *its* Fable-specific window is spent, even if the account has plenty of headroom left on everything else (see [Routing & usage](#routing--usage) below). This is matched by family (any model id containing `fable`, `opus`, `sonnet`, or `haiku`), not by the table entry, so it applies even to a custom `claude-fable-*` id you add yourself.
-- An unknown model id falls back to routing verbatim to Anthropic, so a Codex model **must** be present in the table (as an `openai` entry) to reach a Codex account. OpenAI ships new Codex model ids often — a "GPT-5.6" generation (`sol`/`terra`/`luna` tiers) is in limited trusted-partner preview as of mid-2026 — and they aren't picked up automatically, since Codex has no model-list endpoint (see below); add new ones to `models.json` yourself once you know the exact id string.
+- An unknown model id falls back to routing verbatim to Anthropic, so a Codex model **must** be present in the table (as an `openai` entry) to reach a Codex account. Codex model ids are not discovered automatically; add new ones to `models.json` once you know the exact accepted id.
 
 ### Adding / changing model ids
 
@@ -125,7 +132,7 @@ Codex has no documented model-list endpoint, so `bro models update` can't auto-d
 }
 ```
 
-`id` is what you send to the pool; `upstreamModel` is what the pool sends to OpenAI/Codex (usually identical). Entries in `models.json` are merged over the built-in defaults, so you only list ids you're adding or overriding. Run `bro models list` again to confirm.
+`id` is what you send to the pool; `upstreamModel` is what the pool sends to OpenAI/Codex (usually identical). Optional `contextWindow` and `maxContextWindow` fields publish verified Codex input/history limits to Claude Code. Use `supportedEfforts` for a verified per-model list such as `["low", "medium", "high", "xhigh", "max"]`; `ultra` is intentionally rejected because it is a Codex-app delegation mode, not an effort bro sends upstream. Entries in `models.json` are merged over the built-in defaults, so you only list ids you're adding or overriding. Run `bro models list` again to confirm.
 
 ## Run the server
 

@@ -2,6 +2,7 @@
 // No I/O, no network — everything here is fixture-tested.
 
 import {
+  DEFAULT_CODEX_SUPPORTED_EFFORTS,
   isSourceEffortTier,
   type SourceEffortTier,
   type CodexEffort,
@@ -33,18 +34,27 @@ export function codexEffortFor(tier: SourceEffortTier, effortMap?: EffortMap): C
   return tier === "default" ? undefined : (tier as CodexEffort);
 }
 
-/** Only gpt-5.6* exposes the `max` reasoning effort; every earlier Codex model
- * (gpt-5.5, gpt-5.4, gpt-5.4-mini) tops out at xhigh and 400s on `max`. Clamp
- * down rather than fail upstream — xhigh is supported everywhere `max` is asked. */
-export function clampEffortForModel(effort: CodexEffort | undefined, upstreamModel: string): CodexEffort | undefined {
-  if (effort === "max" && !upstreamModel.startsWith("gpt-5.6")) return "xhigh";
-  return effort;
+/** Normalize an effort against route capabilities. Legacy/custom routes use
+ * the conservative none-through-xhigh set. Unsupported max falls back to xhigh;
+ * other unsupported values are omitted rather than provoking an upstream 400. */
+export function clampEffortToSupported(
+  effort: CodexEffort | undefined,
+  supportedEfforts: readonly CodexEffort[] = DEFAULT_CODEX_SUPPORTED_EFFORTS,
+): CodexEffort | undefined {
+  if (effort === undefined || supportedEfforts.includes(effort)) return effort;
+  if (effort === "max" && supportedEfforts.includes("xhigh")) return "xhigh";
+  return undefined;
+}
+
+export interface CodexTranslationOptions {
+  effortMap?: EffortMap;
+  supportedEfforts?: readonly CodexEffort[];
 }
 
 export function anthropicToCodexRequest(
   body: Record<string, unknown>,
   upstreamModel: string,
-  effortMap?: EffortMap,
+  options: CodexTranslationOptions = {},
 ): Record<string, unknown> {
   const input: Array<Record<string, unknown>> = [];
   for (const m of (body.messages as Array<Record<string, unknown>> | undefined) ?? []) {
@@ -150,7 +160,10 @@ export function anthropicToCodexRequest(
   // field — the backend bounds output itself. Since Claude Code always sends
   // max_tokens, forwarding it here 400s every Codex-routed request. Do not
   // re-add it.
-  const effort = clampEffortForModel(codexEffortFor(deriveEffortTier(body), effortMap), upstreamModel);
+  const effort = clampEffortToSupported(
+    codexEffortFor(deriveEffortTier(body), options.effortMap),
+    options.supportedEfforts,
+  );
   if (effort) out.reasoning = { effort };
   const tools = (body.tools as Array<Record<string, unknown>> | undefined) ?? [];
   if (tools.length) {

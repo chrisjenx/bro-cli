@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import { loadModelTable, resolveModel, DEFAULT_MODEL_TABLE, loadModelConfig, saveModelConfig, DEFAULT_MAPPINGS, type ModelConfig, mappingFor, modelsForListing, type ModelMapping, CODEX_EXTENDED_CONTEXT_MIN } from "./models.ts";
+import { loadModelTable, resolveModel, DEFAULT_MODEL_TABLE, loadModelConfig, saveModelConfig, DEFAULT_MAPPINGS, type ModelConfig, mappingFor, modelsForListing, type ModelMapping, CODEX_EXTENDED_CONTEXT_MIN, supportedEffortsFor } from "./models.ts";
 import { modelFamilyOf } from "./accounts/types.ts";
 
 describe("model table", () => {
@@ -43,6 +43,27 @@ describe("model table", () => {
     expect(alias.upstreamModel).toBe("gpt-5.6-sol");
   });
 
+  test("custom aliases inherit capabilities from known upstream models", () => {
+    const table = [
+      { id: "sol-alias", provider: "openai" as const, upstreamModel: "gpt-5.6-sol" },
+      { id: "astra-alias", provider: "openai" as const, upstreamModel: "gpt-6-astra" },
+    ];
+    expect(supportedEffortsFor(resolveModel(table, "sol-alias"))).toContain("max");
+    expect(supportedEffortsFor(resolveModel(table, "astra-alias"))).not.toContain("none");
+  });
+
+  test("GPT-6 Astra routes directly to the matching Codex model", () => {
+    const route = resolveModel(DEFAULT_MODEL_TABLE, "gpt-6-astra");
+    expect(route).toMatchObject({
+      id: "gpt-6-astra",
+      provider: "openai",
+      upstreamModel: "gpt-6-astra",
+      contextWindow: 272_000,
+      maxContextWindow: 872_000,
+    });
+    expect(supportedEffortsFor(route)).toEqual(["low", "medium", "high", "xhigh", "max"]);
+  });
+
   test("modelsForListing shows one entry per Claude family (the alias), keeps openai + custom ids", () => {
     const ids = modelsForListing(DEFAULT_MODEL_TABLE).map((m) => m.id);
     // one alias per Claude family, and no bundled full-id duplicates
@@ -75,8 +96,23 @@ describe("model table", () => {
     expect(table.find((m) => m.id === "opus")).toBeDefined(); // defaults kept
   });
 
+  test("duplicate configured model ids keep the first route consistently", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pool-models-"));
+    const file = join(dir, "models.json");
+    writeFileSync(file, JSON.stringify({ models: [
+      { id: "duplicate", provider: "openai", upstreamModel: "first", supportedEfforts: ["low"] },
+      { id: "duplicate", provider: "openai", upstreamModel: "second", supportedEfforts: ["max"] },
+    ] }));
+    expect(resolveModel(loadModelTable(file), "duplicate")).toMatchObject({
+      upstreamModel: "first",
+      supportedEfforts: ["low"],
+    });
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   test("bundled Codex routes carry their verified default and maximum contexts", () => {
     const expected = new Map([
+      ["gpt-6-astra", [272_000, 872_000]],
       ["gpt-5.6-sol", [272_000, 872_000]],
       ["gpt-5.6-terra", [272_000, 872_000]],
       ["gpt-5.6-luna", [272_000, 872_000]],
@@ -135,6 +171,25 @@ describe("model table", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  test("loaded routes preserve explicit supported efforts and drop invalid values", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pool-model-capability-"));
+    const file = join(dir, "models.json");
+    writeFileSync(file, JSON.stringify({ models: [
+      { id: "frontier", provider: "openai", upstreamModel: "frontier", supportedEfforts: ["low", "max", "ultra", "low"] },
+      { id: "limited", provider: "openai", upstreamModel: "limited", supportedEfforts: ["none", "low"] },
+      { id: "empty", provider: "openai", upstreamModel: "empty", supportedEfforts: [] },
+      { id: "all-invalid", provider: "openai", upstreamModel: "all-invalid", supportedEfforts: ["ultra"] },
+      { id: "invalid", provider: "openai", upstreamModel: "invalid", supportedEfforts: "all" },
+    ] }));
+    const table = loadModelTable(file);
+    expect(resolveModel(table, "frontier").supportedEfforts).toEqual(["low", "max"]);
+    expect(resolveModel(table, "limited").supportedEfforts).toEqual(["none", "low"]);
+    expect(resolveModel(table, "empty").supportedEfforts).toEqual([]);
+    expect(resolveModel(table, "all-invalid").supportedEfforts).toEqual([]);
+    expect(resolveModel(table, "invalid").supportedEfforts).toBeUndefined();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   test("a trailing 1m selector resolves to the bare route unless configured exactly", () => {
     const routed = resolveModel(DEFAULT_MODEL_TABLE, "gpt-5.6-sol[1m]");
     expect(routed.id).toBe("gpt-5.6-sol[1m]");
@@ -162,6 +217,25 @@ describe("loadModelConfig", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  test("persisted mappings stay authoritative while missing families get current defaults", () => {
+    const dir = mkdtempSync(join(tmpdir(), "models-"));
+    const file = join(dir, "models.json");
+    writeFileSync(file, JSON.stringify({
+      mappingEnabled: true,
+      mappings: [
+        { from: "fable", to: "gpt-5.6-sol" },
+        { from: "sonnet", to: "gpt-5.5" },
+      ],
+    }));
+    const cfg = loadModelConfig(file);
+    expect(cfg.mappingEnabled).toBe(true);
+    expect(cfg.mappings.find((m) => m.from === "fable")?.to).toBe("gpt-5.6-sol");
+    expect(cfg.mappings.find((m) => m.from === "sonnet")?.to).toBe("gpt-5.5");
+    expect(cfg.mappings.find((m) => m.from === "opus")?.to).toBe("gpt-5.6-sol");
+    expect(cfg.mappings.find((m) => m.from === "haiku")?.to).toBe("gpt-5.6-luna");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   test("user mappings shadow defaults by family and enabled flag round-trips", () => {
     const dir = mkdtempSync(join(tmpdir(), "models-"));
     const file = join(dir, "models.json");
@@ -177,9 +251,22 @@ describe("loadModelConfig", () => {
     expect(cfg.mappingEnabled).toBe(true);
     // Shadowed families take the user row; the rest keep defaults.
     expect(cfg.mappings.find((m) => m.from === "fable")!.to).toBe("fable");
-    expect(cfg.mappings.find((m) => m.from === "opus")!.to).toBe("gpt-5.6-terra");
+    expect(cfg.mappings.find((m) => m.from === "opus")!.to).toBe("gpt-5.6-sol");
     expect(cfg.mappings.find((m) => m.from === "haiku")!.effort).toEqual({ low: "medium" });
     rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("default mappings target the requested Codex generation by Claude family", () => {
+    const cfg = cfgWith(DEFAULT_MAPPINGS);
+    const expected = {
+      fable: "gpt-6-astra",
+      opus: "gpt-5.6-sol",
+      sonnet: "gpt-5.6-terra",
+      haiku: "gpt-5.6-luna",
+    };
+    for (const [family, upstreamModel] of Object.entries(expected)) {
+      expect(mappingFor(cfg, family)?.upstreamModel).toBe(upstreamModel);
+    }
   });
 
   test("malformed mapping fields fall back to defaults with mapping off", () => {
@@ -189,6 +276,18 @@ describe("loadModelConfig", () => {
     const cfg = loadModelConfig(file);
     expect(cfg.mappingEnabled).toBe(false);
     expect(cfg.mappings).toEqual(DEFAULT_MAPPINGS);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("target-incompatible effort overrides are dropped while loading", () => {
+    const dir = mkdtempSync(join(tmpdir(), "models-"));
+    const file = join(dir, "models.json");
+    writeFileSync(file, JSON.stringify({ mappings: [{
+      from: "fable",
+      to: "gpt-6-astra",
+      effort: { low: "none", high: "high" },
+    }] }));
+    expect(loadModelConfig(file).mappings.find((m) => m.from === "fable")?.effort).toEqual({ high: "high" });
     rmSync(dir, { recursive: true, force: true });
   });
 

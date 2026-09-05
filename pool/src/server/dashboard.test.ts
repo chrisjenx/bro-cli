@@ -379,7 +379,10 @@ describe("model mapping card", () => {
     const mappingCardHtml = loadMappingCard();
     const html = mappingCardHtml({
       enabled: true,
-      targets: ["gpt-5.6-sol", "gpt-5.5"],
+      targets: [
+        { id: "gpt-5.6-sol", supportedEfforts: [] },
+        { id: "gpt-5.5", supportedEfforts: [] },
+      ],
       // opus is mapped to a target that isn't in `targets` anymore (e.g. a
       // model that was removed from the pool) — must fall back to inert too.
       mappings: [{ from: "opus", to: "gpt-9.9-ghost" }],
@@ -398,7 +401,10 @@ describe("model mapping card", () => {
     const mappingCardHtml = loadMappingCard();
     const html = mappingCardHtml({
       enabled: true,
-      targets: ["gpt-5.6-sol", "gpt-5.5"],
+      targets: [
+        { id: "gpt-5.6-sol", supportedEfforts: ["low", "medium", "high", "xhigh", "max"] },
+        { id: "gpt-5.5", supportedEfforts: ["none", "low", "medium", "high", "xhigh"] },
+      ],
       mappings: [{ from: "fable", to: "gpt-5.6-sol", effort: { max: "xhigh" } }],
     });
 
@@ -412,32 +418,56 @@ describe("model mapping card", () => {
     expect(maxSelect).toContain('<option value="xhigh" selected>Extra High</option>');
   });
 
-  test("only gpt-5.6* targets keep the max effort tier; earlier models omit it", () => {
+  test("polled route capabilities, not model-name prefixes, control the max effort option", () => {
     const mappingCardHtml = loadMappingCard();
     const html = mappingCardHtml({
       enabled: true,
-      targets: ["gpt-5.6-sol", "gpt-5.5", "gpt-5.4-mini"],
+      targets: [
+        { id: "gpt-6-astra", supportedEfforts: ["low", "medium", "high", "xhigh", "max"] },
+        { id: "gpt-5.6-sol", supportedEfforts: ["none", "low", "medium", "high", "xhigh"] },
+        { id: "custom-frontier", supportedEfforts: ["high", "max"] },
+      ],
       mappings: [
-        { from: "fable", to: "gpt-5.6-sol" },
-        { from: "opus", to: "gpt-5.5" },
-        // gpt-5.4-mini is the built-in haiku default and has no max.
-        { from: "haiku", to: "gpt-5.4-mini" },
+        { from: "fable", to: "gpt-6-astra" },
+        { from: "opus", to: "gpt-5.6-sol" },
+        { from: "sonnet", to: "custom-frontier" },
       ],
     });
 
     const fableRow = mapRow(html, "fable");
     const opusRow = mapRow(html, "opus");
-    const haikuRow = mapRow(html, "haiku");
+    const sonnetRow = mapRow(html, "sonnet");
     expect(fableRow).toContain('<option value="max">Max</option>');
+    expect(fableRow).not.toContain('<option value="none">None</option>');
+    expect(opusRow).toContain('<option value="none">None</option>');
     expect(opusRow).not.toContain('<option value="max">Max</option>');
-    expect(haikuRow).not.toContain('<option value="max">Max</option>');
+    expect(sonnetRow).toContain('<option value="max">Max</option>');
+    expect(sonnetRow).not.toContain('<option value="none">None</option>');
+  });
+
+  test("mappingCardHtml refreshes capabilities from each polled status payload", () => {
+    const mappingCardHtml = loadMappingCard();
+    const first = mappingCardHtml({
+      enabled: true,
+      targets: [{ id: "changing", supportedEfforts: ["max"] }],
+      mappings: [{ from: "fable", to: "changing" }],
+    });
+    expect(mapRow(first, "fable")).toContain('<option value="max">Max</option>');
+
+    const second = mappingCardHtml({
+      enabled: true,
+      targets: [{ id: "changing", supportedEfforts: ["none"] }],
+      mappings: [{ from: "fable", to: "changing" }],
+    });
+    expect(mapRow(second, "fable")).not.toContain('<option value="max">Max</option>');
+    expect(mapRow(second, "fable")).toContain('<option value="none">None</option>');
   });
 
   test("mappingCardHtml HTML-escapes target ids from mapping.targets", () => {
     const mappingCardHtml = loadMappingCard();
     const html = mappingCardHtml({
       enabled: true,
-      targets: ["<script>alert(1)</script>"],
+      targets: [{ id: "<script>alert(1)</script>", supportedEfforts: [] }],
       mappings: [],
     });
     expect(html).not.toContain("<script>alert(1)</script>");
@@ -448,7 +478,11 @@ describe("model mapping card", () => {
     const mappingCardHtml = loadMappingCard();
     const html = mappingCardHtml({
       enabled: true,
-      targets: ["gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra"],
+      targets: [
+        { id: "gpt-5.6-sol", supportedEfforts: [] },
+        { id: "gpt-5.5", supportedEfforts: [] },
+        { id: "gpt-5.6-terra", supportedEfforts: [] },
+      ],
       mappings: [
         { from: "fable", to: "gpt-5.6-sol", effort: { max: "xhigh", high: "high" } },
         { from: "opus", to: "gpt-5.5" },

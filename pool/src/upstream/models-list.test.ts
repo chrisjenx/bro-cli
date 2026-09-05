@@ -8,7 +8,7 @@ import {
   resetModelsCache,
   type LiveModelsDeps,
 } from "./models-list.ts";
-import type { ModelRoute } from "../models.ts";
+import { DEFAULT_MODEL_TABLE, type ModelRoute } from "../models.ts";
 
 const upstream = {
   data: [
@@ -146,6 +146,20 @@ test("Codex routes expose one model-aware selector and private context metadata"
     max_context_window: 872_000,
   });
   expect(listed[0]).not.toHaveProperty("max_input_tokens");
+});
+
+test("bundled Astra is listed once with its extended selector and context metadata", () => {
+  const astra = buildModelListing(null, DEFAULT_MODEL_TABLE).filter((model) =>
+    model.id.startsWith("gpt-6-astra")
+  );
+  expect(astra).toEqual([
+    expect.objectContaining({
+      id: "gpt-6-astra[1m]",
+      owned_by: OPENAI_OWNER,
+      context_window: 272_000,
+      max_context_window: 872_000,
+    }),
+  ]);
 });
 
 test("an already marked custom route is not marked twice", () => {

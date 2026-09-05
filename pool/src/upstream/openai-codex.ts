@@ -11,7 +11,7 @@
 import type { Config } from "../config.ts";
 import { AccountManager } from "../accounts/manager.ts";
 import type { Account, OpenAIOauthCreds, RateLimitSnapshot, RateLimitWindow } from "../accounts/types.ts";
-import type { ModelRoute } from "../models.ts";
+import { supportedEffortsFor, type ModelRoute } from "../models.ts";
 import { refreshOpenAIToken } from "../accounts/openai-oauth.ts";
 import { anthropicToCodexRequest, CodexToAnthropicStream } from "./codex-translate.ts";
 import { durationToWindowKey } from "./codex-windows.ts";
@@ -105,7 +105,11 @@ export async function proxyCodexMessages(
   const sessionKey =
     metadata && typeof metadata.user_id === "string" && metadata.user_id ? metadata.user_id : undefined;
   const streamRequested = anthropicBody.stream === true;
-  const codexBody = anthropicToCodexRequest(anthropicBody, route.upstreamModel, route.effortMap);
+  const codexBody = anthropicToCodexRequest(
+    anthropicBody,
+    route.upstreamModel,
+    { effortMap: route.effortMap, supportedEfforts: supportedEffortsFor(route) },
+  );
 
   let account = mgr.pick(sessionKey, undefined, "openai");
   if (!account) return anthropicError(503, "overloaded_error", noOpenAIAccountMessage(mgr));

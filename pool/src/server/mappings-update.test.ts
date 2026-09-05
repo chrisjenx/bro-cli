@@ -34,7 +34,7 @@ describe("handleMappingsUpdate", () => {
     expect(good.status).toBe(200);
     expect(state.config.mappings.find((m) => m.from === "fable")!.to).toBe("gpt-5.6-terra");
     // Unlisted families fall back to defaults on the next load.
-    expect(loadModelConfig(file).mappings.find((m) => m.from === "opus")!.to).toBe("gpt-5.6-terra");
+    expect(loadModelConfig(file).mappings.find((m) => m.from === "opus")!.to).toBe("gpt-5.6-sol");
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -52,6 +52,22 @@ describe("handleMappingsUpdate", () => {
     expect(
       handleMappingsUpdate(state, file, { mappings: [{ from: "opus", to: "gpt-5.5", effort: { low: "ultra" } }] }).status,
     ).toBe(400);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("rejects target-unsupported effort values for Astra", async () => {
+    const { state, file, dir } = freshState();
+    const unsupported = handleMappingsUpdate(state, file, {
+      mappings: [{ from: "fable", to: "gpt-6-astra", effort: { high: "none" } }],
+    });
+    expect(unsupported.status).toBe(400);
+    const body = (await unsupported.json()) as { error: { message: string } };
+    expect(body.error.message).toContain("does not support effort 'none'");
+
+    const supported = handleMappingsUpdate(state, file, {
+      mappings: [{ from: "fable", to: "gpt-6-astra", effort: { high: "max" } }],
+    });
+    expect(supported.status).toBe(200);
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -74,9 +90,9 @@ describe("handleMappingsUpdate", () => {
     // The posted family wins; families left unlisted in the POST keep the value
     // they already had (here still the defaults) immediately in memory.
     expect(state.config.mappings.find((m) => m.from === "fable")!.to).toBe("gpt-5.6-luna");
-    expect(state.config.mappings.find((m) => m.from === "opus")!.to).toBe("gpt-5.6-terra");
-    expect(state.config.mappings.find((m) => m.from === "sonnet")!.to).toBe("gpt-5.6-luna");
-    expect(state.config.mappings.find((m) => m.from === "haiku")!.to).toBe("gpt-5.4-mini");
+    expect(state.config.mappings.find((m) => m.from === "opus")!.to).toBe("gpt-5.6-sol");
+    expect(state.config.mappings.find((m) => m.from === "sonnet")!.to).toBe("gpt-5.6-terra");
+    expect(state.config.mappings.find((m) => m.from === "haiku")!.to).toBe("gpt-5.6-luna");
     expect(state.config.mappings.map((m) => m.from).sort()).toEqual(["fable", "haiku", "opus", "sonnet"]);
 
     // Memory and disk must agree: reloading from the persisted file yields the
@@ -89,9 +105,9 @@ describe("handleMappingsUpdate", () => {
     const { state, file, dir } = freshState();
     // Customize opus and a non-default family away from the bundled defaults.
     expect(handleMappingsUpdate(state, file, {
-      mappings: [{ from: "opus", to: "gpt-5.6-sol" }, { from: "mythos", to: "gpt-5.6-sol" }],
+      mappings: [{ from: "opus", to: "gpt-5.6-terra" }, { from: "mythos", to: "gpt-5.6-sol" }],
     }).status).toBe(200);
-    expect(state.config.mappings.find((m) => m.from === "opus")!.to).toBe("gpt-5.6-sol");
+    expect(state.config.mappings.find((m) => m.from === "opus")!.to).toBe("gpt-5.6-terra");
 
     // A later partial POST that only names fable must NOT clobber opus back to
     // its default, and must not drop the mythos row the dashboard never renders.
@@ -100,7 +116,7 @@ describe("handleMappingsUpdate", () => {
     }).status).toBe(200);
 
     expect(state.config.mappings.find((m) => m.from === "fable")!.to).toBe("gpt-5.6-luna");
-    expect(state.config.mappings.find((m) => m.from === "opus")!.to).toBe("gpt-5.6-sol");
+    expect(state.config.mappings.find((m) => m.from === "opus")!.to).toBe("gpt-5.6-terra");
     expect(state.config.mappings.find((m) => m.from === "mythos")?.to).toBe("gpt-5.6-sol");
     expect(loadModelConfig(file).mappings).toEqual(state.config.mappings);
     rmSync(dir, { recursive: true, force: true });

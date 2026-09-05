@@ -494,8 +494,8 @@ function routingPanelHtml(routing) {
 // Cross-subscription model mapping: each Claude family (fable/opus/sonnet/haiku)
 // can be routed to a Codex/OpenAI-provider target model, with a per-source-tier
 // reasoning-effort override translated into the target's own effort values.
-// Injected from models.ts so the client offer set can't drift from the server's
-// canonical tiers/efforts (same pattern as TUNING_FIELDS below).
+// Tier names are injected from models.ts; per-target capabilities arrive with
+// the polled mapping status so an open dashboard stays in sync across restarts.
 var SOURCE_TIERS = ${JSON.stringify(SOURCE_EFFORT_TIERS)};
 var CODEX_EFFORTS = ${JSON.stringify(CODEX_EFFORTS)};
 var EFFORT_LABELS = { low: "Low (Light)", xhigh: "Extra High", none: "None" };
@@ -515,13 +515,14 @@ function readEfforts(container) {
 // families it omits when Save posts the full set.
 var FAMILIES = ${JSON.stringify(MODEL_FAMILIES)};
 
-function effortOptions(family, tier, selected, targetModel) {
+function effortOptions(family, tier, selected, targetModel, targets) {
   var opts = '<option value="">pass-through</option>';
+  var target = (targets || []).find(function (item) { return item.id === targetModel; });
+  var supported = target && Array.isArray(target.supportedEfforts) ? target.supportedEfforts : [];
   for (var i = 0; i < CODEX_EFFORTS.length; i++) {
     var e = CODEX_EFFORTS[i];
-    // Only gpt-5.6* exposes max; earlier targets (gpt-5.5, gpt-5.4*) 400 on it,
-    // so the server clamps max->xhigh — mirror that here instead of offering it.
-    if (e === "max" && targetModel.indexOf("gpt-5.6") !== 0) continue;
+    // Mirror the route capabilities used by server validation and translation.
+    if (supported.indexOf(e) < 0) continue;
     opts += '<option value="' + e + '"' + (selected === e ? " selected" : "") + ">"
       + esc(EFFORT_LABELS[e] || e.charAt(0).toUpperCase() + e.slice(1)) + "</option>";
   }
@@ -531,32 +532,33 @@ function effortOptions(family, tier, selected, targetModel) {
 // Inner HTML of a family row's .efforts container (one labelled select per
 // source tier). Shared by the initial render and the target-change handler so
 // switching targets re-filters the offered efforts (e.g. drops max off 5.4/5.5).
-function effortsHtml(family, effort, targetModel) {
+function effortsHtml(family, effort, targetModel, targets) {
   var out = "";
   for (var s = 0; s < SOURCE_TIERS.length; s++) {
     var tier = SOURCE_TIERS[s];
     out += '<span class="tier"><label>' + tier + "</label>"
-      + effortOptions(family, tier, (effort || {})[tier] || "", targetModel) + "</span>";
+      + effortOptions(family, tier, (effort || {})[tier] || "", targetModel, targets) + "</span>";
   }
   return out;
 }
 
 function mappingCardHtml(mapping) {
   if (!mapping) return "";
+  var targets = mapping.targets || [];
   var rows = "";
   for (var i = 0; i < FAMILIES.length; i++) {
     var fam = FAMILIES[i];
     var row = (mapping.mappings || []).find(function (m) { return m.from === fam; }) || { from: fam, to: fam };
-    var inert = row.to === fam || (mapping.targets || []).indexOf(row.to) < 0;
+    var inert = row.to === fam || !targets.some(function (target) { return target.id === row.to; });
     var targetOpts = '<option value="' + fam + '"' + (inert ? " selected" : "") + ">Claude only</option>";
-    for (var t = 0; t < (mapping.targets || []).length; t++) {
-      var id = mapping.targets[t];
+    for (var t = 0; t < targets.length; t++) {
+      var id = targets[t].id;
       targetOpts += '<option value="' + esc(id) + '"' + (row.to === id ? " selected" : "") + ">" + esc(id) + "</option>";
     }
     rows += '<div class="map-row" data-map-row="' + fam + '">'
       + "<b>" + fam + "</b> &rarr; "
       + '<select data-map-family="' + fam + '">' + targetOpts + "</select>"
-      + '<div class="efforts"' + (inert ? ' style="display:none"' : "") + ">" + effortsHtml(fam, row.effort, row.to) + "</div>"
+      + '<div class="efforts"' + (inert ? ' style="display:none"' : "") + ">" + effortsHtml(fam, row.effort, row.to, targets) + "</div>"
       + "</div>";
   }
   return '<summary>Model mapping<span class="caret">▶</span></summary>'
@@ -812,7 +814,13 @@ async function refresh() {
       // safe (not mid-edit, and the data actually changed), so a poll tick can
       // never clobber in-progress edits. Show the Settings group iff either
       // config panel has content.
-      const mapVisible = renderSettings("mapping-panel", mappingCardHtml(d.mapping), d.mapping, wireMapping);
+      const mapping = d.mapping || {};
+      const mapVisible = renderSettings(
+        "mapping-panel",
+        mappingCardHtml(mapping),
+        mapping,
+        function () { wireMapping(mapping.targets || []); },
+      );
       const tuneVisible = renderSettings("tuning-panel", tuningPanelHtml(d.tuning), d.tuning, wireTuning);
       document.getElementById("settings-group").style.display = (mapVisible || tuneVisible) ? "block" : "none";
 
@@ -891,7 +899,7 @@ async function refresh() {
 // Attach the Save handler for the mapping panel. Reads each family's target
 // select plus its per-tier effort selects, POSTs the full replacement set to
 // /api/mappings, then refreshes so the server's normalized state comes back.
-function wireMapping() {
+function wireMapping(targets) {
   const saveBtn = document.getElementById("mapping-save");
   if (!saveBtn) return;
 
@@ -905,7 +913,7 @@ function wireMapping() {
       const fam = rowEl.getAttribute("data-map-row");
       const to = sel.value;
       const effortsDiv = rowEl.querySelector(".efforts");
-      effortsDiv.innerHTML = effortsHtml(fam, readEfforts(effortsDiv), to);
+      effortsDiv.innerHTML = effortsHtml(fam, readEfforts(effortsDiv), to, targets);
       effortsDiv.style.display = to === fam ? "none" : "";
     });
   });
