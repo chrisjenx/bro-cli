@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import { loadModelTable, resolveModel, DEFAULT_MODEL_TABLE, loadModelConfig, saveModelConfig, DEFAULT_MAPPINGS, type ModelConfig, mappingFor, modelsForListing, type ModelMapping } from "./models.ts";
+import { loadModelTable, resolveModel, DEFAULT_MODEL_TABLE, loadModelConfig, saveModelConfig, DEFAULT_MAPPINGS, type ModelConfig, mappingFor, modelsForListing, type ModelMapping, CODEX_EXTENDED_CONTEXT_MIN } from "./models.ts";
 import { modelFamilyOf } from "./accounts/types.ts";
 
 describe("model table", () => {
@@ -73,6 +73,82 @@ describe("model table", () => {
     const table = loadModelTable(file);
     expect(table.find((m) => m.id === "gpt-x")?.provider).toBe("openai");
     expect(table.find((m) => m.id === "opus")).toBeDefined(); // defaults kept
+  });
+
+  test("bundled Codex routes carry their verified default and maximum contexts", () => {
+    const expected = new Map([
+      ["gpt-5.6-sol", [272_000, 872_000]],
+      ["gpt-5.6-terra", [272_000, 872_000]],
+      ["gpt-5.6-luna", [272_000, 872_000]],
+      ["gpt-5.6", [272_000, 872_000]],
+      ["gpt-5.5", [272_000, 272_000]],
+      ["gpt-5.4", [272_000, 1_000_000]],
+      ["gpt-5.4-mini", [272_000, 272_000]],
+    ]);
+    expect(CODEX_EXTENDED_CONTEXT_MIN).toBe(872_000);
+    for (const [id, [contextWindow, maxContextWindow]] of expected) {
+      expect(resolveModel(DEFAULT_MODEL_TABLE, id)).toMatchObject({ contextWindow, maxContextWindow });
+    }
+  });
+
+  test("legacy bundled rows inherit context metadata without overriding explicit values", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pool-model-context-"));
+    const file = join(dir, "models.json");
+    writeFileSync(file, JSON.stringify({ models: [
+      { id: "gpt-5.6-sol", provider: "openai", upstreamModel: "gpt-5.6-sol" },
+      { id: "gpt-5.5", provider: "openai", upstreamModel: "gpt-5.5", contextWindow: 250_000, maxContextWindow: 260_000 },
+    ] }));
+    const table = loadModelTable(file);
+    expect(resolveModel(table, "gpt-5.6-sol")).toMatchObject({ contextWindow: 272_000, maxContextWindow: 872_000 });
+    expect(resolveModel(table, "gpt-5.5")).toMatchObject({ contextWindow: 250_000, maxContextWindow: 260_000 });
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("repointed and custom rows do not inherit unrelated bundled context", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pool-model-context-"));
+    const file = join(dir, "models.json");
+    writeFileSync(file, JSON.stringify({ models: [
+      { id: "gpt-5.6-sol", provider: "openai", upstreamModel: "custom-sol" },
+      { id: "custom", provider: "openai", upstreamModel: "custom", contextWindow: -1, maxContextWindow: "wide" },
+      { id: "contradictory", provider: "openai", upstreamModel: "contradictory", contextWindow: 1_000_000, maxContextWindow: 272_000 },
+    ] }));
+    const table = loadModelTable(file);
+    expect(resolveModel(table, "gpt-5.6-sol").contextWindow).toBeUndefined();
+    expect(resolveModel(table, "gpt-5.6-sol").maxContextWindow).toBeUndefined();
+    expect(resolveModel(table, "custom").contextWindow).toBeUndefined();
+    expect(resolveModel(table, "custom").maxContextWindow).toBeUndefined();
+    expect(resolveModel(table, "contradictory").contextWindow).toBeUndefined();
+    expect(resolveModel(table, "contradictory").maxContextWindow).toBeUndefined();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("loaded direct routes preserve valid effort overrides", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pool-model-effort-"));
+    const file = join(dir, "models.json");
+    writeFileSync(file, JSON.stringify({ models: [{
+      id: "gpt-custom",
+      provider: "openai",
+      upstreamModel: "gpt-custom",
+      effortMap: { max: "xhigh", invalid: "high", low: "invalid" },
+    }] }));
+    expect(resolveModel(loadModelTable(file), "gpt-custom").effortMap).toEqual({ max: "xhigh" });
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("a trailing 1m selector resolves to the bare route unless configured exactly", () => {
+    const routed = resolveModel(DEFAULT_MODEL_TABLE, "gpt-5.6-sol[1m]");
+    expect(routed.id).toBe("gpt-5.6-sol[1m]");
+    expect(routed.provider).toBe("openai");
+    expect(routed.upstreamModel).toBe("gpt-5.6-sol");
+
+    const exact = resolveModel([
+      ...DEFAULT_MODEL_TABLE,
+      { id: "literal[1m]", provider: "openai" as const, upstreamModel: "literal-upstream" },
+    ], "literal[1m]");
+    expect(exact.upstreamModel).toBe("literal-upstream");
+
+    const unknown = resolveModel(DEFAULT_MODEL_TABLE, "unknown-anthropic[1m]");
+    expect(unknown.upstreamModel).toBe("unknown-anthropic[1m]");
   });
 });
 
@@ -158,6 +234,8 @@ describe("mappingFor", () => {
       const route = mappingFor(cfg, id)!;
       expect(route.provider).toBe("openai");
       expect(route.upstreamModel).toBe("gpt-5.6-sol");
+      expect(route.contextWindow).toBe(272_000);
+      expect(route.maxContextWindow).toBe(872_000);
       expect(route.effortMap).toEqual({ max: "xhigh" });
       expect(route.id).toBe(id);
     }

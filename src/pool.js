@@ -19,7 +19,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { which, globalBinDirs, runInherit } from './proc.js';
 import { permissionArgs } from './launch.js';
-import { applyPoolEnv, clearPoolEnv, isPoolEnvActive, poolEnvBlock, scrubLegacyPins, refreshCachedFableRowFile, sonnetPinFromCatalog } from './settings.js';
+import { applyPoolEnv, clearPoolEnv, isPoolEnvActive, poolEnvBlock, scrubLegacyPins, scrubManagedContext, refreshCachedFableRowFile, sonnetPinFromCatalog, codexDefaultContextFromCatalog } from './settings.js';
 import { select, prompt, holdOrContinue } from './ui.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -379,8 +379,8 @@ function poolEnvValues(port) {
 // Point settings.json's env at the pool on <port>. Shared by `up` and `restart`
 // so a restart keeps the override in sync with `up` rather than drifting.
 // `paths` is injectable for tests.
-export function reapplyPoolEnv(port, paths, pins = {}) {
-  applyPoolEnv({ ...poolEnvValues(port), pins }, paths);
+export function reapplyPoolEnv(port, paths, derived = {}) {
+  applyPoolEnv({ ...poolEnvValues(port), ...derived }, paths);
 }
 
 // The running pool's live catalog (Anthropic's GET /v1/models via the pool), or
@@ -405,9 +405,12 @@ async function liveCatalog(port) {
 // nothing is pinned and the cached row is left as it is.
 export async function catalogSync(port) {
   const models = await liveCatalog(port);
-  if (!models) return { pins: {} };
+  if (!models) return { pins: {}, maxContextTokens: null };
   refreshCachedFableRowFile(models);
-  return { pins: sonnetPinFromCatalog(models) };
+  return {
+    pins: sonnetPinFromCatalog(models),
+    maxContextTokens: codexDefaultContextFromCatalog(models)
+  };
 }
 
 export async function poolUp() {
@@ -420,7 +423,7 @@ export async function poolUp() {
     return 0;
   }
   await ensureServer(bun, port, baseUrl);
-  reapplyPoolEnv(port, undefined, (await catalogSync(port)).pins);
+  reapplyPoolEnv(port, undefined, await catalogSync(port));
   printStatus(await fetchStatus(port), baseUrl);
   console.log('  ' + C.green('Pool is now the backend for all Claude Code sessions') + C.dim(' (agents included).'));
   console.log('  ' + C.dim('Stop it with ') + 'bro pool down');
@@ -456,7 +459,7 @@ export async function poolRestart() {
     console.log('Pool server not running — starting it.');
   }
   await ensureServer(bun, port, baseUrl);
-  reapplyPoolEnv(port, undefined, (await catalogSync(port)).pins);
+  reapplyPoolEnv(port, undefined, await catalogSync(port));
   printStatus(await fetchStatus(port), baseUrl);
   console.log('  ' + C.green('Pool restarted.') + '\n');
   return 0;
@@ -523,7 +526,8 @@ export async function runPool({ extraArgs = [], permissionMode = 'auto', dryRun 
   const { baseUrl: b, token } = poolEnvValues(port);
 
   if (dryRun) {
-    const { pins } = await catalogSync(port);
+    const derived = await catalogSync(port);
+    const settingsEnv = poolEnvBlock({ baseUrl: b, token, ...derived });
     return {
       via: 'multiple-account pool',
       poolServer: `bun run ${POOL_ENTRY} serve`,
@@ -531,11 +535,11 @@ export async function runPool({ extraArgs = [], permissionMode = 'auto', dryRun 
       backend: process.env.CLAUDE_POOL_BACKEND || 'oauth',
       baseUrl,
       accounts: listAccounts(),
-      settingsEnv: poolEnvBlock({ baseUrl: b, token, pins }),
+      settingsEnv,
       claude: {
         cmd: which('claude') || 'claude',
         args: [...permissionArgs(permissionMode), ...extraArgs],
-        env: poolEnvBlock({ baseUrl, token, pins })
+        env: settingsEnv
       }
     };
   }
@@ -552,8 +556,8 @@ export async function runPool({ extraArgs = [], permissionMode = 'auto', dryRun 
   // 2) Bring the (persistent) server up and make the pool the backend for every
   //    Claude Code session, including agents started from the agents view.
   await ensureServer(bun, port, baseUrl);
-  const { pins } = await catalogSync(port);
-  applyPoolEnv({ baseUrl: b, token, pins });
+  const derived = await catalogSync(port);
+  reapplyPoolEnv(port, undefined, derived);
 
   // 3) Flash the live status, then launch. Hold ~1.5s; enter launches now,
   //    any other key pauses so you can read it, esc cancels.
@@ -585,7 +589,8 @@ export async function runPool({ extraArgs = [], permissionMode = 'auto', dryRun 
   // Model pins exported by an earlier bro (e.g. inherited from a shell it
   // launched) are dropped for the same reason; a pin the user set stays.
   scrubLegacyPins(env);
-  Object.assign(env, poolEnvBlock({ baseUrl: b, token, pins }));
+  scrubManagedContext(env);
+  Object.assign(env, poolEnvBlock({ baseUrl: b, token, ...derived }));
   env.NODE_NO_WARNINGS = '1';
 
   const claudeArgs = [...permissionArgs(permissionMode), ...extraArgs];

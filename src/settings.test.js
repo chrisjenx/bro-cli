@@ -13,7 +13,9 @@ import {
   sonnetPinFromCatalog,
   refreshCachedFableRow,
   refreshCachedFableRowFile,
-  RETIRED_POOL_ENV_KEYS
+  RETIRED_POOL_ENV_KEYS,
+  codexDefaultContextFromCatalog,
+  scrubManagedContext
 } from './settings.js';
 
 function tmpPaths() {
@@ -100,16 +102,129 @@ test('apply adds env keys and preserves other settings', () => {
   assert.equal(isPoolEnvActive(p), true);
 });
 
+test('codexDefaultContextFromCatalog takes the safest valid unsuffixed default', () => {
+  const models = [
+    { id: 'claude-sonnet-5', owned_by: 'anthropic-claude-max-pool', context_window: 1000000 },
+    { id: 'gpt-5.6-sol[1m]', owned_by: 'openai-chatgpt-pool', context_window: 272000, max_context_window: 872000 },
+    { id: 'gpt-5.5', owned_by: 'openai-chatgpt-pool', context_window: 272000, max_context_window: 272000 },
+    { id: 'broken', owned_by: 'openai-chatgpt-pool', context_window: -1 },
+  ];
+  assert.equal(codexDefaultContextFromCatalog(models), 272000);
+  assert.equal(codexDefaultContextFromCatalog([{ id: 'claude', owned_by: 'anthropic-claude-max-pool', context_window: 200000 }]), null);
+  assert.equal(codexDefaultContextFromCatalog(null), null);
+});
+
+test('poolEnvBlock writes only the max-context fallback, never global auto-compact', () => {
+  const env = poolEnvBlock({ ...POOL, maxContextTokens: 272000 });
+  assert.equal(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '272000');
+  assert.equal(env.BRO_POOL_MANAGED_MAX_CONTEXT_TOKENS, '272000');
+  assert.ok(!('CLAUDE_CODE_AUTO_COMPACT_WINDOW' in env));
+  assert.deepEqual(poolEnvBlock(POOL), {
+    ANTHROPIC_BASE_URL: POOL.baseUrl,
+    ANTHROPIC_AUTH_TOKEN: POOL.token,
+  });
+});
+
+test('scrubManagedContext removes only an inherited value proven to be bro-managed', () => {
+  const managed = {
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS: '272000',
+    BRO_POOL_MANAGED_MAX_CONTEXT_TOKENS: '272000',
+  };
+  assert.deepEqual(scrubManagedContext(managed), {});
+
+  const overridden = {
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS: '333000',
+    BRO_POOL_MANAGED_MAX_CONTEXT_TOKENS: '272000',
+  };
+  assert.deepEqual(scrubManagedContext(overridden), { CLAUDE_CODE_MAX_CONTEXT_TOKENS: '333000' });
+});
+
 // Claude Code renders its own picker rows behind the gateway (current Opus,
 // Sonnet, Fable, Haiku, with the 1M variants). Pinning ANTHROPIC_DEFAULT_*_MODEL
 // meant a bro release for every model release, so bro no longer touches them.
-test('apply sets only the base URL and token unless catalog-derived pins are given', () => {
+test('apply sets only the base URL and token unless catalog-derived context or pins are given', () => {
   const p = tmpPaths();
   applyPoolEnv(POOL, p);
   const { env } = read(p.settings);
   assert.deepEqual(Object.keys(env).sort(), ['ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL']);
   assert.deepEqual(poolEnvBlock(POOL), { ANTHROPIC_BASE_URL: POOL.baseUrl, ANTHROPIC_AUTH_TOKEN: POOL.token });
-  for (const k of RETIRED_POOL_ENV_KEYS) assert.match(k, /^ANTHROPIC_DEFAULT_/);
+  assert.ok(RETIRED_POOL_ENV_KEYS.includes('CLAUDE_CODE_AUTO_COMPACT_WINDOW'));
+});
+
+test('apply and clear restore user context settings exactly', () => {
+  const p = tmpPaths();
+  fs.writeFileSync(p.settings, JSON.stringify({ env: {
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS: '333000',
+    CLAUDE_CODE_AUTO_COMPACT_WINDOW: '222000',
+  } }));
+  applyPoolEnv({ ...POOL, maxContextTokens: 272000 }, p);
+  const active = read(p.settings).env;
+  assert.equal(active.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '272000');
+  assert.equal(active.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '222000');
+  clearPoolEnv(p);
+  assert.deepEqual(read(p.settings).env, {
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS: '333000',
+    CLAUDE_CODE_AUTO_COMPACT_WINDOW: '222000',
+  });
+});
+
+test('an apply without catalog context removes bro fallback but preserves the user snapshot', () => {
+  const p = tmpPaths();
+  fs.writeFileSync(p.settings, JSON.stringify({ env: { CLAUDE_CODE_MAX_CONTEXT_TOKENS: '333000' } }));
+  applyPoolEnv({ ...POOL, maxContextTokens: 272000 }, p);
+  applyPoolEnv(POOL, p);
+  assert.equal(read(p.settings).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '333000');
+  clearPoolEnv(p);
+  assert.equal(read(p.settings).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '333000');
+});
+
+test('apply retires an old pool auto-compact value using its existing snapshot', () => {
+  const p = tmpPaths();
+  fs.writeFileSync(p.settings, JSON.stringify({ env: {
+    ANTHROPIC_BASE_URL: POOL.baseUrl,
+    ANTHROPIC_AUTH_TOKEN: POOL.token,
+    CLAUDE_CODE_AUTO_COMPACT_WINDOW: '272000',
+  } }));
+  fs.writeFileSync(p.state, JSON.stringify({ managed: true, prior: {
+    ANTHROPIC_BASE_URL: null,
+    ANTHROPIC_AUTH_TOKEN: null,
+    CLAUDE_CODE_AUTO_COMPACT_WINDOW: null,
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS: null,
+  } }));
+  applyPoolEnv({ ...POOL, maxContextTokens: 272000 }, p);
+  assert.ok(!('CLAUDE_CODE_AUTO_COMPACT_WINDOW' in read(p.settings).env));
+});
+
+test('an older snapshot backfills the new max-context key before overwrite', () => {
+  const p = tmpPaths();
+  fs.writeFileSync(p.settings, JSON.stringify({ env: {
+    ANTHROPIC_BASE_URL: POOL.baseUrl,
+    ANTHROPIC_AUTH_TOKEN: POOL.token,
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS: '333000',
+  } }));
+  fs.writeFileSync(p.state, JSON.stringify({ managed: true, prior: {
+    ANTHROPIC_BASE_URL: null,
+    ANTHROPIC_AUTH_TOKEN: null,
+  } }));
+  applyPoolEnv({ ...POOL, maxContextTokens: 272000 }, p);
+  assert.equal(read(p.state).prior.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '333000');
+  clearPoolEnv(p);
+  assert.equal(read(p.settings).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '333000');
+});
+
+test('clear preserves user max context absent from a legacy managed snapshot', () => {
+  const p = tmpPaths();
+  fs.writeFileSync(p.settings, JSON.stringify({ env: {
+    ANTHROPIC_BASE_URL: POOL.baseUrl,
+    ANTHROPIC_AUTH_TOKEN: POOL.token,
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS: '333000',
+  } }));
+  fs.writeFileSync(p.state, JSON.stringify({ managed: true, prior: {
+    ANTHROPIC_BASE_URL: null,
+    ANTHROPIC_AUTH_TOKEN: null,
+  } }));
+  clearPoolEnv(p);
+  assert.deepEqual(read(p.settings).env, { CLAUDE_CODE_MAX_CONTEXT_TOKENS: '333000' });
 });
 
 // An earlier bro wrote the pins into settings.json; re-applying must scrub them
@@ -219,8 +334,9 @@ test('clear is a no-op when nothing is managed', () => {
 
 test('apply creates settings.json when absent, clear removes empty env', () => {
   const p = tmpPaths();
-  applyPoolEnv(POOL, p);
+  applyPoolEnv({ ...POOL, maxContextTokens: 272000 }, p);
   assert.equal(read(p.settings).env.ANTHROPIC_BASE_URL, POOL.baseUrl);
+  assert.equal(read(p.settings).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '272000');
   clearPoolEnv(p);
   const s = read(p.settings);
   assert.ok(!('env' in s)); // empty env removed

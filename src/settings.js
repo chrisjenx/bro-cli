@@ -9,7 +9,14 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 
 // Keys bro writes today: just enough to point Claude Code at the pool.
-const ACTIVE_KEYS = ['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN'];
+const MANAGED_CONTEXT_MARKER = 'BRO_POOL_MANAGED_MAX_CONTEXT_TOKENS';
+
+const ACTIVE_KEYS = [
+  'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_AUTH_TOKEN',
+  'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
+  MANAGED_CONTEXT_MARKER
+];
 
 // Model-pin keys. Written only when derived from the live catalog at apply time
 // (sonnetPinFromCatalog — see there for why Sonnet is pinned and Fable is not);
@@ -24,19 +31,37 @@ export const RETIRED_POOL_ENV_KEYS = [
   'ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION',
   'ANTHROPIC_DEFAULT_FABLE_MODEL',
   'ANTHROPIC_DEFAULT_FABLE_MODEL_NAME',
-  'ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION'
+  'ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION',
+  'CLAUDE_CODE_AUTO_COMPACT_WINDOW'
 ];
 
 const POOL_ENV_KEYS = [...ACTIVE_KEYS, ...RETIRED_POOL_ENV_KEYS];
 
 // The full settings.json `env` mutation, in one place so applyPoolEnv, the
 // `bro pool` launch env and `--dry-run`'s report can't drift apart.
-export function poolEnvBlock({ baseUrl, token, pins = {} }) {
-  return {
+export function poolEnvBlock({ baseUrl, token, pins = {}, maxContextTokens = null }) {
+  const env = {
     ANTHROPIC_BASE_URL: baseUrl,
     ANTHROPIC_AUTH_TOKEN: token,
     ...pins
   };
+  if (Number.isInteger(maxContextTokens) && maxContextTokens > 0) {
+    const value = String(maxContextTokens);
+    env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = value;
+    env[MANAGED_CONTEXT_MARKER] = value;
+  }
+  return env;
+}
+
+// A marker carrying the exact bro-written value lets nested `bro` launches
+// discard inherited pool context without clobbering a user's own export.
+export function scrubManagedContext(env) {
+  const managedValue = env[MANAGED_CONTEXT_MARKER];
+  if (managedValue !== undefined && env.CLAUDE_CODE_MAX_CONTEXT_TOKENS === managedValue) {
+    delete env.CLAUDE_CODE_MAX_CONTEXT_TOKENS;
+  }
+  delete env[MANAGED_CONTEXT_MARKER];
+  return env;
 }
 
 // Claude Code's Fable picker row is not built in: it is `additionalModelOptionsCache`
@@ -59,6 +84,16 @@ export function newestOfFamily(models, family) {
 
 export function newestFable(models) {
   return newestOfFamily(models, 'fable');
+}
+
+const CODEX_OWNER = 'openai-chatgpt-pool';
+
+export function codexDefaultContextFromCatalog(models) {
+  const windows = (Array.isArray(models) ? models : [])
+    .filter((m) => m?.owned_by === CODEX_OWNER)
+    .map((m) => m.context_window)
+    .filter((n) => Number.isInteger(n) && n > 0);
+  return windows.length ? Math.min(...windows) : null;
 }
 
 // Sonnet's picker row IS built in, and behind the pool (token auth) Claude Code
@@ -203,6 +238,7 @@ function writeJson(file, obj) {
 
 function restoreKeys(env, prior, keys) {
   for (const k of keys) {
+    if (!(k in prior)) continue;
     if (prior[k] === null || prior[k] === undefined) delete env[k];
     else env[k] = prior[k];
   }
@@ -210,7 +246,7 @@ function restoreKeys(env, prior, keys) {
 
 // Point settings.json's env at the pool. Snapshots prior values once (so repeat
 // calls don't clobber the original snapshot) and preserves all other settings.
-export function applyPoolEnv({ baseUrl, token, pins = {} }, paths = defaultPaths()) {
+export function applyPoolEnv({ baseUrl, token, pins = {}, maxContextTokens = null }, paths = defaultPaths()) {
   const settings = readJson(paths.settings) || {};
   const env = { ...(settings.env || {}) };
 
@@ -238,10 +274,10 @@ export function applyPoolEnv({ baseUrl, token, pins = {} }, paths = defaultPaths
     if (changed) writeJson(paths.state, { ...state, prior });
   }
 
-  // Retired keys revert to the user's snapshot (null → removed), so pins an
-  // earlier bro wrote disappear here.
-  restoreKeys(env, prior, RETIRED_POOL_ENV_KEYS);
-  settings.env = { ...env, ...poolEnvBlock({ baseUrl, token, pins }) };
+  const nextEnv = { ...env };
+  restoreKeys(nextEnv, prior, POOL_ENV_KEYS);
+  Object.assign(nextEnv, poolEnvBlock({ baseUrl, token, pins, maxContextTokens }));
+  settings.env = nextEnv;
   writeJson(paths.settings, settings);
 }
 

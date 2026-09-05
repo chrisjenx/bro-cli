@@ -14,6 +14,11 @@ export type CodexEffort = (typeof CODEX_EFFORTS)[number];
 
 export type EffortMap = Partial<Record<SourceEffortTier, CodexEffort>>;
 
+/** Smallest verified Codex input/history ceiling that represents its opt-in
+ * 1M total-budget mode. Claude Code has no arbitrary per-model custom-window
+ * marker, but it does recognize a trailing `[1m]`. */
+export const CODEX_EXTENDED_CONTEXT_MIN = 872_000;
+
 /** Membership guards — the single source of truth for tier validation, so the
  * rule can only change in one place (mirrors isValidPriority/isValidWeight). */
 export function isSourceEffortTier(v: unknown): v is SourceEffortTier {
@@ -27,23 +32,47 @@ export interface ModelRoute {
   id: string;
   provider: Provider;
   upstreamModel: string;
-  /** Attached at request time for mapped routes; never persisted. */
+  /** Codex's normal active input/history window, in tokens. */
+  contextWindow?: number;
+  /** Largest input/history window the Codex subscription backend permits. */
+  maxContextWindow?: number;
+  /** Per-route effort overrides; mapped routes attach this at request time. */
   effortMap?: EffortMap;
 }
 
+const CODEX_DEFAULT_CONTEXT_WINDOW = 272_000;
+const EXTENDED_CONTEXT_SELECTOR = /\[1m\]$/i;
+
+export function modelSelectorId(route: ModelRoute): string {
+  const extended =
+    route.provider === "openai" &&
+    (route.maxContextWindow ?? 0) >= CODEX_EXTENDED_CONTEXT_MIN;
+  return extended && !EXTENDED_CONTEXT_SELECTOR.test(route.id) ? `${route.id}[1m]` : route.id;
+}
+
 const claude = (id: string): ModelRoute => ({ id, provider: "anthropic", upstreamModel: id });
-const openai = (id: string): ModelRoute => ({ id, provider: "openai", upstreamModel: id });
+const openai = (id: string, maxContextWindow: number, upstreamModel = id): ModelRoute => ({
+  id,
+  provider: "openai",
+  upstreamModel,
+  contextWindow: CODEX_DEFAULT_CONTEXT_WINDOW,
+  maxContextWindow,
+});
 
 export const DEFAULT_MODEL_TABLE: ModelRoute[] = [
   claude("opus"), claude("sonnet"), claude("haiku"), claude("fable"),
   claude("claude-opus-5"), claude("claude-opus-4-8"),
   claude("claude-sonnet-5"), claude("claude-haiku-4-5"),
   claude("claude-fable-5"), claude("claude-fable-5-1"),
-  // GPT-5.6 tiers per codex-rs models-manager/models.json: sol (flagship),
-  // terra (mid), luna (fast/cheap); bare "gpt-5.6" is a family alias for sol.
-  openai("gpt-5.6-sol"), openai("gpt-5.6-terra"), openai("gpt-5.6-luna"),
-  { id: "gpt-5.6", provider: "openai", upstreamModel: "gpt-5.6-sol" },
-  openai("gpt-5.5"), openai("gpt-5.4"), openai("gpt-5.4-mini"),
+  // Authenticated Codex catalog values checked 2026-09-04. GPT-5.6's 872K
+  // maximum is its input/history side of the opt-in 1M total budget.
+  openai("gpt-5.6-sol", 872_000),
+  openai("gpt-5.6-terra", 872_000),
+  openai("gpt-5.6-luna", 872_000),
+  openai("gpt-5.6", 872_000, "gpt-5.6-sol"),
+  openai("gpt-5.5", 272_000),
+  openai("gpt-5.4", 1_000_000),
+  openai("gpt-5.4-mini", 272_000),
 ];
 
 /** Bundled full-id duplicates of the family aliases (e.g. `claude-sonnet-5`
@@ -76,11 +105,47 @@ function parseModelsFile(modelsFile: string): Record<string, unknown> | null {
   }
 }
 
+function positiveInteger(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isInteger(v) && v > 0 ? v : undefined;
+}
+
+function sanitizeEffortMap(value: unknown): EffortMap | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const effort: EffortMap = {};
+  for (const [tier, mapped] of Object.entries(value)) {
+    if (isSourceEffortTier(tier) && isCodexEffort(mapped)) effort[tier] = mapped;
+  }
+  return Object.keys(effort).length ? effort : undefined;
+}
+
+function normalizeModelRoute(m: ModelRoute): ModelRoute {
+  const out: ModelRoute = { id: m.id, provider: m.provider, upstreamModel: m.upstreamModel };
+  const contextWindow = positiveInteger(m.contextWindow);
+  const maxContextWindow = positiveInteger(m.maxContextWindow);
+  const effortMap = sanitizeEffortMap(m.effortMap);
+  const contradictoryContext =
+    contextWindow !== undefined &&
+    maxContextWindow !== undefined &&
+    contextWindow > maxContextWindow;
+  if (!contradictoryContext && contextWindow !== undefined) out.contextWindow = contextWindow;
+  if (!contradictoryContext && maxContextWindow !== undefined) out.maxContextWindow = maxContextWindow;
+  if (effortMap !== undefined) out.effortMap = effortMap;
+  return out;
+}
+
 /** Merges on-disk model routes over the bundled defaults (on-disk ids shadow). */
 function mergeModelTable(parsed: Record<string, unknown> | null): ModelRoute[] {
-  const fromFile = Array.isArray(parsed?.models) ? parsed!.models.filter(isModelRoute) : [];
-  const ids = new Set(fromFile.map((m) => m.id));
-  return [...DEFAULT_MODEL_TABLE.filter((m) => !ids.has(m.id)), ...fromFile];
+  const fromFile = Array.isArray(parsed?.models)
+    ? parsed.models.filter(isModelRoute).map(normalizeModelRoute)
+    : [];
+  const defaults = new Map(DEFAULT_MODEL_TABLE.map((m) => [m.id, m]));
+  const merged = fromFile.map((route) => {
+    const bundled = defaults.get(route.id);
+    const sameTarget = bundled?.provider === route.provider && bundled.upstreamModel === route.upstreamModel;
+    return sameTarget ? { ...bundled, ...route } : route;
+  });
+  const ids = new Set(merged.map((m) => m.id));
+  return [...DEFAULT_MODEL_TABLE.filter((m) => !ids.has(m.id)), ...merged];
 }
 
 export function loadModelTable(modelsFile: string): ModelRoute[] {
@@ -92,10 +157,12 @@ export function saveModelTable(modelsFile: string, models: ModelRoute[]): void {
 }
 
 export function resolveModel(table: ModelRoute[], modelId: string): ModelRoute {
-  return (
-    table.find((m) => m.id === modelId) ??
-    { id: modelId, provider: "anthropic", upstreamModel: modelId }
-  );
+  const exact = table.find((m) => m.id === modelId);
+  if (exact) return exact;
+  const bareId = modelId.replace(EXTENDED_CONTEXT_SELECTOR, "");
+  const marked = bareId === modelId ? undefined : table.find((m) => m.id === bareId);
+  if (marked) return { ...marked, id: modelId };
+  return { id: modelId, provider: "anthropic", upstreamModel: modelId };
 }
 
 /** Mapped openai route for a Claude-family request, or null when mapping is
@@ -109,17 +176,14 @@ export function mappingFor(cfg: ModelConfig, modelId: string): ModelRoute | null
   if (!row || row.to === row.from) return null;
   const target = resolveModel(cfg.models, row.to);
   if (target.provider !== "openai") return null;
-  return { id: modelId, provider: "openai", upstreamModel: target.upstreamModel, effortMap: row.effort };
+  return { ...target, id: modelId, effortMap: row.effort };
 }
 
 /**
- * Refreshes the `openai` entries in `table` from an authenticated OpenAI
- * (ChatGPT-subscription) account, if one exists. There is no documented Codex
- * Responses-API model-listing endpoint in the open-source Codex CLI (verified
- * during Task 1/8 research — codex-rs has no `GET .../models` call in its
- * client), so this currently keeps the existing `openai` entries unchanged and
- * prints a notice; it's structured so a real endpoint can be wired in later
- * without changing the `models update` CLI contract.
+ * Keeps configured OpenAI routes unchanged when `models update` runs. ChatGPT's
+ * authenticated Codex service now has an internal model catalog, but it is not
+ * a stable public API; wiring live synchronization is intentionally separate
+ * from the CLI contract and bundled context metadata in this file.
  */
 export async function updateOpenAIModels(mgr: AccountManager, table: ModelRoute[]): Promise<ModelRoute[]> {
   const names = mgr.listNames().filter((n) => mgr.providerFor(n) === "openai");
@@ -211,12 +275,8 @@ export function isModelMapping(v: unknown): v is ModelMapping {
 
 /** Drops effort entries whose key/value aren't recognized tiers. */
 function sanitizeMapping(m: ModelMapping): ModelMapping {
-  if (!m.effort || typeof m.effort !== "object") return { from: m.from, to: m.to };
-  const effort: EffortMap = {};
-  for (const [k, val] of Object.entries(m.effort)) {
-    if (isSourceEffortTier(k) && isCodexEffort(val)) effort[k] = val;
-  }
-  return Object.keys(effort).length ? { from: m.from, to: m.to, effort } : { from: m.from, to: m.to };
+  const effort = sanitizeEffortMap(m.effort);
+  return effort ? { from: m.from, to: m.to, effort } : { from: m.from, to: m.to };
 }
 
 function isModelRoute(v: unknown): v is ModelRoute {

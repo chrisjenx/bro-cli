@@ -38,7 +38,13 @@ function deps(over: Partial<LiveModelsDeps> & { calls?: { n: number; headers?: R
 const TABLE: ModelRoute[] = [
   { id: "opus", provider: "anthropic", upstreamModel: "opus" },
   { id: "claude-opus-5", provider: "anthropic", upstreamModel: "claude-opus-5" },
-  { id: "gpt-5.6-sol", provider: "openai", upstreamModel: "gpt-5.6-sol" },
+  {
+    id: "gpt-5.6-sol",
+    provider: "openai",
+    upstreamModel: "gpt-5.6-sol",
+    contextWindow: 272_000,
+    maxContextWindow: 872_000,
+  },
 ];
 
 beforeEach(resetModelsCache);
@@ -94,7 +100,7 @@ test("returns null with nothing cached when there is no token or upstream is dow
 test("buildModelListing lists live Claude entries, then unlisted table routes, then OpenAI", () => {
   const live = [{ id: "claude-opus-5", object: "model" as const, created: 0, owned_by: ANTHROPIC_OWNER }];
   // `opus` (alias) still routes so it stays listed; `claude-opus-5` is not duplicated.
-  expect(buildModelListing(live, TABLE).map((m) => m.id)).toEqual(["claude-opus-5", "opus", "gpt-5.6-sol"]);
+  expect(buildModelListing(live, TABLE).map((m) => m.id)).toEqual(["claude-opus-5", "opus", "gpt-5.6-sol[1m]"]);
   expect(buildModelListing(live, TABLE)[2]?.owned_by).toBe(OPENAI_OWNER);
 });
 
@@ -117,5 +123,70 @@ test("concurrent cold-cache requests share one upstream call", async () => {
 });
 
 test("buildModelListing falls back to the table's Claude entries without a live list", () => {
-  expect(buildModelListing(null, TABLE).map((m) => m.id)).toEqual(["opus", "claude-opus-5", "gpt-5.6-sol"]);
+  expect(buildModelListing(null, TABLE).map((m) => m.id)).toEqual(["opus", "claude-opus-5", "gpt-5.6-sol[1m]"]);
+});
+
+test("Codex routes expose one model-aware selector and private context metadata", () => {
+  const table: ModelRoute[] = [
+    { id: "gpt-5.6-sol", provider: "openai", upstreamModel: "gpt-5.6-sol", contextWindow: 272_000, maxContextWindow: 872_000 },
+    { id: "gpt-5.5", provider: "openai", upstreamModel: "gpt-5.5", contextWindow: 272_000, maxContextWindow: 272_000 },
+    { id: "gpt-5.4", provider: "openai", upstreamModel: "gpt-5.4", contextWindow: 272_000, maxContextWindow: 1_000_000 },
+    { id: "gpt-5.4-mini", provider: "openai", upstreamModel: "gpt-5.4-mini", contextWindow: 272_000, maxContextWindow: 272_000 },
+  ];
+  const listed = buildModelListing(null, table);
+  expect(listed.map((m) => m.id)).toEqual([
+    "gpt-5.6-sol[1m]",
+    "gpt-5.5",
+    "gpt-5.4[1m]",
+    "gpt-5.4-mini",
+  ]);
+  expect(listed[0]).toMatchObject({
+    owned_by: OPENAI_OWNER,
+    context_window: 272_000,
+    max_context_window: 872_000,
+  });
+  expect(listed[0]).not.toHaveProperty("max_input_tokens");
+});
+
+test("an already marked custom route is not marked twice", () => {
+  const table: ModelRoute[] = [
+    { id: "custom[1m]", provider: "openai", upstreamModel: "custom", contextWindow: 272_000, maxContextWindow: 1_000_000 },
+  ];
+  expect(buildModelListing(null, table).map((m) => m.id)).toEqual(["custom[1m]"]);
+});
+
+test("an explicit configured selector wins a synthesized selector collision", () => {
+  const table: ModelRoute[] = [
+    { id: "custom", provider: "openai", upstreamModel: "custom-extended", contextWindow: 272_000, maxContextWindow: 1_000_000 },
+    { id: "custom[1m]", provider: "openai", upstreamModel: "custom-public", contextWindow: 128_000, maxContextWindow: 272_000 },
+  ];
+  const listed = buildModelListing(null, table);
+  expect(listed.map((m) => m.id)).toEqual(["custom[1m]"]);
+  expect(listed[0]).toMatchObject({
+    context_window: 128_000,
+    max_context_window: 272_000,
+  });
+});
+
+test("a configured Codex selector replaces colliding live Anthropic route and selector ids", () => {
+  const live = [
+    { id: "custom", object: "model" as const, created: 0, owned_by: ANTHROPIC_OWNER },
+    { id: "custom[1m]", object: "model" as const, created: 0, owned_by: ANTHROPIC_OWNER },
+  ];
+  const table: ModelRoute[] = [
+    { id: "custom", provider: "openai", upstreamModel: "custom", contextWindow: 272_000, maxContextWindow: 1_000_000 },
+  ];
+  expect(buildModelListing(live, table)).toEqual([
+    expect.objectContaining({ id: "custom[1m]", owned_by: OPENAI_OWNER }),
+  ]);
+});
+
+test("an exact configured Codex selector replaces a colliding live Anthropic selector", () => {
+  const live = [{ id: "custom[1m]", object: "model" as const, created: 0, owned_by: ANTHROPIC_OWNER }];
+  const table: ModelRoute[] = [
+    { id: "custom[1m]", provider: "openai", upstreamModel: "custom", contextWindow: 128_000, maxContextWindow: 272_000 },
+  ];
+  expect(buildModelListing(live, table)).toEqual([
+    expect.objectContaining({ id: "custom[1m]", owned_by: OPENAI_OWNER, context_window: 128_000 }),
+  ]);
 });

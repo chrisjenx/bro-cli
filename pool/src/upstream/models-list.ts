@@ -4,13 +4,13 @@
  * Anthropic's GET /v1/models accepts the same Claude Code OAuth token the pool
  * already holds for each account, so the Claude side of the listing is read
  * from upstream instead of a hand-maintained table — a new Claude model shows
- * up without a pool release. OpenAI/Codex has no documented list endpoint
- * (see updateOpenAIModels), so those entries still come from the routing table.
+ * up without a pool release. Codex rows come from the configured routing table
+ * because the authenticated catalog is not a stable public synchronization contract.
  *
  * Failures never surface to the caller: the last good upstream list is reused,
  * and with nothing cached the bundled table's Claude entries stand in.
  */
-import type { ModelRoute } from "../models.ts";
+import { modelSelectorId, type ModelRoute } from "../models.ts";
 import { anthropicUrl, asObject, numberProp, oauthHeaders, parseJson, stringProp } from "./shared.ts";
 
 export interface ModelListEntry {
@@ -20,6 +20,9 @@ export interface ModelListEntry {
   owned_by: string;
   display_name?: string;
   max_input_tokens?: number;
+  /** Pool-private Codex metadata consumed by bro's catalog sync. */
+  context_window?: number;
+  max_context_window?: number;
 }
 
 export const ANTHROPIC_OWNER = "anthropic-claude-max-pool";
@@ -109,6 +112,20 @@ async function fetchLive(deps: LiveModelsDeps): Promise<ModelListEntry[] | null>
   return models.length ? models : null;
 }
 
+function tableEntry(route: ModelRoute): ModelListEntry {
+  const entry: ModelListEntry = {
+    id: modelSelectorId(route),
+    object: "model",
+    created: 0,
+    owned_by: route.provider === "openai" ? OPENAI_OWNER : ANTHROPIC_OWNER,
+  };
+  if (route.provider === "openai") {
+    if (route.contextWindow !== undefined) entry.context_window = route.contextWindow;
+    if (route.maxContextWindow !== undefined) entry.max_context_window = route.maxContextWindow;
+  }
+  return entry;
+}
+
 /**
  * The /v1/models payload: live Claude entries first, then the table's Claude
  * entries not already listed (the opus/sonnet/haiku/fable aliases and any
@@ -117,17 +134,28 @@ async function fetchLive(deps: LiveModelsDeps): Promise<ModelListEntry[] | null>
  */
 export function buildModelListing(live: ModelListEntry[] | null, table: ModelRoute[]): ModelListEntry[] {
   const seen = new Set((live ?? []).map((m) => m.id));
-  const rest = table
-    .filter((m) => !seen.has(m.id))
-    .map((m) => ({
-      id: m.id,
-      object: "model" as const,
-      created: 0,
-      owned_by: m.provider === "openai" ? OPENAI_OWNER : ANTHROPIC_OWNER,
-      // Claude rows before OpenAI rows, matching the live-first ordering.
-      _k: m.provider === "openai" ? 1 : 0,
-    }))
-    .sort((x, y) => x._k - y._k)
-    .map(({ _k, ...m }) => m);
-  return [...(live ?? []), ...rest];
+  // Configured OpenAI routes must survive a live-id collision: request routing
+  // gives an exact configured route precedence, so discovery must agree.
+  const routes = table.filter((route) => route.provider === "openai" || !seen.has(route.id));
+  const exactIds = new Set(
+    routes.filter((route) => route.id === modelSelectorId(route)).map((route) => route.id),
+  );
+  const listedIds = new Set<string>();
+  const rest: ModelListEntry[] = [];
+  // Preserve table order within each provider while keeping Claude rows first.
+  for (const provider of ["anthropic", "openai"] as const) {
+    for (const route of routes) {
+      if (route.provider !== provider) continue;
+      const id = modelSelectorId(route);
+      if (exactIds.has(id) && route.id !== id) continue;
+      if (listedIds.has(id)) continue;
+      listedIds.add(id);
+      rest.push(tableEntry(route));
+    }
+  }
+  const configuredOpenAIIds = new Set(table.filter((route) => route.provider === "openai").map((route) => route.id));
+  return [
+    ...(live ?? []).filter((entry) => !listedIds.has(entry.id) && !configuredOpenAIIds.has(entry.id)),
+    ...rest,
+  ];
 }

@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { waitForExit, reapplyPoolEnv, POOL_SUBCOMMANDS, runPoolCommand } from './pool.js';
+import { waitForExit, reapplyPoolEnv, catalogSync, POOL_SUBCOMMANDS, runPoolCommand } from './pool.js';
 
 test('waitForExit resolves true once the process exits', async () => {
   const child = spawn('sleep', ['0.3']);
@@ -44,6 +44,7 @@ test('reapplyPoolEnv writes the pool env and nothing else', () => {
   const { env } = JSON.parse(fs.readFileSync(paths.settings, 'utf8'));
   assert.equal(env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:4321');
   assert.ok(!Object.keys(env).some((k) => k.startsWith('ANTHROPIC_DEFAULT_')), Object.keys(env).join());
+  assert.ok(!('CLAUDE_CODE_MAX_CONTEXT_TOKENS' in env));
 });
 
 // `start`/`stop` are the verbs people reach for once `restart` exists. They used
@@ -63,8 +64,42 @@ test('an unknown pool subcommand still fails instead of silently doing nothing',
 test('reapplyPoolEnv writes catalog-derived pins alongside the pool env', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bro-pool-pins-'));
   const paths = { settings: path.join(dir, 'settings.json'), state: path.join(dir, 'pool-settings.json') };
-  reapplyPoolEnv(4321, paths, { ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-5[1m]', ANTHROPIC_DEFAULT_SONNET_MODEL_NAME: 'Sonnet' });
+  reapplyPoolEnv(4321, paths, { pins: { ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-5[1m]', ANTHROPIC_DEFAULT_SONNET_MODEL_NAME: 'Sonnet' } });
   const { env } = JSON.parse(fs.readFileSync(paths.settings, 'utf8'));
   assert.equal(env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:4321');
   assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL, 'claude-sonnet-5[1m]');
+});
+
+test('reapplyPoolEnv writes the catalog-derived Codex fallback without auto-compact', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bro-pool-context-'));
+  const paths = {
+    settings: path.join(dir, 'settings.json'),
+    state: path.join(dir, 'pool-settings.json'),
+  };
+  reapplyPoolEnv(4321, paths, { maxContextTokens: 272000 });
+  const { env } = JSON.parse(fs.readFileSync(paths.settings, 'utf8'));
+  assert.equal(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '272000');
+  assert.ok(!('CLAUDE_CODE_AUTO_COMPACT_WINDOW' in env));
+});
+
+test('catalogSync derives pins and the unsuffixed Codex baseline from one listing', async () => {
+  const priorFetch = globalThis.fetch;
+  const priorConfigDir = process.env.CLAUDE_CONFIG_DIR;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bro-pool-catalog-'));
+  process.env.CLAUDE_CONFIG_DIR = dir;
+  globalThis.fetch = async () => new Response(JSON.stringify({ data: [
+    { id: 'claude-sonnet-5', display_name: 'Claude Sonnet 5', created: 2, owned_by: 'anthropic-claude-max-pool' },
+    { id: 'gpt-5.6-sol[1m]', owned_by: 'openai-chatgpt-pool', context_window: 272000, max_context_window: 872000 },
+    { id: 'gpt-5.5', owned_by: 'openai-chatgpt-pool', context_window: 272000, max_context_window: 272000 },
+  ] }));
+  try {
+    const derived = await catalogSync(4321);
+    assert.equal(derived.maxContextTokens, 272000);
+    assert.equal(derived.pins.ANTHROPIC_DEFAULT_SONNET_MODEL, 'claude-sonnet-5[1m]');
+  } finally {
+    globalThis.fetch = priorFetch;
+    if (priorConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = priorConfigDir;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
