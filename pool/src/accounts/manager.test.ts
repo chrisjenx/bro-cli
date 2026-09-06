@@ -12,7 +12,7 @@ function tempPool(
   keychain?: KeychainOps,
   overrides: Partial<Config> = {},
 ): { poolDir: string; mgr: AccountManager } {
-  const poolDir = mkdtempSync(join(tmpdir(), "cmp-manager-"));
+  const poolDir = mkdtempSync(join(process.env.CLAUDE_JOB_DIR ? join(process.env.CLAUDE_JOB_DIR, "tmp") : tmpdir(), "cmp-manager-"));
   const accountsDir = join(poolDir, "accounts");
   for (const name of accountNames) {
     const dir = join(accountsDir, name);
@@ -577,7 +577,7 @@ test("a spent model-scoped (Fable) window sidelines the account for that model o
 });
 
 test("Fable requests route by Fable headroom; other models ignore the Fable window", async () => {
-  const { poolDir, mgr } = tempPool(["fable-hot", "fable-cool"]);
+  const { poolDir, mgr } = tempPool(["fable-hot", "fable-cool"], undefined, { routingStrategy: "headroom" });
   try {
     // fable-hot: barely-used account overall, but its Fable window is nearly spent.
     mgr.recordRateLimitSnapshot(
@@ -1413,7 +1413,7 @@ describe("weighted strategy", () => {
       const a = cands.find((c) => c.account === "a")!;
       const b = cands.find((c) => c.account === "b")!;
       expect(a.weight).toBe(2);
-      expect(b.loadFactor).toBeCloseTo(1 / 1.5, 5);
+      expect(b.loadFactor).toBeCloseTo(1 / 2, 5);
       const t = mgr.getTuning();
       for (const c of cands) {
         expect(c.score).toBeCloseTo(
@@ -1461,8 +1461,7 @@ describe("routing tuning", () => {
     try {
       const t = mgr.getTuning();
       expect(t.fiveHourExp).toBe(1);
-      expect(t.loadSlope).toBe(0.5);
-      expect(t.urgencyDecay).toBe(0.75);
+      expect(t.headroomTaperStart).toBe(0.2);
       expect(t.minHeadroom).toBeCloseTo(0.1, 8);
     } finally {
       rmSync(poolDir, { recursive: true, force: true });
@@ -1473,14 +1472,14 @@ describe("routing tuning", () => {
     const { poolDir, mgr } = weightedPool(["a"]);
     try {
       mgr.setTuning({ fiveHourExp: 2 });
-      mgr.setTuning({ loadSlope: 1 }); // second write within the same fs mtime tick
+      mgr.setTuning({ headroomTaperStart: 1 }); // second write within the same fs mtime tick
       const t = mgr.getTuning();
       expect(t.fiveHourExp).toBe(2);
-      expect(t.loadSlope).toBe(1);
+      expect(t.headroomTaperStart).toBe(1);
       // Persisted to tuning.json in the pool dir.
       const onDisk = JSON.parse(readFileSync(join(poolDir, "tuning.json"), "utf8"));
       expect(onDisk.fiveHourExp).toBe(2);
-      expect(onDisk.loadSlope).toBe(1);
+      expect(onDisk.headroomTaperStart).toBe(1);
     } finally {
       rmSync(poolDir, { recursive: true, force: true });
     }
@@ -1491,7 +1490,7 @@ describe("routing tuning", () => {
     try {
       writeFileSync(join(poolDir, "tuning.json"), JSON.stringify({ urgencyDecay: 99, fiveHourExp: 2 }));
       const t = mgr.getTuning();
-      expect(t.urgencyDecay).toBe(0.75); // 99 > max 5 -> default
+      expect(t.headroomTaperStart).toBe(0.2); // 99 > max 5 -> default
       expect(t.fiveHourExp).toBe(2); // valid -> applied
     } finally {
       rmSync(poolDir, { recursive: true, force: true });
@@ -2122,4 +2121,140 @@ describe("adopting a macOS Keychain login", () => {
       rmSync(poolDir, { recursive: true, force: true });
     }
   });
+});
+
+describe("expiry-share regression", () => {
+  for (const strategy of ["weighted", "expiring"] as const) {
+    for (const used of [0.92, 0.999, 1]) test(`${strategy}: Fable weekly ${used} only excludes true exhaustion`, () => {
+      const { poolDir, mgr } = tempPool(["soon", "later"], undefined, { routingStrategy: strategy });
+      try {
+        const now = Date.now();
+        for (const [name, hours, utilization] of [["soon", 3, used], ["later", 70, 0.2]] as const)
+          mgr.recordRateLimitSnapshot(name, snapshot([win("5h", { utilization: 0, reset: now + 3600000 }), win("7d-fable", { utilization, reset: now + hours * 3600000 })]));
+        expect(mgr.pick(undefined, undefined, "anthropic", "fable")?.name).toBe(used === 1 ? "later" : "soon");
+      } finally { rmSync(poolDir, { recursive: true, force: true }); }
+    });
+  }
+  test("eleven live sessions allocate 5/3/2/1 and preview never advances ties", () => {
+    const { poolDir, mgr } = weightedPool(["a", "b", "c", "d"]);
+    try {
+      const now = Date.now();
+      for (const [i, name] of ["a", "b", "c", "d"].entries()) mgr.recordRateLimitSnapshot(name, snapshot([win("7d", { utilization: 0.1, reset: now + (i + 1) * 3600000 })]));
+      const counts: Record<string, number> = { a: 0, b: 0, c: 0, d: 0 };
+      for (let i = 0; i < 11; i++) {
+        const before = mgr.routingSnapshot();
+        expect(mgr.routingSnapshot()).toEqual(before);
+        const picked = mgr.pick("share-" + i)!;
+        expect(picked.name).toBe(before.nextPick!.account);
+        counts[picked.name]!++;
+      }
+      expect(counts).toEqual({ a: 5, b: 3, c: 2, d: 1 });
+    } finally { rmSync(poolDir, { recursive: true, force: true }); }
+  });
+  test("healthy five-hour quota is neutral; only scarcity tapers", () => {
+    const { poolDir, mgr } = weightedPool(["a"]);
+    try {
+      for (const [headroom, factor] of [[1, 1], [0.5, 1], [0.2, 1], [0.15, 0.75], [0.05, 0.25]]) {
+        mgr.recordRateLimitSnapshot("a", snapshot([win("5h", { utilization: 1 - headroom!, reset: Date.now() + 3600000 })]));
+        expect(mgr.routingSnapshot().candidates![0]!.score).toBeCloseTo(5 * factor!, 8);
+      }
+    } finally { rmSync(poolDir, { recursive: true, force: true }); }
+  });
+  test("preview model filter and round robin match pick without session writes", () => {
+    const { poolDir, mgr } = weightedPool(["a", "b"]);
+    try {
+      mgr.pick(); // advance tied cursor
+      expect(mgr.routingSnapshot().nextPick!.account).toBe(mgr.pick()!.name);
+      mgr.recordRateLimitSnapshot("a", snapshot([win("7d-fable", { utilization: 1, reset: Date.now() + 3600000 })]));
+      expect(mgr.routingSnapshot("anthropic", Date.now(), "fable").nextPick!.account).toBe("b");
+    } finally { rmSync(poolDir, { recursive: true, force: true }); }
+  });
+  test("legacy knobs ignored on read and rejected on write including unknown keys", () => {
+    const { poolDir, mgr } = weightedPool(["a"]);
+    try {
+      writeFileSync(join(poolDir, "tuning.json"), JSON.stringify({ urgencyDecay: 0, loadSlope: 0, fiveHourExp: 2 }));
+      expect(mgr.getTuning()).toEqual({ fiveHourExp: 2, headroomTaperStart: 0.2, minHeadroom: 0.1 });
+      for (const patch of [{ urgencyDecay: 0 }, { loadSlope: 0 }, { unknown: 1 }, { headroomTaperStart: 0 }]) expect(() => mgr.setTuning(patch as any)).toThrow();
+    } finally { rmSync(poolDir, { recursive: true, force: true }); }
+  });
+});
+
+describe("expiry shares edge cases", () => {
+  test("later ranks halve; equal resets share rank and manual weights multiply", () => {
+    const names = ["a", "b", "c", "d", "e", "f", "g"];
+    const { poolDir, mgr } = weightedPool(names);
+    try {
+      const now = Date.now();
+      names.forEach((name, i) => mgr.recordRateLimitSnapshot(name, snapshot([win("7d", { utilization: 0.99, reset: now + (Math.min(i, 5) + 1) * 3600000 })])));
+      expect(mgr.routingSnapshot().candidates!.map((c) => c.expiryShare)).toEqual([5, 3, 2, 1, 0.5, 0.25, 0.25]);
+      mgr.setWeight("g", 4);
+      expect(mgr.routingSnapshot().candidates!.find((c) => c.account === "g")!.score).toBe(1);
+      expect(mgr.pick("failover", new Set(["a", "b", "c"]))!.name).toBe("g");
+    } finally { rmSync(poolDir, { recursive: true, force: true }); }
+  });
+  for (const strategy of ["weighted", "expiring", "headroom"] as const) test(`${strategy}: provider comparisons use appropriate headroom without weekly early spillover`, () => {
+    const { poolDir, mgr } = tempPool(["claude", "codex"], undefined, { routingStrategy: strategy });
+    try {
+      writeFileSync(join(mgr.configDirFor("codex"), OPENAI_CREDS_FILENAME), JSON.stringify({ accessToken: "at" }));
+      const now = Date.now();
+      const candidates = [{ provider: "anthropic" as const, modelFamily: "fable" }, { provider: "openai" as const, modelFamily: null }];
+      mgr.recordRateLimitSnapshot("claude", snapshot([win("5h", { utilization: 0, reset: now + 3600000 }), win("7d-fable", { utilization: 0.999, reset: now + 7200000 })]));
+      mgr.recordRateLimitSnapshot("codex", snapshot([win("7d", { utilization: 0.2, reset: now + 7200000 })]));
+      expect(mgr.pickProvider(undefined, candidates)!.provider).toBe(strategy === "headroom" ? "openai" : "anthropic");
+      mgr.recordRateLimitSnapshot("claude", snapshot([win("7d-fable", { utilization: 1, reset: now + 7200000 })]));
+      expect(mgr.pickProvider(undefined, candidates)!.provider).toBe("openai");
+      expect(mgr.routingSnapshot("openai", now).nextPick!.account).toBe(mgr.pick(undefined, undefined, "openai")!.name);
+    } finally { rmSync(poolDir, { recursive: true, force: true }); }
+  });
+  test("weekly-only Codex near exhaustion stays neutral; allowed overrides preserved", () => {
+    const { poolDir, mgr } = weightedPool(["codex"]);
+    try {
+      writeFileSync(join(mgr.configDirFor("codex"), OPENAI_CREDS_FILENAME), JSON.stringify({ accessToken: "at" }));
+      for (const utilization of [0.92, 0.999, 1]) {
+        mgr.recordRateLimitSnapshot("codex", snapshot([win("7d", { utilization, status: "allowed", reset: Date.now() + 3600000 })]));
+        expect(mgr.routingSnapshot("openai").candidates![0]!.headroom).toBe(1);
+        expect(mgr.pick(undefined, undefined, "openai")!.name).toBe("codex");
+      }
+    } finally { rmSync(poolDir, { recursive: true, force: true }); }
+  });
+  test("expired and unrelated five-hour windows are neutral; matching scarcity gates; pins and files untouched by preview", () => {
+    const { poolDir, mgr } = weightedPool(["a", "b"]);
+    try {
+      const now = Date.now();
+      mgr.recordRateLimitSnapshot("a", snapshot([win("5h", { utilization: 0.99, reset: now - 1 }), win("5h-fable", { utilization: 0.95, reset: now + 3600000 }), win("7d-fable", { utilization: 0.999, reset: now + 7200000 })]));
+      expect(mgr.routingSnapshot("anthropic", now, "sonnet").candidates!.find((c) => c.account === "a")!.headroom).toBe(1);
+      expect(mgr.pick(undefined, undefined, "anthropic", "fable")!.name).toBe("b");
+      mgr.setAffinity("pinned", "a");
+      const sessions = readFileSync(join(poolDir, "sessions.json"), "utf8");
+      const usage = readFileSync(join(poolDir, "usage.json"), "utf8");
+      for (let i = 0; i < 3; i++) mgr.routingSnapshot("anthropic", now, "fable");
+      expect(readFileSync(join(poolDir, "sessions.json"), "utf8")).toBe(sessions);
+      expect(readFileSync(join(poolDir, "usage.json"), "utf8")).toBe(usage);
+      expect(mgr.pick("pinned", undefined, "anthropic", "fable")!.name).toBe("a");
+    } finally { rmSync(poolDir, { recursive: true, force: true }); }
+  });
+});
+
+test("routing preview does not roll persisted in-memory usage", () => {
+  const { poolDir, mgr } = weightedPool(["a"]);
+  try {
+    const account = mgr.getAccount("a");
+    account.usage.windowStart = 0;
+    account.usage.windowRequests = 7;
+    mgr.routingSnapshot();
+    expect(account.usage.windowRequests).toBe(7);
+    expect(account.usage.windowStart).toBe(0);
+  } finally { rmSync(poolDir, { recursive: true, force: true }); }
+});
+
+for (const routingStrategy of ["weighted", "expiring", "headroom"] as const) test(`${routingStrategy}: repeated preview follows the next tie without creating sessions`, () => {
+  const { poolDir, mgr } = tempPool(["a", "b"], undefined, { routingStrategy });
+  try {
+    for (let i = 0; i < 6; i++) {
+      const preview = mgr.routingSnapshot();
+      expect(mgr.routingSnapshot()).toEqual(preview);
+      expect(mgr.pick()!.name).toBe(preview.nextPick!.account);
+      expect(mgr.listAccounts().map((a) => a.activeSessions)).toEqual([0, 0]);
+    }
+  } finally { rmSync(poolDir, { recursive: true, force: true }); }
 });

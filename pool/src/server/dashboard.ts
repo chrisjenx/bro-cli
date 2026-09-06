@@ -15,9 +15,8 @@ import { SOURCE_EFFORT_TIERS, CODEX_EFFORTS } from "../models.ts";
 /** Presentation for each tuning knob; min/max come from the shared TUNING_BOUNDS. */
 const TUNING_LABELS: Record<keyof typeof TUNING_BOUNDS, { label: string; step: string }> = {
   fiveHourExp: { label: "5h weight", step: "0.1" },
-  loadSlope: { label: "Session load", step: "0.1" },
-  urgencyDecay: { label: "7d urgency decay", step: "0.05" },
-  minHeadroom: { label: "Min headroom gate", step: "0.05" },
+  headroomTaperStart: { label: "5h taper start", step: "0.05" },
+  minHeadroom: { label: "Min 5h headroom gate", step: "0.05" },
 };
 
 export function dashboardHtml(): string {
@@ -303,6 +302,10 @@ export function dashboardHtml(): string {
   </div>
 </header>
 <main>
+  <div class="hint">
+    <label>Preview provider <select id="routing-provider" onchange="refresh()"><option value="anthropic">Anthropic</option><option value="openai">OpenAI / Codex</option></select></label>
+    <label>Model family <select id="routing-model" onchange="refresh()"><option value="">Account-wide only</option>${MODEL_FAMILIES.map((family) => `<option value="${family}">${family}</option>`).join("")}</select></label>
+  </div>
   <div class="routing-panel" id="routing-panel"></div>
   <details class="settings-group" id="settings-group">
     <summary>Settings<span class="caret">▶</span></summary>
@@ -486,9 +489,11 @@ function routingPanelHtml(routing) {
       + '<span class="fk">' + esc(f.label) + "</span>"
       + '<span class="fv">' + esc(f.detail) + (f.decisive ? " ◀" : "") + "</span></li>"
   ).join("");
-  return '<div class="pick">Next request &rarr; <b>' + esc(routing.nextPick.account) + "</b>"
+  return '<div class="pick">Next new session &rarr; <b>' + esc(routing.nextPick.account) + "</b>"
     + '<div class="summary muted" title="' + esc(r.summary) + '">' + esc(r.summary) + "</div></div>"
-    + '<ul class="why">' + items + "</ul>";
+    + '<ul class="why">' + items + "</ul>"
+    + ((routing.candidates || []).length ? '<div style="overflow-x:auto"><table><thead><tr><th>Account</th><th>Manual weight</th><th>Expiry share</th><th>Pinned sessions</th><th>5h headroom</th><th>5h factor</th><th>Viability</th><th>Score</th></tr></thead><tbody>'
+      + routing.candidates.map(function (c) { return "<tr><td>" + esc(c.account) + "</td><td>" + esc(String(c.weight)) + "</td><td>" + esc(String(c.expiryShare)) + "</td><td>" + esc(String(c.activeSessions)) + "</td><td>" + Math.round(c.headroom * 100) + "%</td><td>" + Number(c.fiveHourFactor).toFixed(2) + "</td><td>" + (c.viable ? "Viable" : "Below 5h gate") + "</td><td>" + Number(c.score).toFixed(2) + "</td></tr>"; }).join("") + "</tbody></table></div>" : "");
 }
 
 // Cross-subscription model mapping: each Claude family (fable/opus/sonnet/haiku)
@@ -542,9 +547,16 @@ function effortsHtml(family, effort, targetModel, targets) {
   return out;
 }
 
+function mappingTargets(mapping) {
+  return (mapping.targets || []).map(function (target) {
+    // Normalize historical string IDs without changing the shipped object API.
+    return typeof target === "string" ? { id: target, supportedEfforts: [] } : target;
+  });
+}
+
 function mappingCardHtml(mapping) {
   if (!mapping) return "";
-  var targets = mapping.targets || [];
+  var targets = mappingTargets(mapping);
   var rows = "";
   for (var i = 0; i < FAMILIES.length; i++) {
     var fam = FAMILIES[i];
@@ -573,8 +585,7 @@ function mappingCardHtml(mapping) {
 
 // Editable weighted-score knobs (key/label/step/min/max), built server-side
 // from TUNING_BOUNDS so the input ranges match the server's validation. The
-// score is weight × urgency × loadFactor × 5h^fiveHourExp; urgency ranks by
-// soonest 7d reset, so sooner-to-expire accounts are drained first.
+// score is manual weight × expiry share × 5h taper / (live sessions + 1).
 var TUNING_FIELDS = ${JSON.stringify(tuningFields)};
 
 function tuningPanelHtml(tuning) {
@@ -588,7 +599,7 @@ function tuningPanelHtml(tuning) {
   }).join("");
   return '<summary>Routing tuning<span class="caret">▶</span></summary>'
     + '<div class="tuning-body">'
-    + '<div class="hint">Weighted-strategy score knobs. Accounts are drained in 7d-expiry order (soonest first); 5h headroom and session load spill new sessions to the next account.</div>'
+    + '<div class="hint">New live-session shares follow distinct weekly resets: 5:3:2:1:0.5:0.25… × manual weight, divided by pinned sessions + 1. Five-hour headroom is neutral above the taper start (default 20%); below it the share tapers. The default 10% gate is five-hour-only, with best-effort fallback. Weekly quota is usable until exhausted. Existing session pins stay stable; these are not token or request ratios.</div>'
     + '<div class="tuning-grid">' + fields + "</div>"
     + '<div class="tuning-actions"><button id="tuning-apply">Apply</button>'
     + '<span class="status" id="tuning-status"></span></div>'
@@ -763,10 +774,16 @@ function finishSettingsSave(id, res, status) {
   return true;
 }
 
+var refreshSequence = 0;
 async function refresh() {
+  const sequence = ++refreshSequence;
   try {
-    const r = await fetch("/api/status");
+    const provider = document.getElementById("routing-provider")?.value || "anthropic";
+    const model = document.getElementById("routing-model")?.value || "";
+    const r = await fetch("/api/status?provider=" + encodeURIComponent(provider) + "&model=" + encodeURIComponent(model));
     const d = await r.json();
+    if (sequence !== refreshSequence) return;
+
     const grid = document.getElementById("grid");
     const onboard = document.getElementById("onboard");
     const banner = document.getElementById("banner");
@@ -781,7 +798,7 @@ async function refresh() {
       document.getElementById("summary").style.display = "none";
     } else {
       onboard.style.display = "none";
-      const routing = d.routing || { tiers: [], nextPick: null, activeTier: null };
+      const routing = d.routingPreview || d.routing || { tiers: [], nextPick: null, activeTier: null };
       const nextAcct = routing.nextPick && routing.nextPick.account;
       const groups = groupAccountsByPriority(accounts);
       if (!accountSettingsDirty && !grid.contains(document.activeElement)) {
@@ -819,7 +836,7 @@ async function refresh() {
         "mapping-panel",
         mappingCardHtml(mapping),
         mapping,
-        function () { wireMapping(mapping.targets || []); },
+        function () { wireMapping(mappingTargets(mapping)); },
       );
       const tuneVisible = renderSettings("tuning-panel", tuningPanelHtml(d.tuning), d.tuning, wireTuning);
       document.getElementById("settings-group").style.display = (mapVisible || tuneVisible) ? "block" : "none";

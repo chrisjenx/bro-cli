@@ -1,5 +1,8 @@
 import { test, expect, describe } from "bun:test";
 import { dashboardHtml } from "./dashboard.ts";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 /**
  * The dashboard's per-account card is rendered client-side by a `card(a)`
@@ -366,6 +369,91 @@ function mapRow(html: string, family: string): string {
 }
 
 describe("model mapping card", () => {
+  test("live status preserves object targets and capabilities for already-open dashboards", async () => {
+    const dir = mkdtempSync(join(process.env.CLAUDE_JOB_DIR ? join(process.env.CLAUDE_JOB_DIR, "tmp") : tmpdir(), "mapping-status-"));
+    writeFileSync(join(dir, "models.json"), JSON.stringify({
+      models: [{ id: "custom-frontier", provider: "openai", upstreamModel: "custom-upstream", supportedEfforts: ["high", "max"] }],
+      mappingEnabled: true,
+      mappings: [{ from: "fable", to: "gpt-6-astra", effort: { max: "max" } }],
+    }));
+    const proc = Bun.spawn([process.execPath, "-e", `
+      import { loadConfig } from "../config.ts";
+      import { startServer } from "./server.ts";
+      startServer(loadConfig({ host: "127.0.0.1", port: 0, usageRefreshEnabled: false }));
+    `], {
+      cwd: import.meta.dir,
+      env: { ...process.env, CLAUDE_POOL_DIR: dir },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const ready = (async () => {
+        let output = "";
+        for await (const chunk of proc.stdout) {
+          output += new TextDecoder().decode(chunk);
+          const origin = output.match(/listening on (http:\/\/127\.0\.0\.1:\d+)/)?.[1];
+          if (origin) return origin;
+        }
+        throw new Error("Pool exited before listening: " + await new Response(proc.stderr).text());
+      })();
+      const origin = await Promise.race([
+        ready,
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("Pool startup timed out")), 5000); }),
+      ]);
+      const response = await fetch(origin + "/api/status");
+      expect(response.status).toBe(200);
+      const previewResponse = await fetch(origin + "/api/status?provider=openai&model=gpt-6-astra");
+      const preview = await previewResponse.json() as any;
+      expect(previewResponse.status).toBe(200);
+      expect(preview.routingContext).toEqual({ provider: "openai", model: "gpt-6-astra", modelFamily: null });
+      expect(preview.routingPreview).toEqual({ activeTier: null, nextPick: null, tiers: [] });
+      expect(preview.routing).toBeDefined();
+      expect((await fetch(origin + "/api/status?provider=unknown")).status).toBe(400);
+      const { mapping } = await response.json() as {
+        mapping: { targets: { id: string; supportedEfforts: string[] }[] };
+      };
+      // The shipped dashboard reads target.id before deciding if a saved
+      // mapping is active. Strings silently turn those routes into Claude-only.
+      expect(mapping.targets.every((target) => typeof target.id === "string")).toBe(true);
+      expect(mapping.targets.find((target) => target.id === "gpt-6-astra")).toEqual({
+        id: "gpt-6-astra", supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+      });
+      expect(mapping.targets.find((target) => target.id === "custom-frontier")).toEqual({
+        id: "custom-frontier", supportedEfforts: ["high", "max"],
+      });
+      expect(mapping.targets.some((target) => target.id === "fable")).toBe(false);
+
+      const rendered = loadMappingCard()(mapping);
+      expect(rendered).not.toContain("[object Object]");
+      expect(rendered).toContain('<option value="custom-frontier">custom-frontier</option>');
+      const fableRow = mapRow(rendered, "fable");
+      expect(fableRow).toContain('<option value="gpt-6-astra" selected>gpt-6-astra</option>');
+      expect(fableRow).toContain('<option value="max" selected>Max</option>');
+      expect(fableRow).not.toContain('<option value="none">');
+    } finally {
+      clearTimeout(timer);
+      proc.kill();
+      await proc.exited;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 10000);
+
+  test("historical string targets retain labels and the active mapping without capability metadata", () => {
+    const rendered = loadMappingCard()({
+      enabled: true,
+      targets: ["gpt-5.5"],
+      mappings: [{ from: "fable", to: "gpt-5.5" }],
+    });
+    const fableRow = mapRow(rendered, "fable");
+    expect(fableRow).toContain('<option value="gpt-5.5" selected>gpt-5.5</option>');
+    expect(fableRow).not.toContain('<option value="fable" selected>');
+    expect(fableRow).not.toContain("display:none");
+    expect(fableRow).toContain('<option value="">pass-through</option>');
+    expect(rendered).not.toContain("undefined");
+    expect(rendered).not.toContain("[object Object]");
+  });
+
   test("dashboard ships the mapping panel and save wiring", () => {
     const html = dashboardHtml();
     expect(html).toContain('id="mapping-panel"');
@@ -694,4 +782,41 @@ describe("settings runtime: collapse persistence + anti-clobber", () => {
     expect(grid.innerHTML).toBe("priority draft");
     expect(document.getElementById("p-available").innerHTML).toBe("available <b>1</b>");
   });
+test("a stale status response cannot overwrite a newer preview context", async () => {
+  let release!: (value: any) => void;
+  let calls = 0;
+  const fetchImpl = async () => {
+    if (++calls === 1) return await new Promise<any>((resolve) => { release = resolve; });
+    return { json: async () => ({ accounts: [baseAccount({ name: "new-context" })] }) };
+  };
+  const { api, document } = loadRuntime(undefined, fetchImpl);
+  const older = api.refresh();
+  await api.refresh();
+  release({ json: async () => ({ accounts: [baseAccount({ name: "old-context" })] }) });
+  await older;
+  expect(document.getElementById("grid").innerHTML).toContain("new-context");
+  expect(document.getElementById("grid").innerHTML).not.toContain("old-context");
+});
+
+});
+
+test("routing preview labels fresh placement and displays backend factors", () => {
+  const rendered = loadRoutingPanel()({
+    nextPick: { account: "a", reason: { summary: "test", factors: [] } },
+    candidates: [{ account: "a", expiryShare: 5, activeSessions: 2, headroom: 0.15, fiveHourFactor: 0.75, viable: true, score: 1.25 }],
+  });
+  expect(rendered).toContain("Next new session");
+  for (const label of ["Expiry share", "Pinned sessions", "5h headroom", "5h factor", "Viability", "0.75"]) expect(rendered).toContain(label);
+  const html = dashboardHtml();
+  expect(html).toContain('id="routing-provider"');
+  expect(html).toContain('id="routing-model"');
+  expect(html).toContain('data-tuning');
+  expect(html).toContain("headroomTaperStart");
+  expect(html).not.toContain("urgencyDecay");
+});
+
+test("preview context uses account-wide label and includes manual weight", () => {
+  expect(dashboardHtml()).toContain("Account-wide only");
+  const rendered = loadRoutingPanel()({ nextPick: { account: "a" }, candidates: [{ account: "a", weight: 2, expiryShare: 5, activeSessions: 0, headroom: 1, fiveHourFactor: 1, score: 10, viable: true }] });
+  expect(rendered).toContain("Manual weight");
 });

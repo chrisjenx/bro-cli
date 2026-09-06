@@ -63,40 +63,35 @@ export function isValidWeight(n: unknown): n is number {
 export interface RoutingTuning {
   /** Exponent on the 5h headroom factor. */
   fiveHourExp: number;
-  /** Active-session load decay: 0 sessions → 1.0, 1 → 1/(1+slope), … */
-  loadSlope: number;
-  /** 7d-expiry urgency rank decay: soonest → 1.0, next → 1/(1+decay), … */
-  urgencyDecay: number;
+  /** Five-hour headroom below which placement shares taper, in (0, 1]. */
+  headroomTaperStart: number;
   /** Minimum gate headroom for an account to stay viable (else best-effort). */
   minHeadroom: number;
 }
 
 /**
- * Per-knob bounds. Exponents/slopes share a generous [0, 5] range (0 disables a
- * factor, 5 makes it dominate); minHeadroom is a fraction in [0, 1]. Each field
+ * Per-knob bounds. The exponent uses [0, 5]; taper start is in (0, 1],
+ * minHeadroom is a fraction in [0, 1]. Each field
  * validates independently so one bad value never rejects the rest.
  */
 export const TUNING_BOUNDS: Record<keyof RoutingTuning, { min: number; max: number }> = {
   fiveHourExp: { min: 0, max: 5 },
-  loadSlope: { min: 0, max: 5 },
-  urgencyDecay: { min: 0, max: 5 },
+  headroomTaperStart: { min: 0, max: 1 },
   minHeadroom: { min: 0, max: 1 },
 };
 
 /** Defaults for the tuning knobs except minHeadroom, which seeds from config (env). */
 const DEFAULT_TUNING_EXP: Omit<RoutingTuning, "minHeadroom"> = {
   fiveHourExp: 1,
-  loadSlope: 0.5,
-  // Soonest-to-reset account gets urgency 1.0; each later reset-rank decays by
-  // this. 0.75 tuned against loadSlope 0.5 so the drain account holds ~1 live
-  // session and spills the 2nd to the next-expiring account.
-  urgencyDecay: 0.75,
+  headroomTaperStart: 0.20,
 };
 
 /** True when `n` is a finite number within `key`'s bounds. */
 export function isValidTuningField(key: keyof RoutingTuning, n: unknown): n is number {
+  if (!Object.hasOwn(TUNING_BOUNDS, key)) return false;
   const b = TUNING_BOUNDS[key];
-  return typeof n === "number" && Number.isFinite(n) && n >= b.min && n <= b.max;
+  return typeof n === "number" && Number.isFinite(n)
+    && n >= b.min && n <= b.max && (key !== "headroomTaperStart" || n > 0);
 }
 
 /** One step of the routing decision, showing where the chosen account stood. */
@@ -251,8 +246,7 @@ export class AccountManager {
     return u;
   }
 
-  private rollWindow(u: AccountUsage): void {
-    const now = Date.now();
+  private rollWindow(u: AccountUsage, now: number = Date.now()): void {
     if (now - u.windowStart >= this.config.usageWindowMs) {
       u.windowStart = now;
       u.windowRequests = 0;
@@ -409,11 +403,13 @@ export class AccountManager {
   setTuning(patch: Partial<RoutingTuning>): void {
     const next = this.readPersistedTuning();
     for (const key of Object.keys(patch) as (keyof RoutingTuning)[]) {
+      if (!Object.hasOwn(TUNING_BOUNDS, key)) throw new Error(`Unknown or retired tuning field: ${key}; expiry shares are fixed at 5:3:2:1:0.5…`);
       const value = patch[key];
       if (value === undefined) continue;
       if (!isValidTuningField(key, value)) {
         const b = TUNING_BOUNDS[key];
-        throw new Error(`${key} must be a number between ${b.min} and ${b.max}, got ${value}`);
+        const range = key === "headroomTaperStart" ? "greater than 0 and at most 1" : `between ${b.min} and ${b.max}`;
+        throw new Error(`${key} must be a finite number ${range}, got ${value}`);
       }
       next[key] = value;
     }
@@ -580,16 +576,17 @@ export class AccountManager {
     writeFileSync(this.openaiCredsPath(name), JSON.stringify(creds, null, 2));
   }
 
-  getAccount(name: string): Account {
+  /** Preview callers roll a shallow usage copy; normal callers retain existing live usage semantics. */
+  getAccount(name: string, readOnly = false, now: number = Date.now()): Account {
     const provider = this.providerFor(name);
     const oauth = provider === "anthropic" ? (this.readCreds(name)?.claudeAiOauth ?? null) : null;
     const openai = provider === "openai" ? this.getOpenAICreds(name) : null;
     const authenticated = provider === "openai" ? Boolean(openai?.accessToken) : Boolean(oauth?.accessToken);
     const tokenExpiresAt = (provider === "openai" ? openai?.expiresAt : oauth?.expiresAt) ?? null;
-    const tokenExpired = tokenExpiresAt != null && tokenExpiresAt < Date.now();
+    const tokenExpired = tokenExpiresAt != null && tokenExpiresAt < now;
 
-    const usage = this.usageFor(name);
-    const now = Date.now();
+    const usage = readOnly ? { ...(this.usage[name] ?? emptyUsage(now)) } : this.usageFor(name);
+    if (readOnly) this.rollWindow(usage, now);
     const cooling = usage.rateLimitedUntil != null && usage.rateLimitedUntil > now;
     const deadLogin = deadLoginReason(usage, oauth?.refreshToken);
     const denied = usage.accessDeniedUntil != null && usage.accessDeniedUntil > now;
@@ -630,7 +627,7 @@ export class AccountManager {
       scopes: oauth?.scopes ?? [],
       priority: this.priorityFor(name),
       weight: this.weightFor(name),
-      activeSessions: this.sessions.activeCount(name),
+      activeSessions: this.sessions.activeCount(name, now),
       tokenExpiresAt,
       tokenExpired,
       usage,
@@ -675,8 +672,8 @@ export class AccountManager {
    * @param modelFamily canonical family of the requested model ("fable",
    *   "opus", …). Model-scoped unified windows (e.g. Fable's own, lower
    *   allowance) sideline an account for matching requests only — the account
-   *   stays in rotation for other models — and count toward headroom scoring
-   *   for matching requests.
+   *   stays in rotation for other models. Only five-hour windows gate or taper
+   *   weighted/expiring placement.
    */
   pick(
     sessionKey?: string,
@@ -771,9 +768,9 @@ export class AccountManager {
     // provider on a reserved backup tier's headroom would pick a provider whose
     // serving tier is actually more constrained.
     let best = usable[0]!;
-    let bestHeadroom = maxHeadroom(activeTier(best.accounts), best.c.modelFamily, now);
+    let bestHeadroom = maxHeadroom(activeTier(best.accounts), best.c.modelFamily, now, this.config.routingStrategy !== "headroom");
     for (const e of usable.slice(1)) {
-      const h = maxHeadroom(activeTier(e.accounts), e.c.modelFamily, now);
+      const h = maxHeadroom(activeTier(e.accounts), e.c.modelFamily, now, this.config.routingStrategy !== "headroom");
       if (h > bestHeadroom) {
         best = e;
         bestHeadroom = h;
@@ -849,15 +846,12 @@ export class AccountManager {
   }
 
   /**
-   * Weighted placement score for every tier-pool candidate:
-   *   score = weight × urgency × loadFactor × gate5h^fiveHourExp
-   * urgency is rank-based over 7d expiry (soonest reset → 1.0; tied resets share
-   * a rank so their cohort is ordered by the remaining factors; nulls/unknown
-   * first to probe). loadFactor decays with live pinned sessions, gate is the 5h
-   * headroom (same gate the expiring strategy uses). The 7d/weekly *headroom* is
-   * deliberately NOT a factor: draining in reset order is the goal, so a nearly
-   * full soon-to-reset account must not be penalised for being full. Exponents/
-   * slopes come from getTuning(). Pure — shared by pick() and routingSnapshot().
+   * Fresh live-session placement: manualWeight × expiryShare × fiveHourFactor /
+   * (activeSessions + 1). Distinct expiry ranks receive 5:3:2:1:0.5:0.25…;
+   * tied resets share a rank, unknown data probes first, spent resets rank last.
+   * Five-hour headroom is neutral above headroomTaperStart, then tapers linearly
+   * (raised to fiveHourExp). Weekly utilization is never an early spillover gate.
+   * Pure ranking shared by pick and preview; pins are not migrated for ratios.
    */
   private scoreWeighted(
     pool: Account[],
@@ -878,14 +872,20 @@ export class AccountManager {
     const rankByReset = new Map(distinct.map((k, i) => [k, i] as const));
 
     return rows.map(({ account, expiryReset, headroom, rankKey }) => {
-      const urgency = 1 / (1 + rankByReset.get(rankKey)! * tuning.urgencyDecay);
-      const loadFactor = 1 / (1 + this.sessions.activeCount(account.name, now) * tuning.loadSlope);
+      const rank = rankByReset.get(rankKey)!;
+      const urgency = rank < 4 ? [5, 3, 2, 1][rank]! : 0.5 ** (rank - 3);
+      const activeSessions = this.sessions.activeCount(account.name, now);
+      const loadFactor = 1 / (activeSessions + 1);
+      const fiveHourFactor = Math.min(1, headroom / tuning.headroomTaperStart) ** tuning.fiveHourExp;
       const weight = this.weightFor(account.name);
-      const score = weight * urgency * loadFactor * headroom ** tuning.fiveHourExp;
+      const score = weight * urgency * loadFactor * fiveHourFactor;
       return {
         account,
         expiryReset,
         weight,
+        expiryShare: urgency,
+        activeSessions,
+        fiveHourFactor,
         urgency,
         loadFactor,
         headroom,
@@ -912,6 +912,10 @@ export class AccountManager {
     return this.pickRoundRobin(tied);
   }
 
+  private previewTie(tied: Account[]): Account {
+    return tied[this.rrCursor % tied.length]!;
+  }
+
   private pickRoundRobin(tied: Account[]): Account {
     if (tied.length <= 1) return tied[0]!;
     const best = tied[this.rrCursor % tied.length]!;
@@ -922,13 +926,11 @@ export class AccountManager {
   /**
    * Current routing decision for one provider: every tier (grouped by priority,
    * with an available count), the active tier, and the account that would serve
-   * the next non-sticky request with a human-readable reason. The decision is
-   * model-agnostic (family = null): it describes general routing, not a specific
-   * model's windows.
+   * the next new session for the requested model family. Reads copied usage
+   * and the current round-robin cursor without touching session pins or usage.
    */
-  routingSnapshot(provider: Provider = "anthropic", now: number = Date.now()): RoutingSnapshot {
-    const family: string | null = null;
-    const accounts = this.listAccounts().filter((a) => a.provider === provider);
+  routingSnapshot(provider: Provider = "anthropic", now: number = Date.now(), family: string | null = null): RoutingSnapshot {
+    const accounts = this.listNames().map((name) => this.getAccount(name, true, now)).filter((a) => a.provider === provider);
 
     const byPriority = new Map<number, Account[]>();
     for (const a of accounts) {
@@ -955,27 +957,33 @@ export class AccountManager {
     let reason: NextPickReason;
     let candidates: RoutingSnapshot["candidates"];
     if (this.config.routingStrategy === "headroom") {
-      // Same winner as pickByHeadroom (max headroom, then fewest requests); a
-      // deterministic sort standing in for rankHeadroom + first-in-pool-order.
+      // Keep the sorted reasons, selecting ties with the same cursor as pick.
       const ranked = tierPool
         .map((a) => ({ account: a, headroom: headroomFraction(a.usage, family, now) }))
         .sort((x, y) => y.headroom - x.headroom || x.account.usage.windowRequests - y.account.usage.windowRequests);
-      best = ranked[0]!.account;
+      best = this.previewTie(this.rankHeadroom(tierPool, family, now));
+      ranked.sort((a, b) => Number(b.account === best) - Number(a.account === best));
       reason = buildHeadroomReason(minPriority, reserveTiers, tierPool.length, ranked);
     } else if (this.config.routingStrategy === "expiring") {
       const minHeadroom = this.getTuning().minHeadroom;
       const ranked = this.sortExpiringCandidates(tierPool, family, now, minHeadroom);
-      best = ranked[0]!.account;
+      best = this.previewTie(this.rankExpiring(tierPool, family, now));
+      ranked.sort((a, b) => Number(b.account === best) - Number(a.account === best));
       reason = buildExpiringReason(minPriority, reserveTiers, minHeadroom, ranked, now, tierPool.length);
     } else {
       const tuning = this.getTuning();
       const scored = this.scoreWeighted(tierPool, family, now, tuning);
       const ranked = this.rankWeighted(scored);
-      best = ranked[0]!.account;
+      best = this.previewTie(ranked.filter((c) => c.score === ranked[0]!.score).map((c) => c.account));
+      ranked.sort((a, b) => Number(b.account === best) - Number(a.account === best));
       reason = buildWeightedReason(minPriority, reserveTiers, ranked, now, tierPool.length, tuning);
       candidates = scored.map((c) => ({
         account: c.account.name,
         weight: c.weight,
+        expiryShare: c.expiryShare,
+        activeSessions: c.activeSessions,
+        fiveHourFactor: c.fiveHourFactor,
+        viable: c.viable,
         urgency: c.urgency,
         loadFactor: c.loadFactor,
         headroom: c.headroom,
@@ -1334,7 +1342,7 @@ function buildWeightedReason(
   const f = (n: number) => n.toFixed(2);
   // Post-exponent effective 5h-headroom factor, so the shown numbers still
   // multiply to the score.
-  const h5 = chosen.headroom ** tuning.fiveHourExp;
+  const h5 = chosen.fiveHourFactor;
 
   const expiryDetail =
     chosen.expiryReset != null
@@ -1342,7 +1350,7 @@ function buildWeightedReason(
       : "no 7d reset data — probing";
   const expiryFactor: NextPickFactor = {
     label: "7d expiry",
-    detail: `${expiryDetail} · urgency ${f(chosen.urgency)}`,
+    detail: `${expiryDetail} · expiry share ${f(chosen.expiryShare)}`,
     decisive: false,
   };
   const scoreDecisive = runnerUp != null && chosen.score !== runnerUp.score;
@@ -1361,7 +1369,7 @@ function buildWeightedReason(
   const summary = `tier ${activeTier} · score ${f(chosen.score)} · ${expiryDetail}`;
   return {
     summary,
-    factors: [tierFactor(activeTier, poolSize, reserveTiers), expiryFactor, scoreFactor, tiebreakFactor],
+    factors: [tierFactor(activeTier, poolSize, reserveTiers), expiryFactor, { label: "5h gate", detail: `${Math.round(chosen.headroom * 100)}% remaining (minimum ${Math.round(tuning.minHeadroom * 100)}%) · factor ${f(h5)} · ${chosen.viable ? "viable" : "best-effort fallback"} · ${chosen.activeSessions} pinned sessions`, decisive: false }, scoreFactor, tiebreakFactor],
   };
 }
 
@@ -1413,7 +1421,12 @@ function bindingWindows(
 
 /** Factor breakdown behind one weighted-strategy candidate's score. */
 export interface WeightedFactors {
+  expiryShare: number;
+  activeSessions: number;
+  fiveHourFactor: number;
+  viable: boolean;
   weight: number;
+  /** Compatibility alias for expiryShare. */
   urgency: number;
   loadFactor: number;
   /** Remaining 5h gate headroom (raw, pre-exponent). */
@@ -1459,9 +1472,9 @@ function headroomFraction(usage: AccountUsage, modelFamily: string | null, now: 
 }
 
 /** The most headroom any of these accounts has for `family`, used by pickProvider(). */
-function maxHeadroom(accounts: Account[], family: string | null, now: number): number {
+function maxHeadroom(accounts: Account[], family: string | null, now: number, fiveHourOnly = false): number {
   let best = 0;
-  for (const a of accounts) best = Math.max(best, headroomFraction(a.usage, family, now));
+  for (const a of accounts) best = Math.max(best, (fiveHourOnly ? candidateGateHeadroom : headroomFraction)(a.usage, family, now));
   return best;
 }
 
@@ -1541,27 +1554,10 @@ function expiryRankKey(usage: AccountUsage, modelFamily: string | null, now: num
   return weeklyWindowSpent(usage, modelFamily, now) ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY;
 }
 
-/**
- * Gate headroom for routing: the tightest binding window EXCEPT the account-wide
- * expiry (longest-duration account-wide) window, which is excluded so we keep
- * draining it. Which window is "the expiry one" is decided from the RAW
- * snapshot (expired windows included): a stale 5h whose reset has passed still
- * proves the 7d is the expiry window, so the 7d stays excluded even when it is
- * the only account-wide window bindingWindows kept. Otherwise a near-full 7d
- * would gate out exactly the soonest-expiring account — which, once benched,
- * never serves and so never refreshes its stale 5h (a deadlock). A lone 5h
- * (account with no 7d data at all) still gates. 1 (full) when there is no snapshot.
- */
+/** Only live five-hour windows gate/taper routing; weekly quota remains usable to exhaustion. */
 function candidateGateHeadroom(usage: AccountUsage, modelFamily: string | null, now: number): number {
-  const windows = bindingWindows(usage.rateLimitStatus, modelFamily, now);
-  const rawAccountWide = (usage.rateLimitStatus?.windows ?? []).filter((w) => w.model == null);
-  const durations = rawAccountWide.map((w) => windowDurationMs(w.key) ?? -1);
-  let excluded: RateLimitWindow | null = null;
-  if (new Set(durations).size >= 2) {
-    const maxDur = Math.max(...durations);
-    excluded = windows.find((w) => w.model == null && (windowDurationMs(w.key) ?? -1) === maxDur) ?? null;
-  }
-  return headroomOf(windows.filter((w) => w !== excluded));
+  return headroomOf(bindingWindows(usage.rateLimitStatus, modelFamily, now)
+    .filter((w) => windowDurationMs(w.key) === 5 * 3600_000));
 }
 
 function compareExpiringCandidates(a: ExpiringCandidate, b: ExpiringCandidate): number {

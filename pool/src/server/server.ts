@@ -96,9 +96,15 @@ export function startServer(config: Config): void {
         });
       }
       if (req.method === "GET" && path === "/api/status") {
+        const provider = url.searchParams.get("provider") ?? "anthropic";
+        if (provider !== "anthropic" && provider !== "openai") return json({ error: { message: "Unknown preview provider" } }, 400);
+        const model = url.searchParams.get("model") || null;
+        const family = modelFamilyOf(model);
         return json({
           accounts: mgr.listAccounts(),
           routing: mgr.routingSnapshot(),
+          routingPreview: mgr.routingSnapshot(provider, Date.now(), family),
+          routingContext: { provider, model, modelFamily: family },
           tuning: mgr.getTuning(),
           mapping: {
             enabled: mappingState.config.mappingEnabled,
@@ -542,7 +548,11 @@ export function handleRoutingUpdate(mgr: AccountManager, body: unknown): Respons
  * Unauthenticated by design, like the other dashboard/status routes.
  */
 export function handleTuningUpdate(mgr: AccountManager, body: unknown): Response {
-  const b = (body ?? {}) as Partial<Record<keyof RoutingTuning, unknown>>;
+  if (!body || typeof body !== "object" || Array.isArray(body)) return json({ error: { message: "provide a tuning object" } }, 400);
+  for (const key of Object.keys(body)) {
+    if (!Object.hasOwn(TUNING_BOUNDS, key)) return json({ error: { message: `Unknown or retired tuning field: ${key}; expiry shares are fixed at 5:3:2:1:0.5…` } }, 400);
+  }
+  const b = body as Partial<Record<keyof RoutingTuning, unknown>>;
   const patch: Partial<RoutingTuning> = {};
   for (const key of Object.keys(TUNING_BOUNDS) as (keyof RoutingTuning)[]) {
     if (b[key] !== undefined) patch[key] = b[key] as number;

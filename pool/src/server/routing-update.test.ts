@@ -7,7 +7,7 @@ import { AccountManager } from "../accounts/manager.ts";
 import { handleRoutingUpdate, handleTuningUpdate } from "./server.ts";
 
 function tempMgr(names: string[]): { poolDir: string; accountsDir: string; mgr: AccountManager } {
-  const poolDir = mkdtempSync(join(tmpdir(), "cmp-routing-"));
+  const poolDir = mkdtempSync(join(process.env.CLAUDE_JOB_DIR ? join(process.env.CLAUDE_JOB_DIR, "tmp") : tmpdir(), "cmp-routing-"));
   const accountsDir = join(poolDir, "accounts");
   for (const n of names) {
     mkdirSync(join(accountsDir, n), { recursive: true });
@@ -52,14 +52,14 @@ test("handleRoutingUpdate rejects unknown account and bad priority", () => {
 test("handleTuningUpdate persists valid knobs and reflects them in getTuning", async () => {
   const { poolDir, mgr } = tempMgr(["work"]);
   try {
-    const res = handleTuningUpdate(mgr, { urgencyDecay: 0.9, minHeadroom: 0.2 });
+    const res = handleTuningUpdate(mgr, { headroomTaperStart: 0.9, minHeadroom: 0.2 });
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { tuning: { urgencyDecay: number; minHeadroom: number; fiveHourExp: number } };
-    expect(body.tuning.urgencyDecay).toBe(0.9);
+    const body = (await res.json()) as { tuning: { headroomTaperStart: number; minHeadroom: number; fiveHourExp: number } };
+    expect(body.tuning.headroomTaperStart).toBe(0.9);
     expect(body.tuning.minHeadroom).toBe(0.2);
     expect(body.tuning.fiveHourExp).toBe(1); // untouched knob preserved at default
     const onDisk = JSON.parse(readFileSync(join(poolDir, "tuning.json"), "utf8"));
-    expect(onDisk.urgencyDecay).toBe(0.9);
+    expect(onDisk.headroomTaperStart).toBe(0.9);
   } finally {
     rmSync(poolDir, { recursive: true, force: true });
   }
@@ -75,4 +75,14 @@ test("handleTuningUpdate rejects out-of-bounds values and empty bodies", () => {
   } finally {
     rmSync(poolDir, { recursive: true, force: true });
   }
+});
+
+test("tuning rejects mixed current and retired or unknown keys atomically", () => {
+  const { poolDir, mgr } = tempMgr(["work"]);
+  try {
+    for (const key of ["urgencyDecay", "loadSlope", "unknown", "toString"]) {
+      expect(handleTuningUpdate(mgr, { fiveHourExp: 2, [key]: 1 }).status).toBe(400);
+      expect(mgr.getTuning().fiveHourExp).toBe(1);
+    }
+  } finally { rmSync(poolDir, { recursive: true, force: true }); }
 });

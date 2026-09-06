@@ -71,13 +71,13 @@ export interface Config {
    * the user reads/thinks; 30 min covers that without pinning abandoned ones.
    */
   sessionIdleMs: number;
-  /** Account routing policy: blended weighted score by default. */
+  /** Default: expiry-share / (live sessions + 1), with five-hour-only taper. */
   routingStrategy: "weighted" | "expiring" | "headroom";
   /**
-   * Minimum remaining headroom for an account to stay eligible in the `weighted`
-   * and `expiring` strategies, measured over the gate set — the tightest binding
-   * window except the account-wide 7d (which we deliberately drain). In practice
-   * this is the 5-hour window, plus any model-scoped window for model requests.
+   * Minimum live five-hour headroom preferred by weighted/expiring routing.
+   * Includes matching model five-hour windows, never weekly windows. If every
+   * usable account falls below it, selection falls back best-effort. Existing
+   * pins stay stable; actual exhaustion and provider allowed semantics apply.
    */
   routingMinHeadroom: number;
   /** Log a line when a request fails over from one account to another. */
