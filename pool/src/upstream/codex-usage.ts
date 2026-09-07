@@ -60,38 +60,61 @@ export async function fetchCodexUsageSnapshot(
   fetchFn: typeof fetch = fetch,
   signal?: AbortSignal,
 ): Promise<RateLimitSnapshot | null> {
-  let creds;
-  try {
-    creds = await ensureFreshToken(account.name, mgr, config, false, fetchFn);
-  } catch {
-    return null;
-  }
-  if (!creds?.accessToken) return null;
-
-  let res: Response;
-  try {
+  const credentials = async (force: boolean) => {
+    try {
+      const creds = await ensureFreshToken(account.name, mgr, config, force, fetchFn);
+      if (!creds?.accessToken) throw new Error("missing access token");
+      return creds;
+    } catch (err) {
+      // OAuth errors can contain upstream response bodies. Expose only the
+      // status, never tokens or arbitrary provider text, on the dashboard.
+      const status = /refresh failed \((\d{3})\)/.exec(String(err))?.[1];
+      const advice = status === "400" || status === "401" || status === "403"
+        ? "; re-run accounts login" : "; check connectivity or re-run accounts login";
+      throw new Error(`Codex token refresh failed${status ? ` (HTTP ${status})` : ""}${advice}`);
+    }
+  };
+  let creds = await credentials(false);
+  const request = async () => {
     const timeout = AbortSignal.timeout(config.usageFetchTimeoutMs);
     const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
-    res = await fetchFn(config.codexUsageUrl, {
-      method: "GET",
-      headers: {
-        authorization: `Bearer ${creds.accessToken}`,
-        [CODEX_ACCOUNT_ID_HEADER]: creds.accountId ?? "",
-        originator: CODEX_ORIGINATOR,
-        "user-agent": config.codexUsageUserAgent,
-        accept: "application/json",
-      },
-      signal: combined,
-    });
-  } catch {
-    return null;
+    try {
+      return await fetchFn(config.codexUsageUrl, {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${creds.accessToken}`,
+          [CODEX_ACCOUNT_ID_HEADER]: creds.accountId ?? "",
+          originator: CODEX_ORIGINATOR,
+          "user-agent": config.codexUsageUserAgent,
+          accept: "application/json",
+        },
+        signal: combined,
+      });
+    } catch {
+      throw new Error(combined.aborted ? "Codex usage request timed out or was cancelled" : "Codex usage request failed (network error)");
+    }
+  };
+  let res = await request();
+  // The server can invalidate a token before its locally recorded expiry.
+  // Like inference, retry once with refreshed credentials on an auth failure.
+  if (res.status === 401 || res.status === 403) {
+    await res.body?.cancel();
+    signal?.throwIfAborted();
+    // A concurrent inference request may already have replaced the rejected token.
+    const current = mgr.getOpenAICreds(account.name);
+    const alreadyRefreshed = !!current?.accessToken && current.accessToken !== creds.accessToken;
+    creds = await credentials(!alreadyRefreshed);
+    res = await request();
   }
-  if (!res.ok) return null;
+  if (!res.ok) {
+    await res.body?.cancel();
+    throw new Error(`Codex usage request failed (HTTP ${res.status})${res.status === 401 || res.status === 403 ? "; re-run accounts login" : ""}`);
+  }
   let text: string;
   try {
     text = await res.text();
   } catch {
-    return null;
+    throw new Error("Codex usage response could not be read");
   }
   return mapCodexUsageResponse(asObject(parseJson(text)), Date.now());
 }
@@ -118,7 +141,7 @@ export async function maybeRefreshCodexUsage(
     try {
       const snap = await fetchCodexUsageSnapshot(account, mgr, config);
       if (snap) mgr.recordUsageSnapshot(account.name, snap);
-      else mgr.recordUsageCheckError(account.name, "codex usage refresh failed (see logs)");
+      else mgr.recordUsageCheckError(account.name, "Codex usage response contained no usable rate-limit data");
     } catch (err) {
       mgr.recordUsageCheckError(account.name, (err as Error).message);
     } finally {

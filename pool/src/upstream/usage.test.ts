@@ -289,7 +289,7 @@ test("sweepUsageRefresh refreshes stale authenticated anthropic accounts, skips 
     });
     await sweepUsageRefresh(mgr, loadConfig());
     expect(fetchedNames).toEqual(["idle-stale"]);
-    expect(mgr.errors).toContain("codex usage refresh failed (see logs)");
+    expect(mgr.errors).toContain("Codex token refresh failed; check connectivity or re-run accounts login");
   } finally {
     globalThis.fetch = orig;
   }
