@@ -661,6 +661,8 @@ describe("settings runtime: collapse persistence + anti-clobber", () => {
       "document", "localStorage", "matchMedia", "fetch",
       `${stubbed}\nreturn {
         refresh,
+        wireTuning,
+        tuningPanelHtml,
         renderSettings,
         finishSettingsSave: typeof finishSettingsSave === "undefined" ? undefined : finishSettingsSave,
         getDirty: () => settingsDirty,
@@ -669,6 +671,29 @@ describe("settings runtime: collapse persistence + anti-clobber", () => {
     const api = factory(document, localStorage, () => ({ matches: false }), fetchImpl);
     return { api, els, store, document };
   }
+
+  test("taper input rejects zero locally without rejecting positive custom values", () => {
+    let requests = 0;
+    const { api, els, document } = loadRuntime({}, async () => {
+      requests++;
+      return Response.json({ ok: true });
+    });
+    const rendered = api.tuningPanelHtml({ headroomTaperStart: 0.2 });
+    const inputTag = rendered.match(/<input[^>]*data-tuning="headroomTaperStart"[^>]*>/)![0];
+    const min = inputTag.match(/min="([^"]+)"/)![1];
+    const max = inputTag.match(/max="([^"]+)"/)![1];
+    const input = {
+      value: "0",
+      getAttribute: (key: string) => ({ min, max, "data-tuning": "headroomTaperStart" })[key as "min" | "max" | "data-tuning"] ?? null,
+    };
+    document.querySelectorAll = () => [input];
+    api.wireTuning();
+    els["tuning-apply"].fire("click");
+    expect(requests).toBe(0);
+    expect(els["tuning-status"].textContent).toBe("out of range");
+    expect(Number(min)).toBeGreaterThan(0);
+    expect(Number(min)).toBeLessThanOrEqual(0.001);
+  });
 
   test("restores each panel's open state from localStorage (collapsed by default)", () => {
     const { els } = loadRuntime({ "cmp-open-settings-group": "1" });

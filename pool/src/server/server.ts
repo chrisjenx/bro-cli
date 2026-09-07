@@ -9,7 +9,7 @@
  */
 
 import type { Config } from "../config.ts";
-import { AccountManager, isValidPriority, isValidWeight, TUNING_BOUNDS, type RoutingTuning } from "../accounts/manager.ts";
+import { AccountManager, isValidPriority, isValidWeight, type RoutingTuning } from "../accounts/manager.ts";
 import {
   loadModelConfig,
   resolveModel,
@@ -100,10 +100,16 @@ export function startServer(config: Config): void {
         if (provider !== "anthropic" && provider !== "openai") return json({ error: { message: "Unknown preview provider" } }, 400);
         const model = url.searchParams.get("model") || null;
         const family = modelFamilyOf(model);
+        const accounts = mgr.listAccounts();
+        const now = Date.now();
+        const routing = mgr.routingSnapshot("anthropic", now);
+        const routingPreview = provider === "anthropic" && family === null
+          ? routing
+          : mgr.routingSnapshot(provider, now, family);
         return json({
-          accounts: mgr.listAccounts(),
-          routing: mgr.routingSnapshot(),
-          routingPreview: mgr.routingSnapshot(provider, Date.now(), family),
+          accounts,
+          routing,
+          routingPreview,
           routingContext: { provider, model, modelFamily: family },
           tuning: mgr.getTuning(),
           mapping: {
@@ -112,7 +118,7 @@ export function startServer(config: Config): void {
             targets: mappingTargets,
           },
           usageWindowMs: config.usageWindowMs,
-          now: Date.now(),
+          now,
         });
       }
       if (path === "/api/routing") {
@@ -549,14 +555,7 @@ export function handleRoutingUpdate(mgr: AccountManager, body: unknown): Respons
  */
 export function handleTuningUpdate(mgr: AccountManager, body: unknown): Response {
   if (!body || typeof body !== "object" || Array.isArray(body)) return json({ error: { message: "provide a tuning object" } }, 400);
-  for (const key of Object.keys(body)) {
-    if (!Object.hasOwn(TUNING_BOUNDS, key)) return json({ error: { message: `Unknown or retired tuning field: ${key}; expiry shares are fixed at 5:3:2:1:0.5…` } }, 400);
-  }
-  const b = body as Partial<Record<keyof RoutingTuning, unknown>>;
-  const patch: Partial<RoutingTuning> = {};
-  for (const key of Object.keys(TUNING_BOUNDS) as (keyof RoutingTuning)[]) {
-    if (b[key] !== undefined) patch[key] = b[key] as number;
-  }
+  const patch = body as Partial<RoutingTuning>;
   if (Object.keys(patch).length === 0) {
     return json({ error: { message: "provide at least one tuning field" } }, 400);
   }

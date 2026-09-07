@@ -76,7 +76,8 @@ export interface RoutingTuning {
  */
 export const TUNING_BOUNDS: Record<keyof RoutingTuning, { min: number; max: number }> = {
   fiveHourExp: { min: 0, max: 5 },
-  headroomTaperStart: { min: 0, max: 1 },
+  // Smallest representable positive value: both server and HTML inputs exclude zero.
+  headroomTaperStart: { min: Number.MIN_VALUE, max: 1 },
   minHeadroom: { min: 0, max: 1 },
 };
 
@@ -91,7 +92,7 @@ export function isValidTuningField(key: keyof RoutingTuning, n: unknown): n is n
   if (!Object.hasOwn(TUNING_BOUNDS, key)) return false;
   const b = TUNING_BOUNDS[key];
   return typeof n === "number" && Number.isFinite(n)
-    && n >= b.min && n <= b.max && (key !== "headroomTaperStart" || n > 0);
+    && n >= b.min && n <= b.max;
 }
 
 /** One step of the routing decision, showing where the chosen account stood. */
@@ -794,22 +795,10 @@ export class AccountManager {
    * never drift apart.
    */
   private rankHeadroom(pool: Account[], family: string | null, now: number): Account[] {
-    let best = pool[0]!;
-    let bestHeadroom = headroomFraction(best.usage, family, now);
-    for (const a of pool) {
-      const headroom = headroomFraction(a.usage, family, now);
-      if (
-        headroom > bestHeadroom ||
-        (headroom === bestHeadroom && a.usage.windowRequests < best.usage.windowRequests)
-      ) {
-        best = a;
-        bestHeadroom = headroom;
-      }
-    }
-    const minLoad = best.usage.windowRequests;
-    return pool.filter(
-      (a) => headroomFraction(a.usage, family, now) === bestHeadroom && a.usage.windowRequests === minLoad,
-    );
+    return tiedHeadroomAccounts(pool.map((account) => ({
+      account,
+      headroom: headroomFraction(account.usage, family, now),
+    })));
   }
 
   /**
@@ -840,9 +829,7 @@ export class AccountManager {
 
   /** The tied set of expiring winners (see sortExpiringCandidates), in ranked order. */
   private rankExpiring(pool: Account[], family: string | null, now: number): Account[] {
-    const sorted = this.sortExpiringCandidates(pool, family, now);
-    const best = sorted[0]!;
-    return sorted.filter((c) => compareExpiringCandidates(c, best) === 0).map((c) => c.account);
+    return tiedExpiringAccounts(this.sortExpiringCandidates(pool, family, now));
   }
 
   /**
@@ -960,14 +947,14 @@ export class AccountManager {
       // Keep the sorted reasons, selecting ties with the same cursor as pick.
       const ranked = tierPool
         .map((a) => ({ account: a, headroom: headroomFraction(a.usage, family, now) }))
-        .sort((x, y) => y.headroom - x.headroom || x.account.usage.windowRequests - y.account.usage.windowRequests);
-      best = this.previewTie(this.rankHeadroom(tierPool, family, now));
+        .sort(compareHeadroomCandidates);
+      best = this.previewTie(tiedHeadroomAccounts(ranked));
       ranked.sort((a, b) => Number(b.account === best) - Number(a.account === best));
       reason = buildHeadroomReason(minPriority, reserveTiers, tierPool.length, ranked);
     } else if (this.config.routingStrategy === "expiring") {
       const minHeadroom = this.getTuning().minHeadroom;
       const ranked = this.sortExpiringCandidates(tierPool, family, now, minHeadroom);
-      best = this.previewTie(this.rankExpiring(tierPool, family, now));
+      best = this.previewTie(tiedExpiringAccounts(ranked));
       ranked.sort((a, b) => Number(b.account === best) - Number(a.account === best));
       reason = buildExpiringReason(minPriority, reserveTiers, minHeadroom, ranked, now, tierPool.length);
     } else {
@@ -1378,7 +1365,7 @@ function buildHeadroomReason(
   activeTier: number,
   reserveTiers: number[],
   tierCount: number,
-  ranked: { account: Account; headroom: number }[],
+  ranked: HeadroomCandidate[],
 ): NextPickReason {
   const chosen = ranked[0]!;
   const runnerUp = ranked[1] ?? null;
@@ -1438,6 +1425,20 @@ interface WeightedCandidate extends WeightedFactors {
   account: Account;
   expiryReset: number | null;
   viable: boolean;
+}
+
+interface HeadroomCandidate {
+  account: Account;
+  headroom: number;
+}
+
+function compareHeadroomCandidates(a: HeadroomCandidate, b: HeadroomCandidate): number {
+  return b.headroom - a.headroom || a.account.usage.windowRequests - b.account.usage.windowRequests;
+}
+
+function tiedHeadroomAccounts(candidates: HeadroomCandidate[]): Account[] {
+  const best = candidates.reduce((a, b) => compareHeadroomCandidates(a, b) <= 0 ? a : b);
+  return candidates.filter((c) => compareHeadroomCandidates(c, best) === 0).map((c) => c.account);
 }
 
 interface ExpiringCandidate {
@@ -1558,6 +1559,10 @@ function expiryRankKey(usage: AccountUsage, modelFamily: string | null, now: num
 function candidateGateHeadroom(usage: AccountUsage, modelFamily: string | null, now: number): number {
   return headroomOf(bindingWindows(usage.rateLimitStatus, modelFamily, now)
     .filter((w) => windowDurationMs(w.key) === 5 * 3600_000));
+}
+
+function tiedExpiringAccounts(ranked: ExpiringCandidate[]): Account[] {
+  return ranked.filter((c) => compareExpiringCandidates(c, ranked[0]!) === 0).map((c) => c.account);
 }
 
 function compareExpiringCandidates(a: ExpiringCandidate, b: ExpiringCandidate): number {
