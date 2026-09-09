@@ -2,6 +2,12 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { loadConfig } from "./config.ts";
 
 const ENV_KEYS = [
+  "ANTHROPIC_IDLE_TIMEOUT_MS",
+  "CODEX_IDLE_TIMEOUT_MS",
+  "ANTHROPIC_MAX_INFLIGHT",
+  "CODEX_MAX_INFLIGHT",
+  "INFLIGHT_WAIT_MS",
+  "REQUEST_TIMEOUT_MS",
   "TOKEN_REFRESH_TIMEOUT_MS",
   "STREAM_KEEPALIVE_MS",
   "OVERLOAD_RETRY_MAX",
@@ -16,6 +22,29 @@ afterEach(() => {
     if (originalEnv[key] === undefined) delete process.env[key];
     else process.env[key] = originalEnv[key];
   }
+});
+
+test("inference scheduling defaults and env floors", () => {
+  for (const key of ENV_KEYS) delete process.env[key];
+  const defaults = loadConfig();
+  expect(defaults.anthropicIdleTimeoutMs).toBe(600_000);
+  expect(defaults.codexIdleTimeoutMs).toBe(300_000);
+  expect(defaults.codexMaxInFlight).toBe(4);
+  expect(defaults.anthropicMaxInFlight).toBe(0);
+  expect(defaults.inFlightWaitMs).toBe(90_000);
+  process.env.ANTHROPIC_IDLE_TIMEOUT_MS = "-1";
+  process.env.CODEX_IDLE_TIMEOUT_MS = "9999999";
+  process.env.CODEX_MAX_INFLIGHT = "-1";
+  process.env.ANTHROPIC_MAX_INFLIGHT = "2";
+  process.env.INFLIGHT_WAIT_MS = "-1";
+  process.env.REQUEST_TIMEOUT_MS = "60000";
+  const c = loadConfig();
+  expect(c.anthropicIdleTimeoutMs).toBe(30_000);
+  expect(c.codexIdleTimeoutMs).toBe(60_000);
+  expect(c.codexMaxInFlight).toBe(0);
+  expect(c.anthropicMaxInFlight).toBe(2);
+  expect(c.inFlightWaitMs).toBe(0);
+  expect(loadConfig({ requestTimeoutMs: 10_000 }).codexIdleTimeoutMs).toBe(10_000);
 });
 
 describe("timeout/interval config floors", () => {

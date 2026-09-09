@@ -43,6 +43,17 @@ export interface Config {
   proxyApiKey: string;
   /** Per-request upstream/subprocess timeout in milliseconds. */
   requestTimeoutMs: number;
+  /** Header/read-progress idle limits. These are separate from the per-attempt deadline. */
+  anthropicIdleTimeoutMs: number;
+  codexIdleTimeoutMs: number;
+  /** Per-account soft concurrency limits; 0 means unlimited. */
+  anthropicMaxInFlight: number;
+  codexMaxInFlight: number;
+  /** Total slot-wait budget per proxy invocation before soft-cap overflow.
+   * Waiting adds to first-byte latency; keep below client/server idle limits
+   * (the pool server defaults to 255s). It is not invisible to clients.
+   */
+  inFlightWaitMs: number;
   /**
    * Emit an SSE `ping` keep-alive when a streaming upstream goes idle this long
    * without sending bytes. Reasoning models (e.g. gpt-5.5 via Codex) can think
@@ -73,6 +84,12 @@ export interface Config {
   sessionIdleMs: number;
   /** Default: expiry-share / (live sessions + 1), with five-hour-only taper. */
   routingStrategy: "weighted" | "expiring" | "headroom";
+  /**
+   * Where Claude Code's auto-mode safety classifier requests go. "anthropic"
+   * (default) prefers Claude and bypasses the initial Sonnet mapping; existing
+   * mapped fallback remains available. "default" treats them like other requests.
+   */
+  classifierRoute: "anthropic" | "default";
   /**
    * Minimum live five-hour headroom preferred by weighted/expiring routing.
    * Includes matching model five-hour windows, never weekly windows. If every
@@ -125,6 +142,10 @@ function routingStrategyEnv(): "weighted" | "expiring" | "headroom" {
   return "weighted";
 }
 
+function classifierRouteEnv(): "anthropic" | "default" {
+  return process.env.CLASSIFIER_ROUTE?.toLowerCase() === "default" ? "default" : "anthropic";
+}
+
 function backendEnv(): "oauth" | "cli" {
   const raw = (process.env.CLAUDE_POOL_BACKEND || process.env.POOL_BACKEND || "oauth").toLowerCase();
   return raw === "cli" || raw === "subprocess" || raw === "claude" ? "cli" : "oauth";
@@ -154,6 +175,11 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
     port: intEnv("PORT", 3456),
     proxyApiKey: process.env.PROXY_API_KEY || "",
     requestTimeoutMs: intEnv("REQUEST_TIMEOUT_MS", 15 * 60 * 1000),
+    anthropicIdleTimeoutMs: positiveIntEnv("ANTHROPIC_IDLE_TIMEOUT_MS", 600_000, 30_000),
+    codexIdleTimeoutMs: positiveIntEnv("CODEX_IDLE_TIMEOUT_MS", 300_000, 30_000),
+    anthropicMaxInFlight: positiveIntEnv("ANTHROPIC_MAX_INFLIGHT", 0, 0),
+    codexMaxInFlight: positiveIntEnv("CODEX_MAX_INFLIGHT", 4, 0),
+    inFlightWaitMs: positiveIntEnv("INFLIGHT_WAIT_MS", 90_000, 0),
     streamKeepAliveMs: positiveIntEnv("STREAM_KEEPALIVE_MS", 1000, 100),
     usageWindowMs: intEnv("USAGE_WINDOW_MS", 5 * 60 * 60 * 1000),
     rateLimitCooldownMs: intEnv("RATE_LIMIT_COOLDOWN_MS", 60 * 60 * 1000),
@@ -163,6 +189,7 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
     overloadRetryMaxDelayMs: positiveIntEnv("OVERLOAD_RETRY_MAX_DELAY_MS", 8000, 0),
     sessionIdleMs: positiveIntEnv("SESSION_IDLE_MS", 30 * 60 * 1000, 60_000),
     routingStrategy: routingStrategyEnv(),
+    classifierRoute: classifierRouteEnv(),
     routingMinHeadroom: clamp(floatEnv("ROUTING_MIN_HEADROOM", 0.1), 0, 1),
     logFailover: process.env.LOG_FAILOVER !== "0",
     usageRefreshEnabled: process.env.CLAUDE_USAGE_REFRESH !== "0",
@@ -174,6 +201,8 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
     ...overrides,
   };
 
+  config.anthropicIdleTimeoutMs = Math.min(config.anthropicIdleTimeoutMs, config.requestTimeoutMs);
+  config.codexIdleTimeoutMs = Math.min(config.codexIdleTimeoutMs, config.requestTimeoutMs);
   return config;
 }
 

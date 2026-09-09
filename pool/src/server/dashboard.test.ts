@@ -47,6 +47,7 @@ function baseAccount(overrides: Record<string, unknown> = {}) {
     unavailableReason: null,
     weight: 1,
     activeSessions: 0,
+    inFlight: 0,
     usage: {
       windowRequests: 3,
       windowInputTokens: 100,
@@ -64,6 +65,12 @@ function baseAccount(overrides: Record<string, unknown> = {}) {
     ...overrides,
   };
 }
+
+test("card() shows live in-flight count separately from pinned sessions", () => {
+  const html = loadCard()(baseAccount({ inFlight: 3, activeSessions: 7 }));
+  expect(html).toContain('In-flight</span><span class="v">3');
+  expect(html).toContain('7 active');
+});
 
 test("card() falls back to est. bars for every window kind when no live snapshot exists", () => {
   const card = loadCard();
@@ -407,7 +414,7 @@ describe("model mapping card", () => {
       const preview = await previewResponse.json() as any;
       expect(previewResponse.status).toBe(200);
       expect(preview.routingContext).toEqual({ provider: "openai", model: "gpt-6-astra", modelFamily: null });
-      expect(preview.routingPreview).toEqual({ activeTier: null, nextPick: null, tiers: [] });
+      expect(preview.routingPreview).toEqual({ activeTier: null, nextPick: null, tiers: [], busy: [] });
       expect(preview.routing).toBeDefined();
       expect((await fetch(origin + "/api/status?provider=unknown")).status).toBe(400);
       const { mapping } = await response.json() as {
@@ -844,4 +851,12 @@ test("preview context uses account-wide label and includes manual weight", () =>
   expect(dashboardHtml()).toContain("Account-wide only");
   const rendered = loadRoutingPanel()({ nextPick: { account: "a" }, candidates: [{ account: "a", weight: 2, expiryShare: 5, activeSessions: 0, headroom: 1, fiveHourFactor: 1, score: 10, viable: true }] });
   expect(rendered).toContain("Manual weight");
+});
+
+
+test("routing panel explains capacity-skipped accounts when every slot is busy", () => {
+  const html = loadRoutingPanel()({ nextPick: null, busy: [{ account: "gpt-account", inFlight: 4, limit: 4 }] });
+  expect(html).toContain("gpt-account");
+  expect(html).toContain("4 / 4");
+  expect(html).toContain("soft limit");
 });

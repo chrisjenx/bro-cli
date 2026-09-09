@@ -89,9 +89,50 @@ This remains the seam for the CLI fallback and OpenAI compatibility path.
 - **Preview**: `/api/status?provider=anthropic&model=fable` adds a model-aware `routingPreview` and `routingContext`, while retaining the default `routing` field for existing clients. The dashboard's provider/model-family controls describe the next **new session**, not an already-pinned request, and show backend-computed expiry shares, pinned sessions, five-hour headroom/factor, viability and score. Preview does not advance the tie cursor, roll live usage, or write pins.
 - **Rate-limit handling**: direct proxy failover handles HTTP 429 and initial streaming rate-limit errors before committing SSE. Actual cooldowns evict pins; changing distribution alone does not. Deployment of code changes still requires a pool restart.
 
+## Inference idle limits and soft concurrency
+
+The direct Anthropic and Codex paths use explicit header/read-progress idle limits:
+
+| Environment setting | Default | Meaning |
+| --- | ---: | --- |
+| `ANTHROPIC_IDLE_TIMEOUT_MS` | 600000 | Wait for headers or the next requested upstream body chunk |
+| `CODEX_IDLE_TIMEOUT_MS` | 300000 | Same progress limit on the Codex path |
+| `ANTHROPIC_MAX_INFLIGHT` | 0 | Soft concurrent reservation limit per Claude account; zero is unlimited |
+| `CODEX_MAX_INFLIGHT` | 4 | Soft concurrent reservation limit per Codex account; zero is unlimited |
+| `INFLIGHT_WAIT_MS` | 90000 | Slot-wait budget shared across account retries and mapped provider fallback |
+
+Environment idle limits have a 30000 ms floor and are clamped to `REQUEST_TIMEOUT_MS`.
+Bun 1.3.14 ignores numeric `fetch({ timeout })` overrides, so inference fetches disable
+Bun's implicit socket timer with `timeout: false`. A shared watchdog bounds header
+waiting and each demanded upstream body read instead. The timer is paused when
+backpressure means no upstream read is pending. It does not alter response bytes,
+status or headers, and it is not equivalent to Codex's complete-SSE-event idle timer.
+`REQUEST_TIMEOUT_MS` remains a per-fetch-attempt deadline, not a whole-request deadline
+covering token refresh, slot waiting, backoff and retries. Client watchdogs and the
+server's 255-second idle limit remain independent and can expire earlier.
+
+Account selection and reservation happen synchronously before asynchronous token
+refresh. Reservations remain live through streaming, non-stream body consumption,
+and same-account retry/backoff, then release on completion, failure or client abort.
+Counts are in memory only and appear as `inFlight` in status and the dashboard, even
+for unlimited accounts. They differ from pinned session counts.
+
+Accounts at their soft limit are skipped in normal account and mapped-provider
+selection. If every otherwise-eligible account is busy, the proxy waits for a release.
+When the shared wait budget expires it may exceed the soft limit rather than invent
+a capacity error. Authentication, cooldown, model eligibility and failover exclusions
+are never bypassed. Thus the configured limit is not a hard maximum, and there is no
+guarantee of eliminating silent upstream holds. Waiting adds to first-byte latency;
+it is not invisible or guaranteed to fit within the client's timeout.
+
+Direct Anthropic SSE bytes remain unchanged. Existing Codex translation and independent
+timer-driven downstream pings remain unchanged. These controls apply to every model
+using the direct provider paths, including classifier requests and their mapped
+fallback, not just Sonnet or Opus. The legacy subprocess backend is unchanged.
+
 ## Failure modes
 
 - **No accounts / none available** → `503` with an OpenAI- or Anthropic-shaped error body.
 - **Client disconnects** → the request's `AbortSignal` aborts the upstream fetch or subprocess.
-- **Timeout** → `REQUEST_TIMEOUT_MS` aborts the direct upstream request/stream or subprocess.
+- **Timeout** → provider idle limits bound inference header/read waiting. `REQUEST_TIMEOUT_MS` bounds each fetch attempt or subprocess, not the complete retry lifecycle.
 - **CLI missing** → only affects `CLAUDE_POOL_BACKEND=cli` or OpenAI compatibility requests; a spawn error is surfaced as an `error` TurnEvent (→ `502`).

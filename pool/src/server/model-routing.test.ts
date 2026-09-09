@@ -9,7 +9,7 @@ import type { RateLimitSnapshot, RateLimitWindow } from "../accounts/types.ts";
 import { OPENAI_CREDS_FILENAME } from "../accounts/types.ts";
 import { AccountManager } from "../accounts/manager.ts";
 import { loadConfig } from "../config.ts";
-import { chooseMappedService, CROSS_PROVIDER_RETRY_STATUSES, serveWithCrossProviderFallback } from "./server.ts";
+import { anthropicServePlan, chooseMappedService, CROSS_PROVIDER_RETRY_STATUSES, serveWithCrossProviderFallback } from "./server.ts";
 import type { FailoverHooks } from "./failover.ts";
 
 /**
@@ -231,5 +231,59 @@ describe("serveWithCrossProviderFallback", () => {
     expect(res).toBe(retry200);
     expect(called).toEqual(["openai", "anthropic"]);
     expect(failoverCalls).toEqual([["openai pool", "anthropic pool"]]);
+  });
+});
+
+describe("anthropicServePlan", () => {
+  const classifier = { model: "claude-sonnet-5", max_tokens: 64, system: "You are a security monitor for autonomous AI coding agents.", messages: [] };
+  const normal = { model: "claude-sonnet-5", max_tokens: 64000, stream: true, tools: [{ name: "Bash" }], system: "You are a Claude agent.", messages: [] };
+
+  test("classifier with a Sonnet mapping: anthropic first, cross-provider fallback kept, no session affinity", () => {
+    const { poolDir, mgr } = crossProviderPool();
+    try {
+      const config = loadConfig({ classifierRoute: "anthropic" });
+      const plan = anthropicServePlan(mgr, config, classifier, "sess", true);
+      expect(plan).toEqual({ first: "anthropic", fallback: true, affinity: false, classifier: true });
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("classifier with anthropic accounts exhausted still starts on anthropic so the fallback can carry it", () => {
+    const { poolDir, mgr } = crossProviderPool();
+    try {
+      mgr.markRateLimited("claude1", Date.now() + 60 * 60_000);
+      const plan = anthropicServePlan(mgr, loadConfig({ classifierRoute: "anthropic" }), classifier, "sess", true);
+      expect(plan?.first).toBe("anthropic");
+      expect(plan?.fallback).toBe(true);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("classifier without a mapping: anthropic only, no fallback", () => {
+    const { poolDir, mgr } = crossProviderPool();
+    try {
+      const plan = anthropicServePlan(mgr, loadConfig({ classifierRoute: "anthropic" }), classifier, "sess", false);
+      expect(plan).toEqual({ first: "anthropic", fallback: false, affinity: false, classifier: true });
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("ordinary mapped request: provider chosen by headroom, affinity kept; unmapped ordinary request: no plan", () => {
+    const { poolDir, mgr } = crossProviderPool();
+    try {
+      const config = loadConfig({ classifierRoute: "anthropic" });
+      const plan = anthropicServePlan(mgr, config, normal, "sess", true);
+      expect(plan?.classifier).toBe(false);
+      expect(plan?.fallback).toBe(true);
+      expect(plan?.affinity).toBe(true);
+      expect(["anthropic", "openai"]).toContain(plan?.first ?? "");
+      expect(anthropicServePlan(mgr, config, normal, "sess", false)).toBeNull();
+      expect(anthropicServePlan(mgr, loadConfig({ classifierRoute: "default" }), classifier, "sess", false)).toBeNull();
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
   });
 });

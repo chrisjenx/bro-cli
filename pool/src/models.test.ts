@@ -340,6 +340,15 @@ describe("mappingFor", () => {
     }
   });
 
+  test("Sonnet's extended-context selector preserves its caller id while mapping to Terra", () => {
+    const route = mappingFor(cfgWith([{ from: "sonnet", to: "gpt-5.6-terra" }]), "claude-sonnet-5[1m]");
+    expect(route).toMatchObject({
+      id: "claude-sonnet-5[1m]",
+      provider: "openai",
+      upstreamModel: "gpt-5.6-terra",
+    });
+  });
+
   test("disabled flag, unknown family, and missing row return null", () => {
     expect(mappingFor(cfgWith(base, false), "fable")).toBeNull();
     expect(mappingFor(cfgWith(base), "gpt-5.5")).toBeNull();

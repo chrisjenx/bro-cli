@@ -48,8 +48,9 @@ import {
   streamAnthropic,
   type AnthropicRequest,
 } from "../adapters/anthropic.ts";
-import { anthropicError } from "../upstream/shared.ts";
+import { anthropicError, asObject, stringProp } from "../upstream/shared.ts";
 import { installGracefulShutdown } from "./shutdown.ts";
+import { bypassMappingForClassifier, classifierShapeMatches, isAutoModeClassifierRequest } from "./classifier.ts";
 
 const APPEND_SYSTEM_PROMPT =
   "You are being used as an API model endpoint. Respond directly to the user's request. " +
@@ -335,11 +336,70 @@ export function chooseMappedService(
   sessionKey: string | undefined,
   modelFamily: string | null,
 ): "anthropic" | "openai" | null {
-  const pick = mgr.pickProvider(sessionKey, [
-    { provider: "anthropic", modelFamily },
-    { provider: "openai", modelFamily: null },
-  ]);
+  const candidates = [
+    { provider: "anthropic" as const, modelFamily },
+    { provider: "openai" as const, modelFamily: null },
+  ];
+  // Capacity is a preference, not exhaustion. If both providers are busy,
+  // choose an otherwise-usable provider and let its proxy wait for a slot.
+  const pick = mgr.pickProvider(sessionKey, candidates)
+    ?? mgr.pickProvider(sessionKey, candidates, true);
   return pick?.provider ?? null;
+}
+
+export interface AnthropicServePlan {
+  /** Provider to try first; null when neither has a usable account. */
+  first: "anthropic" | "openai" | null;
+  /** Retry once on the other provider when `first` is exhausted. */
+  fallback: boolean;
+  /** Read/refresh the session's account pin. */
+  affinity: boolean;
+  classifier: boolean;
+}
+
+/**
+ * How an OAuth-backend /v1/messages request that is either mapped to Codex or
+ * recognised as the auto-mode classifier should be served. Null means the
+ * plain Anthropic path applies.
+ *
+ * The classifier is a plain Sonnet request, so it would otherwise inherit the
+ * Sonnet mapping and land on Codex; a slow/held Codex path then makes every
+ * tool call "unavailable". It starts on Claude accounts, keeps the cross-
+ * provider fallback when a mapping exists (an exhausted Claude pool must not
+ * 503 it), and never touches session affinity: it shares the session id with
+ * the real turns, and refreshing the anthropic pin would steer those turns
+ * away from their mapped provider.
+ */
+export function anthropicServePlan(
+  mgr: AccountManager,
+  config: Config,
+  body: unknown,
+  sessionKey: string | undefined,
+  mapped: boolean,
+): AnthropicServePlan | null {
+  if (bypassMappingForClassifier(config, body)) {
+    return { first: "anthropic", fallback: mapped, affinity: false, classifier: true };
+  }
+  if (!mapped) return null;
+  const family = modelFamilyOf(stringProp(asObject(body), "model"));
+  return { first: chooseMappedService(mgr, sessionKey, family), fallback: true, affinity: true, classifier: false };
+}
+
+let lastMarkerDriftLogAt = 0;
+/**
+ * A request with the classifier's shape but not its marker is the one signal
+ * that Claude Code reworded the prompt (which silently disables the bypass),
+ * so log it, rate-limited: other small non-streaming helper calls share the
+ * shape.
+ */
+function noteClassifierMarkerDrift(config: Config, body: unknown, model: string): void {
+  if (config.classifierRoute !== "anthropic") return;
+  if (modelFamilyOf(model) !== "sonnet") return;
+  if (!classifierShapeMatches(body) || isAutoModeClassifierRequest(body)) return;
+  const now = Date.now();
+  if (now - lastMarkerDriftLogAt < 5 * 60_000) return;
+  lastMarkerDriftLogAt = now;
+  console.log(`  ⚠ classifier-shaped Sonnet request without the auto-mode marker (model ${model}); if auto mode reports timeouts, the marker in server/classifier.ts may be stale`);
 }
 
 /** Serves a mapped request on `first`, retrying once on the other provider when
@@ -384,29 +444,35 @@ async function handleAnthropic(
     // avoids re-extracting body.model a second time.
     const requestedModel = route.id;
     const mapped = mappingFor(mappingState.config, requestedModel);
-    if (mapped) {
-      const sessionKey = extractSessionKey(body);
-      const family = modelFamilyOf(requestedModel);
-      const first = chooseMappedService(mgr, sessionKey, family);
-      const hooks = failoverHooks(config);
+    noteClassifierMarkerDrift(config, body, requestedModel);
+    const plan = anthropicServePlan(mgr, config, body, extractSessionKey(body), mapped !== null);
+    if (!plan) {
+      return proxyAnthropicMessages(body, headers, mgr, config, signal, failoverHooks(config));
+    }
 
-      const serve = (svc: "anthropic" | "openai") =>
-        svc === "openai"
-          ? proxyCodexMessages(body, mgr, config, signal, mapped, hooks)
-          : proxyAnthropicMessages(body, headers, mgr, config, signal, hooks);
+    const hooks = { ...failoverHooks(config), sessionAffinity: plan.affinity, slotWaitBudget: { remainingMs: config.inFlightWaitMs } };
+    const serve = (svc: "anthropic" | "openai") =>
+      svc === "openai" && mapped
+        ? proxyCodexMessages(body, mgr, config, signal, mapped, hooks)
+        : proxyAnthropicMessages(body, headers, mgr, config, signal, hooks);
 
-      if (!first) {
-        // Neither provider usable; let the anthropic path produce its 503.
-        return proxyAnthropicMessages(body, headers, mgr, config, signal, hooks);
-      }
+    let res: Response;
+    if (!plan.first) {
+      // Neither provider usable; let the anthropic path produce its 503.
+      res = await proxyAnthropicMessages(body, headers, mgr, config, signal, hooks);
+    } else if (plan.fallback) {
       // Cross-provider fallback: the proxies only return exhaustion statuses
       // when every same-provider account was exhausted before any bytes
       // streamed, so retrying the whole request on the other subscription is
       // safe.
-      return serveWithCrossProviderFallback(first, serve, hooks);
+      res = await serveWithCrossProviderFallback(plan.first, serve, hooks);
+    } else {
+      res = await serve(plan.first);
     }
-
-    return proxyAnthropicMessages(body, headers, mgr, config, signal, failoverHooks(config));
+    if (!plan.classifier) return res;
+    const out = new Response(res.body, res);
+    out.headers.set("X-Pool-Route", "classifier");
+    return out;
   }
 
   const legacyBody = body as AnthropicRequest;

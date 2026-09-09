@@ -801,3 +801,67 @@ test("a 403 with no other account surfaces the upstream error faithfully", async
     rmSync(poolDir, { recursive: true, force: true });
   }
 });
+
+test("sessionAffinity: false serves the request without creating or refreshing a session pin", async () => {
+  const { poolDir, mgr, config } = tempPool(["a", "b"]);
+  try {
+    mockFetch(() => jsonResponse({ id: "msg_1", type: "message", role: "assistant", content: [], usage: { input_tokens: 1, output_tokens: 1 } }));
+    const body = { model: "claude-sonnet-5", max_tokens: 64, messages: [{ role: "user", content: "hi" }], metadata: { user_id: "session-affinity" } };
+    const res = await proxyAnthropicMessages(body, new Headers(), mgr, config, new AbortController().signal, { sessionAffinity: false });
+    expect(res.status).toBe(200);
+    let pinned: Record<string, unknown> = {};
+    try {
+      pinned = JSON.parse(readFileSync(config.sessionsFile, "utf8")).sessions ?? {};
+    } catch {
+      // No ledger written at all is the strongest form of "no pin".
+    }
+    expect(Object.keys(pinned)).toHaveLength(0);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+// A stream that dies before any content is buffered (an idle-watchdog abort on
+// an upstream that answered 200 and then went silent, most importantly) has
+// committed nothing to the client, so it must fail over like any other
+// pre-commit fault rather than hand back a hard 502.
+test("a streaming body that fails before commit fails over instead of returning 502", async () => {
+  const { poolDir, mgr, config } = tempPool(["a", "b"]);
+  try {
+    const failovers: string[] = [];
+    const calls = mockFetch((_, init) => {
+      const token = new Headers(init.headers).get("authorization");
+      if (token === "Bearer tok-a") {
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.error(new Error("upstream went silent"));
+            },
+          }),
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      return sseResponse(
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":1}}}\n\n'
+          + 'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+      );
+    });
+
+    const response = await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", max_tokens: 8, stream: true, messages: [{ role: "user", content: "hi" }] },
+      new Headers(),
+      mgr,
+      config,
+      new AbortController().signal,
+      { onFailover: (from, to) => failovers.push(`${from}->${to}`) },
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-Pool-Account")).toBe("b");
+    expect(await response.text()).toContain("message_stop");
+    expect(calls.map((c) => c.headers.get("authorization"))).toEqual(["Bearer tok-a", "Bearer tok-b"]);
+    expect(failovers).toEqual(["a->b"]);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});

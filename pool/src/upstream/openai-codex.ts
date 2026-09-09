@@ -16,10 +16,13 @@ import { refreshOpenAIToken } from "../accounts/openai-oauth.ts";
 import { anthropicToCodexRequest, CodexToAnthropicStream } from "./codex-translate.ts";
 import { durationToWindowKey } from "./codex-windows.ts";
 import { CODEX_RESPONSES_URL, CODEX_ORIGINATOR, CODEX_ACCOUNT_ID_HEADER, CODEX_RATE_LIMIT_HEADERS } from "./codex-constants.ts";
-import { anthropicError, makeAbort, SseParser, isRateLimit, retryAfterMs, parseJson, stringProp, objectProp } from "./shared.ts";
+import { anthropicError, makeAbort, fetchWithIdleTimeout, SseParser, isRateLimit, retryAfterMs, parseJson, stringProp, objectProp } from "./shared.ts";
 
 interface ProxyHooks {
   onFailover?: (from: string, to: string) => void;
+  /** false: do not read or refresh the session's account pin (see anthropic.ts). */
+  sessionAffinity?: boolean;
+  slotWaitBudget?: { remainingMs: number };
 }
 
 interface RetryReason {
@@ -103,7 +106,9 @@ export async function proxyCodexMessages(
   const anthropicBody = (body ?? {}) as Record<string, unknown>;
   const metadata = anthropicBody.metadata as Record<string, unknown> | undefined;
   const sessionKey =
-    metadata && typeof metadata.user_id === "string" && metadata.user_id ? metadata.user_id : undefined;
+    hooks.sessionAffinity !== false && metadata && typeof metadata.user_id === "string" && metadata.user_id
+      ? metadata.user_id
+      : undefined;
   const streamRequested = anthropicBody.stream === true;
   const codexBody = anthropicToCodexRequest(
     anthropicBody,
@@ -111,29 +116,34 @@ export async function proxyCodexMessages(
     { effortMap: route.effortMap, supportedEfforts: supportedEffortsFor(route) },
   );
 
-  let account = mgr.pick(sessionKey, undefined, "openai");
-  if (!account) return anthropicError(503, "overloaded_error", noOpenAIAccountMessage(mgr));
-
   const tried = new Set<string>();
+  const budget = hooks.slotWaitBudget ?? { remainingMs: config.inFlightWaitMs };
+  let previous: string | undefined;
   let lastRetry: RetryReason | null = null;
 
-  while (account) {
-    tried.add(account.name);
-    const attempt = await tryCodexAccount(
-      account, codexBody, route, mgr, config, signal, streamRequested, fetchFn, sessionKey,
-    );
-
+  while (true) {
+    const lease = await mgr.reserveInFlight(sessionKey, tried, "openai", null, signal, budget);
+    if (signal.aborted) { lease?.release(); return clientAbortedResponse(); }
+    if (!lease) break;
+    const { account, release } = lease;
+    let streaming = false;
+    let attempt: AttemptResult;
+    try {
+      if (previous) hooks.onFailover?.(previous, account.name);
+      tried.add(account.name);
+      attempt = await tryCodexAccount(
+        account, codexBody, route, mgr, config, signal, streamRequested, fetchFn, sessionKey,
+        () => { streaming = true; return release; },
+      );
+    } finally { if (!streaming) release(); }
+    if (signal.aborted) { release(); return clientAbortedResponse(); }
     if (attempt.kind === "response") {
       if (sessionKey) mgr.setAffinity(sessionKey, account.name, "openai");
       return attempt.response;
     }
     if (attempt.kind === "terminal") return attempt.response;
-
     lastRetry = attempt.reason;
-    const next = mgr.pick(sessionKey, tried, "openai");
-    if (!next) break;
-    hooks.onFailover?.(account.name, next.name);
-    account = next;
+    previous = account.name;
   }
 
   return anthropicError(
@@ -141,6 +151,11 @@ export async function proxyCodexMessages(
     lastRetry?.type ?? "overloaded_error",
     lastRetry?.message ?? noOpenAIAccountMessage(mgr),
   );
+}
+
+/** Response for a request whose client disconnected mid-flight; nobody reads it. */
+function clientAbortedResponse(): Response {
+  return anthropicError(499, "request_aborted", "Request aborted by client");
 }
 
 function authReason(message: string, status = 401): RetryReason {
@@ -157,15 +172,18 @@ async function tryCodexAccount(
   streamRequested: boolean,
   fetchFn: typeof fetch,
   sessionKey: string | undefined,
+  onStream: () => () => void,
 ): Promise<AttemptResult> {
   let creds: OpenAIOauthCreds | null;
   try {
     creds = await ensureFreshToken(account.name, mgr, config, false, fetchFn);
   } catch (err) {
+    if (signal.aborted) return { kind: "terminal", response: clientAbortedResponse() };
     const message = (err as Error).message;
     mgr.recordError(account.name, message);
     return { kind: "retry", reason: authReason(message) };
   }
+  if (signal.aborted) return { kind: "terminal", response: clientAbortedResponse() };
   if (!creds?.accessToken) {
     const message = `Account "${account.name}" has no OpenAI access token`;
     mgr.recordError(account.name, message);
@@ -174,11 +192,14 @@ async function tryCodexAccount(
 
   let res: Response;
   let abortCleanup: () => void;
+  let upstreamFailure: AbortSignal;
   try {
     const attempt = await fetchCodex(creds, codexBody, config, signal, fetchFn);
     res = attempt.response;
     abortCleanup = attempt.cleanup;
+    upstreamFailure = attempt.failureSignal;
   } catch (err) {
+    if (signal.aborted) return { kind: "terminal", response: clientAbortedResponse() };
     const message = (err as Error).message;
     mgr.recordError(account.name, message);
     return { kind: "retry", reason: { status: 502, type: "api_error", message, rateLimited: false } };
@@ -189,6 +210,7 @@ async function tryCodexAccount(
     try {
       creds = await ensureFreshToken(account.name, mgr, config, true, fetchFn);
     } catch (err) {
+      if (signal.aborted) return { kind: "terminal", response: clientAbortedResponse() };
       const message = (err as Error).message;
       mgr.recordError(account.name, message);
       return { kind: "retry", reason: authReason(message) };
@@ -202,7 +224,9 @@ async function tryCodexAccount(
       const retryAttempt = await fetchCodex(creds, codexBody, config, signal, fetchFn);
       res = retryAttempt.response;
       abortCleanup = retryAttempt.cleanup;
+      upstreamFailure = retryAttempt.failureSignal;
     } catch (err) {
+      if (signal.aborted) return { kind: "terminal", response: clientAbortedResponse() };
       const message = (err as Error).message;
       mgr.recordError(account.name, message);
       return { kind: "retry", reason: { status: 502, type: "api_error", message, rateLimited: false } };
@@ -226,6 +250,7 @@ async function tryCodexAccount(
   if (res.status === 429) {
     const text = await res.text().catch(() => "");
     abortCleanup();
+    if (signal.aborted) return { kind: "terminal", response: clientAbortedResponse() };
     const resetAt = resetAtFromCodexHeaders(res.headers);
     mgr.markRateLimited(account.name, resetAt);
     return {
@@ -243,6 +268,7 @@ async function tryCodexAccount(
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     abortCleanup();
+    if (signal.aborted) return { kind: "terminal", response: clientAbortedResponse() };
     // A non-OK that isn't auth (401/403) or rate limit (429) is a request-shape
     // or backend rejection — deterministic across accounts, so it's terminal
     // rather than a failover trigger. Render the backend's own reason into one
@@ -268,6 +294,9 @@ async function tryCodexAccount(
     abortCleanup,
     config,
     sessionKey,
+    signal,
+    onStream,
+    upstreamFailure,
   );
 }
 
@@ -277,10 +306,10 @@ async function fetchCodex(
   config: Config,
   signal: AbortSignal,
   fetchFn: typeof fetch,
-): Promise<{ response: Response; cleanup: () => void }> {
+): Promise<{ response: Response; cleanup: () => void; failureSignal: AbortSignal }> {
   const abort = makeAbort(config, signal);
   try {
-    const response = await fetchFn(CODEX_RESPONSES_URL, {
+    const upstream = await fetchWithIdleTimeout(CODEX_RESPONSES_URL, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -291,8 +320,8 @@ async function fetchCodex(
       },
       body: JSON.stringify(codexBody),
       signal: abort.signal,
-    });
-    return { response, cleanup: abort.cleanup };
+    }, config.codexIdleTimeoutMs, fetchFn);
+    return { response: upstream.response, cleanup: () => { upstream.cleanup(); abort.cleanup(); }, failureSignal: upstream.failureSignal };
   } catch (err) {
     abort.cleanup();
     if (signal.aborted) throw new Error("Request aborted by client");
@@ -344,6 +373,9 @@ async function streamCodexResponse(
   cleanup: () => void,
   config: Config,
   sessionKey: string | undefined,
+  signal: AbortSignal,
+  onStream: () => () => void,
+  failureSignal: AbortSignal,
 ): Promise<AttemptResult> {
   const contextUsage = contextUsageFor(mgr);
   const translator = new CodexToAnthropicStream(
@@ -363,66 +395,119 @@ async function streamCodexResponse(
   const reader = body.getReader();
   const encoder = new TextEncoder();
 
+  // One teardown for every exit path: stop the keep-alive (a no-op before the
+  // timer exists), drop the upstream reader (a terminal protocol event
+  // completes the response; waiting for EOF can hang even after all output
+  // has arrived), then release the abort/timeout wiring.
+  let closed = false;
+  let releaseStream: (() => void) | undefined;
+  let outputController: ReadableStreamDefaultController<Uint8Array> | undefined;
+  let keepAliveTimer: ReturnType<typeof setInterval> | undefined;
+  const teardown = (reason?: unknown) => {
+    if (closed) return;
+    closed = true;
+    failureSignal.removeEventListener("abort", onFailure);
+    releaseStream?.();
+    if (keepAliveTimer) clearInterval(keepAliveTimer);
+    void reader.cancel(reason).catch(() => {});
+    cleanup();
+  };
+  // Deadlines and disconnects must tear down even when downstream never pulls.
+  const onFailure = () => {
+    if (closed) return;
+    const error = failureSignal.reason;
+    teardown(error);
+    if (!signal.aborted) mgr.recordError(account.name, error instanceof Error ? error.message : String(error));
+    outputController?.error(error);
+  };
+  const failRetry = (message: string): AttemptResult => {
+    teardown();
+    mgr.recordError(account.name, message);
+    return { kind: "retry", reason: { status: 502, type: "api_error", message, rateLimited: false } };
+  };
+  /**
+   * Settles a response that failed before anything reached the client. Both
+   * the streaming pre-commit path and the non-stream path land here so they
+   * agree: an upstream rate limit sidelines the account and retries; any
+   * other upstream-reported error is terminal (the next account would refuse
+   * it just the same); a synthesized failure (truncation, terminal event
+   * without message_start) is a transport fault worth another account.
+   */
+  const failedBeforeCommit = (upstreamError: { type: string; message: string } | null): AttemptResult => {
+    translator.finish();
+    if (upstreamError && isRateLimit(upstreamError.message)) {
+      teardown();
+      mgr.markRateLimited(account.name);
+      return {
+        kind: "retry",
+        reason: { status: 429, type: upstreamError.type, message: upstreamError.message, rateLimited: true },
+      };
+    }
+    if (upstreamError) {
+      teardown();
+      mgr.recordError(account.name, upstreamError.message);
+      return { kind: "terminal", response: anthropicError(502, upstreamError.type, upstreamError.message) };
+    }
+    return failRetry(translator.sawError?.message ?? "Codex stream ended before any content");
+  };
+  const readFailed = (err: unknown): AttemptResult => {
+    // The client hung up: not the account's fault, and nobody to retry for.
+    if (signal.aborted) {
+      teardown();
+      return { kind: "terminal", response: clientAbortedResponse() };
+    }
+    return failRetry((err as Error).message);
+  };
+
   if (streamRequested) {
     const pending: string[] = [];
     let committed = false;
-    let initialRateLimit: RetryReason | null = null;
 
     const parser = new SseParser((event) => {
       const frames = translator.handleEvent(event);
-      if (translator.sawError && !committed) {
-        if (isRateLimit(translator.sawError.message)) {
-          initialRateLimit = {
-            status: 429,
-            type: translator.sawError.type,
-            message: translator.sawError.message,
-            rateLimited: true,
-          };
-          return;
-        }
-      }
+      // An upstream error before anything was sent is settled by
+      // failedBeforeCommit (retry / terminal 502), never streamed as a lone
+      // error frame inside a 200.
+      if (translator.sawError && !committed) return;
       // gpt-5.5's reasoning-summary events (and other droppable preamble)
       // translate to no frames. Once the stream has started, emit a ping in
       // their place so the client sees keep-alive activity rather than silence
       // during a long reasoning phase — mirroring Anthropic's own ping events.
-      if (frames.length === 0 && translator.hasStarted && !translator.sawError) {
+      if (frames.length === 0 && translator.hasStarted && !translator.hasTerminalEvent) {
         pending.push(PING_FRAME);
       }
       if (frames.length > 0) committed = true;
       pending.push(...frames);
     });
 
-    // Drain until we can decide: either content committed, an early rate-limit
-    // error surfaced, the upstream stream ended, or we've buffered enough
-    // non-content preamble (64 KiB, matching anthropic.ts's prefix cap) that
-    // we should commit and stream the rest through normally rather than risk
-    // unbounded buffering against a misbehaving upstream.
+    // Drain until we can decide: either content committed, the response ended
+    // (terminal event or EOF), or we've buffered enough non-content preamble
+    // (64 KiB, matching anthropic.ts's prefix cap) that we should commit and
+    // stream the rest through normally rather than risk unbounded buffering
+    // against a misbehaving upstream.
     let upstreamDone = false;
     let prefixBytes = 0;
-    try {
-      while (!committed && !initialRateLimit && !upstreamDone && prefixBytes < 64 * 1024) {
-        const { value, done: d } = await reader.read();
-        if (d) {
-          upstreamDone = true;
-          break;
-        }
-        if (value) prefixBytes += value.byteLength;
+    const responseDone = () => upstreamDone || translator.hasTerminalEvent;
+    const readUpstream = async () => {
+      const { value, done: d } = await reader.read();
+      if (d) {
+        upstreamDone = true;
+        parser.end();
+      } else {
         parser.push(value);
       }
+      return value;
+    };
+    try {
+      while (!committed && !responseDone() && prefixBytes < 64 * 1024) {
+        const value = await readUpstream();
+        if (value) prefixBytes += value.byteLength;
+      }
     } catch (err) {
-      await reader.cancel().catch(() => {});
-      cleanup();
-      const message = (err as Error).message;
-      mgr.recordError(account.name, message);
-      return { kind: "retry", reason: { status: 502, type: "api_error", message, rateLimited: false } };
+      return readFailed(err);
     }
 
-    if (initialRateLimit) {
-      await reader.cancel().catch(() => {});
-      cleanup();
-      mgr.markRateLimited(account.name, (initialRateLimit as RetryReason).resetAt);
-      return { kind: "retry", reason: initialRateLimit };
-    }
+    if (!committed && responseDone()) return failedBeforeCommit(translator.sawError);
 
     // We hit the byte cap without the translator producing a single frame. That
     // happens when Codex's first event (response.created, which echoes the full
@@ -430,9 +515,12 @@ async function streamCodexResponse(
     // the parser can't complete it, so no message_start was emitted and the
     // client would see a 200 with no opening frame and hang. Synthesize the
     // message_start envelope now so the stream always opens promptly; the real
-    // response.created becomes a no-op once it finally parses in pull().
-    if (!committed && !upstreamDone) {
+    // response.created becomes a no-op once it finally parses in pull(). This
+    // counts as committed: a later upstream error must reach the client as an
+    // error frame rather than be swallowed by the pre-commit guard.
+    if (!committed) {
       pending.push(...translator.forceMessageStart());
+      committed = true;
     }
 
     const prefix = pending.splice(0, pending.length);
@@ -444,15 +532,31 @@ async function streamCodexResponse(
     // and its inactivity timeout fires. An interval enqueues pings regardless of
     // pull cadence, matching Anthropic's own periodic ping.
     let lastSentAt = Date.now();
-    let closed = false;
-    let keepAliveTimer: ReturnType<typeof setInterval> | undefined;
-    const stopKeepAlive = () => {
-      closed = true;
-      if (keepAliveTimer) clearInterval(keepAliveTimer);
+    const flush = (controller: ReadableStreamDefaultController<Uint8Array>, frames: string[]) => {
+      for (const frame of frames) controller.enqueue(encoder.encode(frame));
+      if (frames.length > 0) lastSentAt = Date.now();
     };
+    const finalize = (controller: ReadableStreamDefaultController<Uint8Array>) => {
+      flush(controller, [...pending.splice(0, pending.length), ...translator.finish()]);
+      if (translator.sawError) {
+        // Bytes are already committed, so the error frame is the client's
+        // answer; still sideline the account like the non-stream path does.
+        if (isRateLimit(translator.sawError.message)) mgr.markRateLimited(account.name);
+        else mgr.recordError(account.name, translator.sawError.message);
+      } else {
+        recordTerminalContext();
+        recordCodexSuccess(mgr, account.name, translator);
+      }
+      teardown();
+      controller.close();
+    };
+    releaseStream = onStream();
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
-        for (const frame of prefix) controller.enqueue(encoder.encode(frame));
+        outputController = controller;
+        failureSignal.addEventListener("abort", onFailure, { once: true });
+        if (failureSignal.aborted) { onFailure(); return; }
+        flush(controller, prefix);
         lastSentAt = Date.now();
         keepAliveTimer = setInterval(() => {
           if (closed) return;
@@ -462,53 +566,31 @@ async function streamCodexResponse(
               lastSentAt = Date.now();
             } catch {
               // Stream already closed/errored — stop pinging.
-              stopKeepAlive();
+              teardown();
             }
           }
         }, config.streamKeepAliveMs);
       },
       async pull(controller) {
-        const finalize = () => {
-          upstreamDone = true;
-          stopKeepAlive();
-          parser.end();
-          for (const frame of translator.finish()) controller.enqueue(encoder.encode(frame));
-          if (translator.sawError) {
-            mgr.recordError(account.name, translator.sawError.message);
-          } else {
-            recordTerminalContext();
-            recordCodexSuccess(mgr, account.name, translator);
-          }
-          cleanup();
-          controller.close();
-        };
-        if (upstreamDone) {
-          finalize();
-          return;
-        }
         try {
-          const { value, done: d } = await reader.read();
-          if (d) {
-            finalize();
-            return;
+          if (!responseDone()) {
+            await readUpstream();
+            if (closed) return;
           }
-          parser.push(value);
-          const frames = pending.splice(0, pending.length);
-          if (frames.length > 0) {
-            for (const frame of frames) controller.enqueue(encoder.encode(frame));
-            lastSentAt = Date.now();
+          if (responseDone()) {
+            finalize(controller);
+          } else {
+            flush(controller, pending.splice(0, pending.length));
           }
         } catch (err) {
-          stopKeepAlive();
-          mgr.recordError(account.name, (err as Error).message);
-          cleanup();
+          if (closed) return;
+          teardown();
+          if (!signal.aborted) mgr.recordError(account.name, (err as Error).message);
           controller.error(err);
         }
       },
-      async cancel(reason) {
-        stopKeepAlive();
-        cleanup();
-        await reader.cancel(reason).catch(() => {});
+      cancel(reason) {
+        teardown(reason);
       },
     });
 
@@ -531,38 +613,39 @@ async function streamCodexResponse(
     translator.handleEvent(event);
   });
   try {
-    while (true) {
+    while (!translator.hasTerminalEvent) {
       const { value, done } = await reader.read();
-      if (done) break;
+      if (done) {
+        collector.end();
+        break;
+      }
       collector.push(value);
     }
-    collector.end();
-    translator.finish();
   } catch (err) {
-    cleanup();
-    mgr.recordError(account.name, (err as Error).message);
-    return { kind: "terminal", response: anthropicError(502, "api_error", `Streaming proxy error: ${(err as Error).message}`) };
+    return readFailed(err);
   }
-  cleanup();
 
-  if (translator.sawError) {
-    if (isRateLimit(translator.sawError.message)) {
-      mgr.markRateLimited(account.name);
-      return {
-        kind: "retry",
-        reason: { status: 429, type: translator.sawError.type, message: translator.sawError.message, rateLimited: true },
-      };
-    }
-    mgr.recordError(account.name, translator.sawError.message);
-    return {
-      kind: "terminal",
-      response: anthropicError(502, translator.sawError.type, translator.sawError.message),
-    };
+  // Nothing has reached the client, so settle exactly as the streaming
+  // pre-commit path does: an upstream error event is terminal or a rate-limit
+  // retry; truncation or a terminal event without message_start fails over.
+  if (translator.sawError || !translator.hasTerminalEvent || !translator.hasStarted) {
+    return failedBeforeCommit(translator.sawError);
+  }
+  translator.finish();
+  // Re-read after finish(): control-flow narrowing still sees the null above.
+  const lateError = (translator as CodexToAnthropicStream).sawError;
+  if (lateError) {
+    // Corrupt tool arguments from the model: the response is unusable but
+    // another account would not do better.
+    teardown();
+    mgr.recordError(account.name, lateError.message);
+    return { kind: "terminal", response: anthropicError(502, lateError.type, lateError.message) };
   }
 
   const message = translator.toAnthropicMessage();
   recordTerminalContext();
   recordCodexSuccess(mgr, account.name, translator);
+  teardown();
   return {
     kind: "response",
     response: new Response(JSON.stringify(message), {

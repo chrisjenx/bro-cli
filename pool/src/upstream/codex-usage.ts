@@ -128,11 +128,18 @@ export async function maybeRefreshCodexUsage(
   config: Config,
 ): Promise<void> {
   if (!config.usageRefreshEnabled) return;
-  const lastActivity = Math.max(
-    account.usage.rateLimitStatus?.updatedAt ?? 0,
-    account.usage.lastUsageCheckAt ?? 0,
-  );
-  if (Date.now() - lastActivity < config.usageRefreshTtlMs) return;
+  // Gate on this poll's OWN cadence only. rateLimitStatus.updatedAt is bumped
+  // by the per-response x-codex-* header tap, and those headers describe just
+  // the request that produced them: they can never report that a limit was
+  // lifted upstream (the user spending a "Reset usage" credit, say). Folding
+  // updatedAt in here meant any account serving traffic more often than the
+  // TTL starved the ground-truth poll indefinitely — the account stayed
+  // benched at its last 429's snapshot until traffic happened to go quiet.
+  // lastUsageCheckAt covers both outcomes: recordUsageSnapshot bumps it on
+  // success and recordUsageCheckError bumps it on failure, so a failing
+  // endpoint still backs off by a full TTL rather than being retried hotly.
+  const lastCheck = account.usage.lastUsageCheckAt ?? 0;
+  if (Date.now() - lastCheck < config.usageRefreshTtlMs) return;
 
   const existing = codexUsageLocks.get(account.name);
   if (existing) return existing;

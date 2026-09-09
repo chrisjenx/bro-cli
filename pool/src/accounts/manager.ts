@@ -120,6 +120,7 @@ export interface RoutingSnapshot {
   tiers: { priority: number; accounts: string[]; available: number }[];
   /** Per-candidate factor breakdown; present only for the weighted strategy. */
   candidates?: ({ account: string } & WeightedFactors)[];
+  busy?: { account: string; inFlight: number; limit: number }[];
 }
 
 interface PersistedState {
@@ -168,6 +169,78 @@ function deadLoginReason(usage: AccountUsage, refreshToken: string | undefined):
 
 export class AccountManager {
   private config: Config;
+  private inFlight = new Map<string, number>();
+  private slotWaiters = new Set<(accounts: Account[]) => void>();
+
+  inFlightOf(name: string): number { return this.inFlight.get(name) ?? 0; }
+
+  /** Reservation is synchronous with selection; release is safe on every exit path. */
+  acquireInFlight(name: string): () => void {
+    this.inFlight.set(name, this.inFlightOf(name) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const count = this.inFlightOf(name) - 1;
+      if (count > 0) this.inFlight.set(name, count);
+      else this.inFlight.delete(name);
+      if (this.slotWaiters.size === 0) return;
+      // listAccounts() re-reads creds/usage per account: snapshot it once for
+      // the whole wake fan-out instead of once per waiter.
+      const accounts = this.listAccounts();
+      for (const wake of [...this.slotWaiters]) wake(accounts);
+    };
+  }
+
+  private atCap(a: Account): boolean {
+    const cap = a.provider === "openai" ? this.config.codexMaxInFlight : this.config.anthropicMaxInFlight;
+    return cap > 0 && this.inFlightOf(a.name) >= cap;
+  }
+
+  waitForSlot(provider: Provider, family: string | null, signal: AbortSignal, maxMs: number, exclude?: ReadonlySet<string>): Promise<void> {
+    if (signal.aborted || maxMs <= 0) return Promise.resolve();
+    return new Promise((resolve) => {
+      const finish = () => {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", finish);
+        this.slotWaiters.delete(check);
+        resolve();
+      };
+      const check = (accounts: Account[] = this.listAccounts()) => {
+        const now = Date.now();
+        if (signal.aborted || accounts.some(a => this.usableFor(a, provider, family, now, exclude))) finish();
+      };
+      const timer = setTimeout(finish, maxMs);
+      this.slotWaiters.add(check);
+      signal.addEventListener("abort", finish, { once: true });
+      check();
+    });
+  }
+
+  /** One mutable wait budget is shared by all retries of the incoming request.
+   * The soft cap is bypassed only after that budget is spent, never auth/quota gates.
+   */
+  async reserveInFlight(sessionKey: string | undefined, exclude: ReadonlySet<string> | undefined, provider: Provider, family: string | null, signal: AbortSignal, budget: { remainingMs: number }): Promise<{ account: Account; release: () => void } | null> {
+    let waited = 0;
+    while (!signal.aborted) {
+      const account = this.pick(sessionKey, exclude, provider, family)
+        ?? (budget.remainingMs <= 0 ? this.pick(sessionKey, exclude, provider, family, { ignoreCap: true }) : null);
+      if (account) {
+        const free = this.acquireInFlight(account.name);
+        const release = () => { signal.removeEventListener("abort", release); free(); };
+        signal.addEventListener("abort", release, { once: true });
+        if (waited > 0 && this.config.logFailover) console.log(`  ↻ waited ${Math.round(waited)}ms for a ${provider} slot`);
+        return { account, release };
+      }
+      const now = Date.now();
+      if (!this.listAccounts().some(a => this.usableFor(a, provider, family, now, exclude, true))) return null;
+      await this.waitForSlot(provider, family, signal, budget.remainingMs, exclude);
+      const elapsed = Date.now() - now;
+      waited += elapsed;
+      budget.remainingMs = Math.max(0, budget.remainingMs - elapsed);
+    }
+    return null;
+  }
   private usage: Record<string, AccountUsage> = {};
   /** Persistent session→account pins + per-account active-session load. */
   private sessions: SessionLedger;
@@ -629,6 +702,7 @@ export class AccountManager {
       priority: this.priorityFor(name),
       weight: this.weightFor(name),
       activeSessions: this.sessions.activeCount(name, now),
+      inFlight: this.inFlightOf(name),
       tokenExpiresAt,
       tokenExpired,
       usage,
@@ -650,10 +724,12 @@ export class AccountManager {
     family: string | null,
     now: number,
     exclude?: ReadonlySet<string>,
+    ignoreCap = false,
   ): boolean {
     return (
       a.available &&
       a.provider === provider &&
+      (ignoreCap || !this.atCap(a)) &&
       !exclude?.has(a.name) &&
       modelExhaustedReason(a.usage.rateLimitStatus, family, now) == null
     );
@@ -681,11 +757,12 @@ export class AccountManager {
     exclude?: ReadonlySet<string>,
     provider: Provider = "anthropic",
     modelFamily?: string | null,
+    options: { ignoreCap?: boolean } = {},
   ): Account | null {
     const now = Date.now();
     const family = modelFamily ?? null;
 
-    const available = this.listAccounts().filter((a) => this.usableFor(a, provider, family, now, exclude));
+    const available = this.listAccounts().filter((a) => this.usableFor(a, provider, family, now, exclude, options.ignoreCap));
     if (available.length === 0) return null;
 
     // Priority tiers: only spend the highest-priority (lowest number) tier that
@@ -703,7 +780,7 @@ export class AccountManager {
         // cost, so an existing session stays put while its account is usable
         // AND in the active tier — a session pinned to a fallback during a
         // primary outage must still move back once primary recovers.
-        if (this.usableFor(acct, provider, family, now, exclude) && acct.priority === minPriority) {
+        if (this.usableFor(acct, provider, family, now, exclude, options.ignoreCap) && acct.priority === minPriority) {
           this.sessions.touch(provider, sessionKey, pinned, now);
           return acct;
         }
@@ -736,7 +813,7 @@ export class AccountManager {
    *   4. otherwise the candidate whose best account has the most headroom;
    *      ties keep candidate order (callers list anthropic first).
    */
-  pickProvider(sessionKey: string | undefined, candidates: ProviderCandidate[]): ProviderCandidate | null {
+  pickProvider(sessionKey: string | undefined, candidates: ProviderCandidate[], ignoreCap = false): ProviderCandidate | null {
     const now = Date.now();
     // List once — the account set is identical for every candidate, only the
     // provider/family filter differs (listAccounts() reads creds/usage per account).
@@ -744,7 +821,7 @@ export class AccountManager {
     const usable = candidates
       .map((c) => ({
         c,
-        accounts: all.filter((a) => this.usableFor(a, c.provider, c.modelFamily, now)),
+        accounts: all.filter((a) => this.usableFor(a, c.provider, c.modelFamily, now, undefined, ignoreCap)),
       }))
       .filter((e) => e.accounts.length > 0);
     if (usable.length === 0) return null;
@@ -872,6 +949,7 @@ export class AccountManager {
         weight,
         expiryShare: urgency,
         activeSessions,
+        inFlight: account.inFlight,
         fiveHourFactor,
         urgency,
         loadFactor,
@@ -933,8 +1011,11 @@ export class AccountManager {
         available: accts.filter((a) => this.usableFor(a, provider, family, now)).length,
       }));
 
+    const busy = accounts
+      .filter(a => this.usableFor(a, provider, family, now, undefined, true) && this.atCap(a))
+      .map(a => ({ account: a.name, inFlight: a.inFlight, limit: provider === "openai" ? this.config.codexMaxInFlight : this.config.anthropicMaxInFlight }));
     const available = accounts.filter((a) => this.usableFor(a, provider, family, now));
-    if (available.length === 0) return { activeTier: null, nextPick: null, tiers };
+    if (available.length === 0) return { activeTier: null, nextPick: null, tiers, busy };
 
     const minPriority = Math.min(...available.map((a) => a.priority));
     const tierPool = available.filter((a) => a.priority === minPriority);
@@ -969,6 +1050,7 @@ export class AccountManager {
         weight: c.weight,
         expiryShare: c.expiryShare,
         activeSessions: c.activeSessions,
+        inFlight: c.inFlight,
         fiveHourFactor: c.fiveHourFactor,
         viable: c.viable,
         urgency: c.urgency,
@@ -977,7 +1059,7 @@ export class AccountManager {
         score: c.score,
       }));
     }
-    return { activeTier: minPriority, nextPick: { account: best.name, reason }, tiers, candidates };
+    return { activeTier: minPriority, nextPick: { account: best.name, reason }, tiers, candidates, busy };
   }
 
   /** Pin a session to the account that actually served it (post-failover). */
@@ -1410,6 +1492,7 @@ function bindingWindows(
 export interface WeightedFactors {
   expiryShare: number;
   activeSessions: number;
+  inFlight: number;
   fiveHourFactor: number;
   viable: boolean;
   weight: number;

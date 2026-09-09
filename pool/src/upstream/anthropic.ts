@@ -15,6 +15,7 @@ import type { CliUsage } from "../subprocess/types.ts";
 import {
   anthropicError,
   makeAbort,
+  fetchWithIdleTimeout,
   SseParser,
   parseJson,
   asObject,
@@ -34,6 +35,13 @@ import { maybeRefreshUsage } from "./usage.ts";
 
 interface ProxyHooks {
   onFailover?: (from: string, to: string) => void;
+  /**
+   * false: neither read nor refresh the session's account pin. Used for
+   * side requests (auto-mode classifier) that share the session id but must
+   * not steer which provider/account the session's real turns land on.
+   */
+  sessionAffinity?: boolean;
+  slotWaitBudget?: { remainingMs: number };
 }
 
 interface RetryReason {
@@ -63,6 +71,7 @@ type AttemptResult =
 interface FetchResult {
   response: Response;
   cleanup: () => void;
+  failureSignal: AbortSignal;
 }
 
 type ByteReadResult = { done: true; value?: undefined } | { done: false; value: Uint8Array };
@@ -80,47 +89,42 @@ export async function proxyAnthropicMessages(
   signal: AbortSignal,
   hooks: ProxyHooks = {},
 ): Promise<Response> {
-  const sessionKey = extractSessionKey(body);
+  const sessionKey = hooks.sessionAffinity === false ? undefined : extractSessionKey(body);
   // Model-scoped usage windows (e.g. Fable's own allowance) only bind for
   // requests that actually target that model, so routing needs to know it.
   const modelFamily = modelFamilyOf(stringProp(asObject(body), "model"));
-  const first = mgr.pick(sessionKey, undefined, "anthropic", modelFamily);
-  if (!first) return anthropicError(503, "overloaded_error", noAccountMessage(mgr));
-
-  // Off the hot path: refresh this account's usage for the NEXT routing decision.
-  // Fire-and-forget — the current request routes immediately on existing data.
-  void maybeRefreshUsage(first, mgr, config).catch(() => {});
-
-  // Deliberate exception to forwarding the caller body verbatim: thinking
-  // blocks fabricated by the Codex translation path (see stripCodexThinking)
-  // carry signatures the real Anthropic API rejects with a retry-stable 400.
-  // Stripping only what this pool itself synthesized keeps a session that
-  // switched from a gpt-* to a claude-* model recoverable without user
-  // intervention; genuine caller content is untouched.
+  // Strip only thinking signatures synthesized by our Codex translation.
   const bodyText = JSON.stringify(stripCodexThinking(body) ?? {});
-  // Computed once from the already-parsed body; threaded into every attempt so
-  // the backoff loop doesn't re-JSON.parse bodyText on each retry.
   const streamRequested = Boolean(asObject(body)?.stream);
   const tried = new Set<string>();
-  let account: Account | null = first;
+  const budget = hooks.slotWaitBudget ?? { remainingMs: config.inFlightWaitMs };
+  let previous: string | undefined;
   let lastRetry: RetryReason | null = null;
 
-  while (account) {
-    tried.add(account.name);
-    const attempt = await tryAccount(account, bodyText, incomingHeaders, mgr, config, signal, streamRequested);
-
+  while (true) {
+    const lease = await mgr.reserveInFlight(sessionKey, tried, "anthropic", modelFamily, signal, budget);
+    if (signal.aborted) { lease?.release(); return anthropicError(499, "request_aborted", "Request aborted by client"); }
+    if (!lease) break;
+    const { account, release } = lease;
+    let streaming = false;
+    let attempt: AttemptResult;
+    try {
+      if (previous) hooks.onFailover?.(previous, account.name);
+      tried.add(account.name);
+      void maybeRefreshUsage(account, mgr, config).catch(() => {});
+      attempt = await tryAccount(account, bodyText, incomingHeaders, mgr, config, signal, streamRequested, () => {
+        streaming = true;
+        return release;
+      });
+    } finally { if (!streaming) release(); }
+    if (signal.aborted) { release(); return anthropicError(499, "request_aborted", "Request aborted by client"); }
     if (attempt.kind === "response") {
       if (sessionKey) mgr.setAffinity(sessionKey, account.name);
       return attempt.response;
     }
-
     if (attempt.kind === "terminal") return attempt.response;
-
     lastRetry = attempt.reason;
-    const next = mgr.pick(sessionKey, tried, "anthropic", modelFamily);
-    if (!next) break;
-    hooks.onFailover?.(account.name, next.name);
-    account = next;
+    previous = account.name;
   }
 
   return anthropicError(
@@ -138,17 +142,19 @@ async function tryAccount(
   config: Config,
   signal: AbortSignal,
   streamRequested: boolean,
+  onStream: () => () => void,
 ): Promise<AttemptResult> {
   const opts = { baseMs: config.overloadRetryBaseMs, maxDelayMs: config.overloadRetryMaxDelayMs };
   // Backoff budget spent (or client gone): record the overload once, at surface
   // time, and hand the caller the faithful upstream error.
   const surface = (reason: RetryReason): AttemptResult => {
+    if (signal.aborted) return { kind: "terminal", response: anthropicError(499, "request_aborted", "Request aborted by client") };
     mgr.recordError(account.name, reason.message);
     return { kind: "terminal", response: surfaceOverload(reason, account.name) };
   };
   let attempt = 0;
   while (true) {
-    const result = await attemptOnce(account, bodyText, incomingHeaders, mgr, config, signal, streamRequested);
+    const result = await attemptOnce(account, bodyText, incomingHeaders, mgr, config, signal, streamRequested, onStream);
     // Success, terminal, or a 429 rate-limit retry all pass straight up; only a
     // transient overload retry is handled here (same-account backoff).
     if (result.kind !== "retry" || !result.reason.transient) return result;
@@ -176,11 +182,13 @@ async function attemptOnce(
   config: Config,
   signal: AbortSignal,
   streamRequested: boolean,
+  onStream: () => () => void,
 ): Promise<AttemptResult> {
   let upstream: FetchResult;
   try {
     upstream = await fetchWithAccount(account, bodyText, incomingHeaders, mgr, config, signal, false);
   } catch (err) {
+    if (signal.aborted) return { kind: "terminal", response: anthropicError(499, "request_aborted", "Request aborted by client") };
     const message = (err as Error).message;
     mgr.recordError(account.name, message);
     return { kind: "retry", reason: authOrNetworkReason(message) };
@@ -191,6 +199,7 @@ async function attemptOnce(
     try {
       upstream = await fetchWithAccount(account, bodyText, incomingHeaders, mgr, config, signal, true);
     } catch (err) {
+      if (signal.aborted) return { kind: "terminal", response: anthropicError(499, "request_aborted", "Request aborted by client") };
       const message = (err as Error).message;
       mgr.recordError(account.name, message);
       return { kind: "retry", reason: authOrNetworkReason(message) };
@@ -207,6 +216,7 @@ async function attemptOnce(
   if (!upstream.response.ok) {
     const text = await upstream.response.text().catch(() => "");
     upstream.cleanup();
+    if (signal.aborted) return { kind: "terminal", response: anthropicError(499, "request_aborted", "Request aborted by client") };
     const reason = classifyHttpError(upstream.response.status, upstream.response.headers, text);
     if (reason.rejected) {
       // Benching here would sideline every account for rateLimitCooldownMs on
@@ -243,11 +253,18 @@ async function attemptOnce(
   }
 
   if (isSse && upstream.response.body) {
-    return prepareStreamingResponse(upstream, account, mgr);
+    return prepareStreamingResponse(upstream, account, mgr, signal, onStream);
   }
 
-  const text = await upstream.response.text();
-  upstream.cleanup();
+  let text: string;
+  try {
+    text = await upstream.response.text();
+  } catch (err) {
+    if (signal.aborted) return { kind: "terminal", response: anthropicError(499, "request_aborted", "Request aborted by client") };
+    const message = (err as Error).message;
+    mgr.recordError(account.name, message);
+    return { kind: "terminal", response: anthropicError(502, "api_error", message) };
+  } finally { upstream.cleanup(); }
   recordJsonUsage(text, mgr, account.name);
   return {
     kind: "response",
@@ -267,13 +284,13 @@ async function fetchWithAccount(
   const token = await accessTokenFor(account, mgr, config, forceRefresh);
   const abort = makeAbort(config, signal);
   try {
-    const response = await fetch(messagesUrl(config.anthropicApiBaseUrl), {
+    const upstream = await fetchWithIdleTimeout(messagesUrl(config.anthropicApiBaseUrl), {
       method: "POST",
       headers: upstreamHeaders(incomingHeaders, token),
       body: bodyText,
       signal: abort.signal,
-    });
-    return { response, cleanup: abort.cleanup };
+    }, config.anthropicIdleTimeoutMs);
+    return { response: upstream.response, cleanup: () => { upstream.cleanup(); abort.cleanup(); }, failureSignal: upstream.failureSignal };
   } catch (err) {
     abort.cleanup();
     if (signal.aborted) throw new Error("Request aborted by client");
@@ -285,6 +302,8 @@ async function prepareStreamingResponse(
   upstream: FetchResult,
   account: Account,
   mgr: AccountManager,
+  signal: AbortSignal,
+  onStream: () => () => void,
 ): Promise<AttemptResult> {
   const body = upstream.response.body;
   if (!body) {
@@ -337,7 +356,8 @@ async function prepareStreamingResponse(
       return { kind: "retry", reason: tap.initialTransient };
     }
 
-    const stream = streamWithTap(reader, prefix, tap, upstream.cleanup);
+    const release = onStream();
+    const stream = streamWithTap(reader, prefix, tap, () => { upstream.cleanup(); release(); }, signal, upstream.failureSignal);
     return {
       kind: "response",
       response: new Response(stream, {
@@ -348,10 +368,22 @@ async function prepareStreamingResponse(
     };
   } catch (err) {
     upstream.cleanup();
-    mgr.recordError(account.name, (err as Error).message);
+    if (signal.aborted) return { kind: "terminal", response: anthropicError(499, "request_aborted", "Request aborted by client") };
+    // Nothing reached the client yet (the prefix is still buffered), so a
+    // transport fault here — an idle-watchdog abort on an upstream that sent
+    // headers and then went silent, say — is worth another account rather than
+    // a hard 502. Mirrors the Codex path's readFailed().
+    const message = (err as Error).message;
+    mgr.recordError(account.name, message);
     return {
-      kind: "terminal",
-      response: anthropicError(502, "api_error", `Streaming proxy error: ${(err as Error).message}`),
+      kind: "retry",
+      reason: {
+        status: 502,
+        type: "api_error",
+        message: `Streaming proxy error: ${message}`,
+        rateLimited: false,
+        transient: false,
+      },
     };
   }
 }
@@ -361,43 +393,57 @@ function streamWithTap(
   prefix: Uint8Array[],
   tap: StreamUsageTap,
   cleanup: () => void,
+  signal: AbortSignal,
+  failureSignal: AbortSignal,
 ): ReadableStream<Uint8Array> {
   let prefixIndex = 0;
   let finished = false;
-
-  const finish = () => {
-    if (finished) return;
-    finished = true;
-    tap.finish();
+  let output: ReadableStreamDefaultController<Uint8Array>;
+  const stop = () => {
+    failureSignal.removeEventListener("abort", onFailure);
     cleanup();
   };
+  const fail = (error: unknown) => {
+    if (finished) return;
+    finished = true;
+    if (signal.aborted) tap.cancel();
+    else tap.error(error instanceof Error ? error.message : String(error));
+    stop();
+    output.error(error);
+  };
+  const onFailure = () => fail(failureSignal.reason);
 
   return new ReadableStream<Uint8Array>({
+    start(controller) {
+      output = controller;
+      failureSignal.addEventListener("abort", onFailure, { once: true });
+      if (failureSignal.aborted) onFailure();
+    },
     async pull(controller) {
+      if (finished) return;
       if (prefixIndex < prefix.length) {
         controller.enqueue(prefix[prefixIndex++]!);
         return;
       }
       try {
         const { value, done } = await reader.read();
+        if (finished) return;
         if (done) {
-          finish();
+          tap.finish();
+          finished = true;
+          stop();
           controller.close();
-          return;
-        }
-        if (value) {
+        } else if (value) {
           tap.push(value);
           controller.enqueue(value);
         }
-      } catch (err) {
-        tap.error((err as Error).message);
-        cleanup();
-        controller.error(err);
-      }
+      } catch (err) { fail(err); }
     },
     async cancel(reason) {
+      if (finished) return;
+      finished = true;
       tap.cancel();
-      cleanup();
+      stop();
       await reader.cancel(reason).catch(() => {});
     },
   });

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { loadConfig } from "../config.ts";
@@ -147,6 +147,24 @@ const sse = [
   "",
   "",
 ].join("\n");
+/** The fixture up to (not including) its terminal event. */
+const ssePrefix = sse.slice(0, sse.indexOf('data: {"type":"response.completed"'));
+const enc = new TextEncoder();
+const CODEX_ROUTE = { id: "gpt", provider: "openai", upstreamModel: "gpt-5.2-codex" } as const;
+
+/** Sends a minimal /v1/messages body through proxyCodexMessages with a stubbed upstream body. */
+function proxyWithUpstream(
+  mgr: AccountManager,
+  config: ReturnType<typeof loadConfig>,
+  stream: boolean,
+  upstream: string | ReadableStream<Uint8Array>,
+): Promise<Response> {
+  return proxyCodexMessages(
+    { model: CODEX_ROUTE.id, messages: [{ role: "user", content: "hi" }], stream },
+    mgr, config, new AbortController().signal, CODEX_ROUTE, {},
+    (async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) => new Response(upstream)) as typeof fetch,
+  );
+}
 
 describe("describeCodexError", () => {
   test("surfaces the backend `detail` with context instead of raw JSON", () => {
@@ -173,6 +191,145 @@ describe("describeCodexError", () => {
 });
 
 describe("proxyCodexMessages", () => {
+  /**
+   * Serves one request over real HTTP against an upstream that sends
+   * `ssePrefix`, then `terminalChunk` once the request is in flight, and
+   * never closes on its own. Fails if the proxy waits for transport EOF.
+   */
+  async function serveHeldOpenUpstream(
+    stream: boolean,
+    terminalChunk: string,
+    check: (mgr: AccountManager, response: { status: number; text: string }) => void,
+  ): Promise<void> {
+    const { poolDir, mgr } = tempOpenAIPool(["gpt1"]);
+    const config = loadConfig({ poolDir, accountsDir: join(poolDir, "accounts"), usageFile: join(poolDir, "usage.json"), streamKeepAliveMs: 20 });
+    let upstreamController!: ReadableStreamDefaultController<Uint8Array>;
+    let cancelled = false;
+    const upstream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        upstreamController = controller;
+        controller.enqueue(enc.encode(ssePrefix));
+      },
+      cancel() { cancelled = true; },
+    });
+    const server = Bun.serve({
+      hostname: "127.0.0.1", port: 0,
+      fetch: () => proxyWithUpstream(mgr, config, stream, upstream),
+    });
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = fetch(`http://127.0.0.1:${server.port}`).then(async (res) => ({ status: res.status, text: await res.text() }));
+      upstreamController.enqueue(enc.encode(terminalChunk));
+      const response = await Promise.race([
+        result,
+        new Promise<never>((_, reject) => { deadline = setTimeout(() => reject(new Error("waited for transport EOF")), 1000); }),
+      ]);
+      expect(cancelled).toBe(true);
+      check(mgr, response);
+    } finally {
+      clearTimeout(deadline);
+      if (!cancelled) upstreamController.close();
+      server.stop(true);
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  }
+
+  for (const stream of [true, false]) {
+    const mode = stream ? "streaming" : "non-stream";
+
+    // A streaming response commits message_start before EOF is known, so its
+    // failure surfaces as an SSE error frame inside a 200; non-stream and
+    // empty bodies fail before commit and get a 502.
+    for (const { label, body, status } of [
+      { label: "empty", body: "", status: 502 },
+      { label: "partial", body: ssePrefix, status: stream ? 200 : 502 },
+      { label: "unterminated terminal event", body: sse.trimEnd(), status: stream ? 200 : 502 },
+    ]) {
+      test(`${mode}: ${label} EOF is not recorded as success`, async () => {
+        const { poolDir, mgr } = tempOpenAIPool(["gpt1"]);
+        try {
+          const config = loadConfig({ poolDir, accountsDir: join(poolDir, "accounts"), usageFile: join(poolDir, "usage.json") });
+          const res = await proxyWithUpstream(mgr, config, stream, body);
+          const text = await res.text();
+          expect(res.status).toBe(status);
+          expect(text).toContain("before a terminal event");
+          expect(text).not.toContain("message_stop");
+          expect(mgr.getAccount("gpt1").usage.totalRequests).toBe(0);
+          expect(mgr.getAccount("gpt1").usage.lastError).toContain("before a terminal event");
+        } finally {
+          rmSync(poolDir, { recursive: true, force: true });
+        }
+      });
+    }
+
+    for (const { event, stop } of [
+      { event: { type: "response.completed", response: { status: "completed" } }, stop: "end_turn" },
+      { event: { type: "response.incomplete", response: { status: "incomplete", incomplete_details: { reason: "max_output_tokens" } } }, stop: "max_tokens" },
+      { event: { type: "response.incomplete", response: { status: "incomplete", incomplete_details: { reason: "content_filter" } } }, stop: "refusal" },
+    ]) {
+      test(`${mode}: ${event.type}/${stop} finishes without transport EOF over HTTP`, async () => {
+        await serveHeldOpenUpstream(stream, `data: ${JSON.stringify(event)}\n\n`, (mgr, response) => {
+          expect(response.status).toBe(200);
+          if (stream) {
+            expect((response.text.match(/event: message_stop/g) ?? [])).toHaveLength(1);
+            expect(response.text).toContain(`"stop_reason":"${stop}"`);
+          } else {
+            expect(JSON.parse(response.text)).toMatchObject({ content: [{ type: "text", text: "Hi" }], stop_reason: stop });
+          }
+          expect(mgr.getAccount("gpt1").usage.totalRequests).toBe(1);
+        });
+      });
+    }
+
+    test(`${mode}: response.failed ends the response without transport EOF over HTTP`, async () => {
+      const failed = { type: "response.failed", response: { error: { code: "server_error", message: "upstream failed" } } };
+      await serveHeldOpenUpstream(stream, `data: ${JSON.stringify(failed)}\n\n`, (mgr, response) => {
+        expect(response.text).toContain("upstream failed");
+        expect(response.text).not.toContain("message_stop");
+        expect(mgr.getAccount("gpt1").usage.totalRequests).toBe(0);
+      });
+    });
+  }
+
+  test("non-stream: truncated upstream fails over to the next account like the streaming path", async () => {
+    const { poolDir, mgr } = tempOpenAIPool(["gpt1", "gpt2"]);
+    try {
+      const config = loadConfig({ poolDir, accountsDir: join(poolDir, "accounts"), usageFile: join(poolDir, "usage.json") });
+      const bodies = [ssePrefix, sse];
+      const fakeFetch = (async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) =>
+        new Response(bodies.shift() ?? "")) as typeof fetch;
+      const res = await proxyCodexMessages(
+        { model: CODEX_ROUTE.id, messages: [{ role: "user", content: "hi" }] },
+        mgr, config, new AbortController().signal, CODEX_ROUTE, {}, fakeFetch,
+      );
+      expect(res.status).toBe(200);
+      expect(bodies).toHaveLength(0);
+      const first = mgr.getAccount("gpt1").usage;
+      const second = mgr.getAccount("gpt2").usage;
+      const [truncated, served] = first.totalRequests === 0 ? [first, second] : [second, first];
+      expect(truncated.lastError).toContain("before a terminal event");
+      expect(served.totalRequests).toBe(1);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("streaming: a post-commit rate-limit error sidelines the account", async () => {
+    const { poolDir, mgr } = tempOpenAIPool(["gpt1"]);
+    try {
+      const config = loadConfig({ poolDir, accountsDir: join(poolDir, "accounts"), usageFile: join(poolDir, "usage.json") });
+      const limited = { type: "error", error: { code: "rate_limit_exceeded", message: "You have hit your usage limit" } };
+      const res = await proxyWithUpstream(mgr, config, true, `${ssePrefix}data: ${JSON.stringify(limited)}\n\n`);
+      const text = await res.text();
+      expect(res.status).toBe(200);
+      expect(text).toContain("usage limit");
+      expect(text).not.toContain("message_stop");
+      expect(mgr.getAccount("gpt1").usage.rateLimitedUntil ?? 0).toBeGreaterThan(Date.now());
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
   test("passes the route's max-effort capability into the Codex request", async () => {
     const { poolDir, mgr } = tempOpenAIPool(["gpt1"]);
     try {
@@ -965,4 +1122,123 @@ describe("proxyCodexMessages", () => {
     });
   }
 
+});
+
+describe("proxyCodexMessages review fixes", () => {
+  const codexConfig = (poolDir: string) =>
+    loadConfig({ poolDir, accountsDir: join(poolDir, "accounts"), usageFile: join(poolDir, "usage.json"), sessionsFile: join(poolDir, "sessions.json") });
+  const fetchBodies = (bodies: Array<string | ReadableStream<Uint8Array>>, onHit?: (init?: RequestInit) => void) => {
+    let hits = 0;
+    const fn = (async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      hits += 1;
+      onHit?.(init);
+      return new Response(bodies.shift() ?? "");
+    }) as typeof fetch;
+    return { fn, hits: () => hits };
+  };
+  const messages = [{ role: "user", content: "hi" }];
+
+  test("streaming: an oversized response.created followed by a rate-limit error still reaches the client as an error frame", async () => {
+    const { poolDir, mgr } = tempOpenAIPool(["gpt1"]);
+    try {
+      // The oversized line arrives in two reads: the proxy hits its prefix cap
+      // mid-line (synthesizing message_start), then the line completes and the
+      // rate-limit error follows in the same chunk.
+      const head = `data: {"type":"response.created","response":{"id":"r1","instructions":"${"x".repeat(70 * 1024)}`;
+      const tail = '"}}\n\ndata: {"type":"error","error":{"code":"rate_limit_exceeded","message":"You have hit your usage limit"}}\n\n';
+      const upstream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(enc.encode(head));
+          setTimeout(() => {
+            controller.enqueue(enc.encode(tail));
+            controller.close();
+          }, 20);
+        },
+      });
+      const { fn } = fetchBodies([upstream]);
+      const res = await proxyCodexMessages({ model: CODEX_ROUTE.id, messages, stream: true }, mgr, codexConfig(poolDir), new AbortController().signal, CODEX_ROUTE, {}, fn);
+      const text = await res.text();
+      expect(text).toContain("event: message_start");
+      expect(text).toContain("event: error");
+      expect(text).toContain("usage limit");
+      expect(mgr.getAccount("gpt1").usage.rateLimitedUntil).toBeGreaterThan(Date.now());
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("streaming: a pre-commit response.failed is a 502 like the non-stream path, not a 200 with a lone error frame", async () => {
+    const { poolDir, mgr } = tempOpenAIPool(["gpt1"]);
+    try {
+      const failed = 'data: {"type":"response.failed","response":{"error":{"code":"server_error","message":"upstream failed"}}}\n\n';
+      const { fn } = fetchBodies([failed]);
+      const res = await proxyCodexMessages({ model: CODEX_ROUTE.id, messages, stream: true }, mgr, codexConfig(poolDir), new AbortController().signal, CODEX_ROUTE, {}, fn);
+      expect(res.status).toBe(502);
+      expect(await res.text()).toContain("upstream failed");
+      expect(mgr.getAccount("gpt1").usage.lastError).toContain("upstream failed");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a client abort before commit is not recorded against the account and is not retried elsewhere", async () => {
+    const { poolDir, mgr } = tempOpenAIPool(["gpt1", "gpt2"]);
+    try {
+      const ac = new AbortController();
+      let hitCount = 0;
+      // Like real fetch: the body read rejects once the request signal aborts.
+      const fn = (async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        hitCount += 1;
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(enc.encode(": preamble\n\n"));
+            init?.signal?.addEventListener("abort", () => controller.error(new DOMException("The operation was aborted.", "AbortError")));
+          },
+        });
+        return new Response(body);
+      }) as typeof fetch;
+      const hits = () => hitCount;
+      const pending = proxyCodexMessages({ model: CODEX_ROUTE.id, messages, stream: true }, mgr, codexConfig(poolDir), ac.signal, CODEX_ROUTE, {}, fn);
+      setTimeout(() => ac.abort(), 30);
+      const res = await pending;
+      expect(res.status).not.toBe(200);
+      expect(hits()).toBe(1);
+      for (const name of ["gpt1", "gpt2"]) expect(mgr.getAccount(name).usage.lastError).toBeNull();
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("non-stream: a terminal event without response.created fails over like the streaming path", async () => {
+    const { poolDir, mgr } = tempOpenAIPool(["gpt1", "gpt2"]);
+    try {
+      const noStart = 'data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1}}}\n\n';
+      const { fn, hits } = fetchBodies([noStart, sse]);
+      const res = await proxyCodexMessages({ model: CODEX_ROUTE.id, messages }, mgr, codexConfig(poolDir), new AbortController().signal, CODEX_ROUTE, {}, fn);
+      expect(res.status).toBe(200);
+      expect(hits()).toBe(2);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("sessionAffinity: false serves without creating a session pin", async () => {
+    const { poolDir, mgr } = tempOpenAIPool(["gpt1"]);
+    try {
+      const config = codexConfig(poolDir);
+      const { fn } = fetchBodies([sse]);
+      const body = { model: CODEX_ROUTE.id, messages, metadata: { user_id: "sess-no-pin" } };
+      const res = await proxyCodexMessages(body, mgr, config, new AbortController().signal, CODEX_ROUTE, { sessionAffinity: false }, fn);
+      expect(res.status).toBe(200);
+      let pinned: Record<string, unknown> = {};
+      try {
+        pinned = JSON.parse(readFileSync(config.sessionsFile, "utf8")).sessions ?? {};
+      } catch {
+        // no ledger written
+      }
+      expect(Object.keys(pinned)).toHaveLength(0);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
 });

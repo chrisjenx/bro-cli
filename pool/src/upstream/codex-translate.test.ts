@@ -277,6 +277,27 @@ describe("stripCodexThinking", () => {
 describe("CodexToAnthropicStream", () => {
   const ev = (event: string, data: unknown) => ({ event, data: JSON.stringify(data) });
 
+  test("premature EOF is an error whether or not message_start was emitted", () => {
+    const beforeStart = new CodexToAnthropicStream("gpt");
+    const afterStart = new CodexToAnthropicStream("gpt");
+    afterStart.handleEvent(ev("response.created", { response: { id: "r1" } }));
+    for (const s of [beforeStart, afterStart]) {
+      expect(s.finish().map(parse).map((f) => f.type)).toEqual(["error"]);
+      expect(s.sawError?.message).toContain("before a terminal event");
+      expect(s.finish()).toEqual([]);
+    }
+  });
+
+  test("completion without usage closes cleanly and ignores trailing events", () => {
+    const s = new CodexToAnthropicStream("gpt");
+    s.handleEvent(ev("response.created", { response: { id: "r1" } }));
+    s.handleEvent(ev("response.completed", { response: { status: "completed" } }));
+    expect(s.handleEvent(ev("response.output_item.added", { item: { type: "message" } }))).toEqual([]);
+    expect(s.finish().map(parse).map((f) => f.type)).toEqual(["message_delta", "message_stop"]);
+    expect(s.sawError).toBeNull();
+    expect(s.hasTerminalUsage).toBe(false);
+  });
+
   test("text turn produces well-formed Anthropic SSE sequence", () => {
     const s = new CodexToAnthropicStream("gpt");
     const frames = [
@@ -400,6 +421,7 @@ describe("CodexToAnthropicStream", () => {
       ...s.handleEvent(ev("response.output_item.added", { item: { type: "message" } })),
       ...s.handleEvent(ev("response.output_text.delta", { delta: "Hi" })),
       ...s.handleEvent(ev("response.output_item.done", { item: { type: "message" } })),
+      ...s.handleEvent(ev("response.completed", { response: { status: "completed" } })),
       ...s.finish(),
     ];
     expect(rest.map(parse).map((d) => d.type)).toEqual([

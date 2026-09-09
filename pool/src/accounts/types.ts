@@ -258,6 +258,8 @@ export interface Account {
   weight: number;
   /** Live sessions currently pinned to this account (routing load signal). */
   activeSessions: number;
+  /** Live reserved requests, including auth/backoff; never persisted. */
+  inFlight: number;
   tokenExpiresAt: number | null;
   tokenExpired: boolean;
   usage: AccountUsage;

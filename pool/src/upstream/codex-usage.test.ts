@@ -6,7 +6,7 @@ import { loadConfig } from "../config.ts";
 import { AccountManager } from "../accounts/manager.ts";
 import { OPENAI_CREDS_FILENAME } from "../accounts/types.ts";
 import { CODEX_TOKEN_URL } from "./codex-constants.ts";
-import { fetchCodexUsageSnapshot, mapCodexUsageResponse } from "./codex-usage.ts";
+import { fetchCodexUsageSnapshot, mapCodexUsageResponse, maybeRefreshCodexUsage } from "./codex-usage.ts";
 
 // Trimmed from a real GET /backend-api/wham/usage capture (2026-07-14):
 // weekly window in the primary slot, 100% used but still allowed (unenforced).
@@ -189,3 +189,70 @@ for (const status of [401, 403]) {
     expect(refreshCalls).toBe(0);
   });
 }
+
+// A serving Codex account has its rateLimitStatus.updatedAt bumped by the
+// per-response x-codex-* header tap. Those headers only describe the request
+// that just happened: they cannot report that a limit was lifted upstream
+// (e.g. the user spent a "Reset usage" credit). Only GET /wham/usage can. So
+// the ground-truth poll must run on its own cadence, keyed to its own
+// lastUsageCheckAt, rather than being starved by header-tap freshness.
+function pollAccount(name: string, usage: Record<string, unknown>): Parameters<typeof maybeRefreshCodexUsage>[0] {
+  return { name, provider: "openai", authenticated: true, usage } as unknown as Parameters<typeof maybeRefreshCodexUsage>[0];
+}
+
+function pollMgr(): { mgr: AccountManager; snapshots: string[]; errors: string[] } {
+  const snapshots: string[] = [];
+  const errors: string[] = [];
+  const mgr = {
+    getOpenAICreds: () => ({ accessToken: "tok", refreshToken: "r", accountId: "acct", expiresAt: Date.now() + 3_600_000 }),
+    updateOpenAICreds: () => {},
+    recordUsageSnapshot: (n: string) => snapshots.push(n),
+    recordUsageCheckError: (n: string, m: string) => errors.push(`${n}: ${m}`),
+  } as unknown as AccountManager;
+  return { mgr, snapshots, errors };
+}
+
+test("polls ground truth for a busy account whose header tap keeps updatedAt fresh", async () => {
+  const { mgr, snapshots, errors } = pollMgr();
+  let usageCalls = 0;
+  const orig = globalThis.fetch;
+  globalThis.fetch = (async (_url: string | URL | Request) => { usageCalls++; return Response.json(UNENFORCED); }) as unknown as typeof fetch;
+  try {
+    // Header tap ran 2s ago (account is serving); the usage endpoint has not
+    // been polled in 20 minutes. This is the starvation case seen in the wild.
+    await maybeRefreshCodexUsage(
+      pollAccount("busy", {
+        rateLimitStatus: { unifiedStatus: "rejected", windows: [], updatedAt: Date.now() - 2_000 },
+        lastUsageCheckAt: Date.now() - 1_200_000,
+      }),
+      mgr,
+      loadConfig(),
+    );
+  } finally {
+    globalThis.fetch = orig;
+  }
+  expect(errors).toEqual([]);
+  expect(usageCalls).toBe(1);
+  expect(snapshots).toEqual(["busy"]);
+});
+
+test("still honours its own poll cadence after a recent usage check", async () => {
+  const { mgr, snapshots } = pollMgr();
+  let usageCalls = 0;
+  const orig = globalThis.fetch;
+  globalThis.fetch = (async (_url: string | URL | Request) => { usageCalls++; return Response.json(UNENFORCED); }) as unknown as typeof fetch;
+  try {
+    await maybeRefreshCodexUsage(
+      pollAccount("recently-checked", {
+        rateLimitStatus: { unifiedStatus: "allowed", windows: [], updatedAt: Date.now() - 1_200_000 },
+        lastUsageCheckAt: Date.now() - 5_000,
+      }),
+      mgr,
+      loadConfig(),
+    );
+  } finally {
+    globalThis.fetch = orig;
+  }
+  expect(usageCalls).toBe(0);
+  expect(snapshots).toEqual([]);
+});

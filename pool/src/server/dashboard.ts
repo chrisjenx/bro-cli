@@ -482,18 +482,22 @@ function rollOver(w) {
   return { ...w, utilization: 0, reset };
 }
 function routingPanelHtml(routing) {
-  if (!routing || !routing.nextPick) return "";
+  if (!routing) return "";
+  const busy = (routing.busy || []).map(function (c) {
+    return '<div class="summary muted">Busy: ' + esc(c.account) + ' · ' + esc(String(c.inFlight)) + ' / ' + esc(String(c.limit)) + ' soft limit</div>';
+  }).join("");
+  if (!routing.nextPick) return busy;
   const r = routing.nextPick.reason || { summary: "", factors: [] };
   const items = (r.factors || []).map((f) =>
     '<li class="fact' + (f.decisive ? " decisive" : "") + '">'
       + '<span class="fk">' + esc(f.label) + "</span>"
       + '<span class="fv">' + esc(f.detail) + (f.decisive ? " ◀" : "") + "</span></li>"
   ).join("");
-  return '<div class="pick">Next new session &rarr; <b>' + esc(routing.nextPick.account) + "</b>"
+  return busy + '<div class="pick">Next new session &rarr; <b>' + esc(routing.nextPick.account) + "</b>"
     + '<div class="summary muted" title="' + esc(r.summary) + '">' + esc(r.summary) + "</div></div>"
     + '<ul class="why">' + items + "</ul>"
-    + ((routing.candidates || []).length ? '<div style="overflow-x:auto"><table><thead><tr><th>Account</th><th>Manual weight</th><th>Expiry share</th><th>Pinned sessions</th><th>5h headroom</th><th>5h factor</th><th>Viability</th><th>Score</th></tr></thead><tbody>'
-      + routing.candidates.map(function (c) { return "<tr><td>" + esc(c.account) + "</td><td>" + esc(String(c.weight)) + "</td><td>" + esc(String(c.expiryShare)) + "</td><td>" + esc(String(c.activeSessions)) + "</td><td>" + Math.round(c.headroom * 100) + "%</td><td>" + Number(c.fiveHourFactor).toFixed(2) + "</td><td>" + (c.viable ? "Viable" : "Below 5h gate") + "</td><td>" + Number(c.score).toFixed(2) + "</td></tr>"; }).join("") + "</tbody></table></div>" : "");
+    + ((routing.candidates || []).length ? '<div style="overflow-x:auto"><table><thead><tr><th>Account</th><th>Manual weight</th><th>Expiry share</th><th>Pinned sessions</th><th>In-flight</th><th>5h headroom</th><th>5h factor</th><th>Viability</th><th>Score</th></tr></thead><tbody>'
+      + routing.candidates.map(function (c) { return "<tr><td>" + esc(c.account) + "</td><td>" + esc(String(c.weight)) + "</td><td>" + esc(String(c.expiryShare)) + "</td><td>" + esc(String(c.activeSessions)) + "</td><td>" + esc(String(c.inFlight ?? 0)) + "</td><td>" + Math.round(c.headroom * 100) + "%</td><td>" + Number(c.fiveHourFactor).toFixed(2) + "</td><td>" + (c.viable ? "Viable" : "Below 5h gate") + "</td><td>" + Number(c.score).toFixed(2) + "</td></tr>"; }).join("") + "</tbody></table></div>" : "");
 }
 
 // Cross-subscription model mapping: each Claude family (fable/opus/sonnet/haiku)
@@ -710,6 +714,7 @@ function card(a, isNext) {
       <span class="k">Cost (window)</span><span class="v">\${fmtUsd(u.windowCostUsd)}</span>
       <span class="k">Requests</span><span class="v">\${fmtInt(u.totalRequests)} · \${ago(u.lastUsedAt)}</span>
       <span class="k">Sessions</span><span class="v">\${fmtInt(a.activeSessions ?? 0)} active</span>
+      <span class="k">In-flight</span><span class="v">\${fmtInt(a.inFlight ?? 0)}</span>
       \${limitStatusRow}
       \${cooldownRow}
       \${usageCheckRow}

@@ -287,6 +287,7 @@ function mapToolChoice(choice: unknown): unknown {
 export class CodexToAnthropicStream {
   usage: { input_tokens: number; output_tokens: number; cache_read_input_tokens?: number };
   hasTerminalUsage = false;
+  hasTerminalEvent = false;
   stopReason: string | null = null;
   sawError: { type: string; message: string } | null = null;
 
@@ -325,9 +326,9 @@ export class CodexToAnthropicStream {
   }
 
   handleEvent(event: { event: string; data: string }): string[] {
-    // An error is terminal for the Anthropic SSE contract: once emitted, no
-    // further content frames may follow it.
-    if (this.sawError) return [];
+    // Terminal events end the response even if the transport stays open or
+    // another event follows in the same upstream chunk.
+    if (this.hasTerminalEvent || this.finished) return [];
     let data: Record<string, unknown>;
     try {
       data = JSON.parse(event.data) as Record<string, unknown>;
@@ -392,6 +393,7 @@ export class CodexToAnthropicStream {
         return this.closeBlock((data.item ?? {}) as Record<string, unknown>);
       case "response.completed":
       case "response.incomplete": {
+        this.hasTerminalEvent = true;
         const response = (data.response ?? {}) as Record<string, unknown>;
         const usage = (response.usage ?? {}) as Record<string, unknown>;
         const totalInput = usage.input_tokens;
@@ -432,6 +434,7 @@ export class CodexToAnthropicStream {
       }
       case "response.failed":
       case "error": {
+        this.hasTerminalEvent = true;
         const err = ((data.response as Record<string, unknown>)?.error ?? data.error ?? data) as Record<string, unknown>;
         this.sawError = {
           type: String(err.code ?? err.type ?? "api_error"),
@@ -477,17 +480,19 @@ export class CodexToAnthropicStream {
   }
 
   finish(): string[] {
-    if (this.finished || !this.started) return [];
-    if (this.sawError) {
-      this.finished = true;
-      return [];
-    }
+    if (this.finished) return [];
     this.finished = true;
+    if (this.sawError) return [];
     const frames = this.closeBlock();
-    if (this.argsError) {
-      // A tool call closed with corrupt args and no token-cap event excused
-      // it — end the stream with a terminal error instead of a clean close.
-      this.sawError = { type: "api_error", message: this.argsError };
+    // A tool call closed with corrupt args and no token-cap event excused
+    // it — end the stream with a terminal error instead of a clean close.
+    // Likewise, EOF is not a completion: only a terminal protocol event
+    // (after message_start) may close cleanly.
+    const failure = this.argsError
+      ?? (!this.hasTerminalEvent ? "Codex stream ended before a terminal event" : null)
+      ?? (!this.started ? "Codex stream ended without a message_start event" : null);
+    if (failure) {
+      this.sawError = { type: "api_error", message: failure };
       frames.push(frame("error", { type: "error", error: this.sawError }));
       return frames;
     }

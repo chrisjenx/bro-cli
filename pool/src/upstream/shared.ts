@@ -33,6 +33,11 @@ export class SseParser {
     this.pushText(this.decoder.decode(chunk, { stream: true }));
   }
 
+  /**
+   * Flushes the decoder at EOF. An event without its terminating blank line
+   * is discarded by design: callers treat it as a truncated stream, not a
+   * complete event.
+   */
   end(): void {
     const rest = this.decoder.decode();
     if (rest) this.pushText(rest);
@@ -85,8 +90,9 @@ export function anthropicError(status: number, type: string, message: string): R
 
 export function makeAbort(config: Config, signal: AbortSignal): { signal: AbortSignal; cleanup: () => void } {
   const controller = new AbortController();
-  const onAbort = () => controller.abort();
+  const onAbort = () => controller.abort(signal.reason);
   signal.addEventListener("abort", onAbort, { once: true });
+  if (signal.aborted) onAbort();
   const timeout = setTimeout(() => controller.abort(), config.requestTimeoutMs);
   return {
     signal: controller.signal,
@@ -95,6 +101,89 @@ export function makeAbort(config: Config, signal: AbortSignal): { signal: AbortS
       signal.removeEventListener("abort", onAbort);
     },
   };
+}
+
+/** Bun 1.3.14 ignores numeric fetch timeout values. Disable its implicit socket
+ * timer and bound header waiting and each demanded body read explicitly instead.
+ * Bytes pass through unchanged. Backpressure with no read pending is not idle.
+ */
+export async function fetchWithIdleTimeout(
+  input: string | URL,
+  init: RequestInit,
+  idleMs: number,
+  fetchFn: typeof fetch = fetch,
+): Promise<{ response: Response; cleanup: () => void; failureSignal: AbortSignal }> {
+  const abort = new AbortController();
+  // Error-only notification: intentional cleanup/EOF must not report failure.
+  const failure = new AbortController();
+  const incoming = init.signal;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let reader: Pick<ReadableStreamDefaultReader<Uint8Array>, "read" | "cancel"> | undefined;
+  let output: ReadableStreamDefaultController<Uint8Array> | undefined;
+  let closed = false;
+  const clear = () => { clearTimeout(timer); timer = undefined; };
+  const cleanup = () => {
+    if (closed) return;
+    closed = true;
+    clear();
+    incoming?.removeEventListener("abort", onIncomingAbort);
+    abort.signal.removeEventListener("abort", onAbort);
+    abort.abort();
+    void reader?.cancel().catch(() => {});
+  };
+  const onAbort = () => {
+    if (closed) return;
+    output?.error(abort.signal.reason);
+    failure.abort(abort.signal.reason);
+    cleanup();
+  };
+  const onIncomingAbort = () => abort.abort(incoming?.reason);
+  const arm = () => {
+    clear();
+    timer = setTimeout(() => abort.abort(new DOMException("Upstream idle timeout", "TimeoutError")), idleMs);
+  };
+  abort.signal.addEventListener("abort", onAbort, { once: true });
+  incoming?.addEventListener("abort", onIncomingAbort, { once: true });
+  if (incoming?.aborted) onIncomingAbort();
+  try {
+    abort.signal.throwIfAborted();
+    arm();
+    const response = await fetchFn(input, { ...init, signal: abort.signal, timeout: false } as RequestInit & { timeout: false });
+    clear();
+    abort.signal.throwIfAborted();
+    if (!response.body) { cleanup(); return { response, cleanup, failureSignal: failure.signal }; }
+    reader = response.body.getReader();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) { output = controller; },
+      async pull(controller) {
+        if (closed) return;
+        arm();
+        try {
+          while (!closed) {
+            const part = await reader!.read();
+            if (closed) return;
+            if (part.done) { cleanup(); controller.close(); return; }
+            // Empty chunks are not byte progress and must not re-arm the timer.
+            if (part.value.byteLength === 0) continue;
+            clear();
+            controller.enqueue(part.value);
+            return;
+          }
+        } catch (err) {
+          if (closed) return;
+          controller.error(err);
+          failure.abort(err);
+          cleanup();
+        }
+      },
+      cancel() { cleanup(); },
+    }, { highWaterMark: 0 });
+    return { response: new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers }), cleanup, failureSignal: failure.signal };
+  } catch (err) {
+    const reason = abort.signal.aborted ? abort.signal.reason : err;
+    cleanup();
+    throw reason;
+  }
 }
 
 /** Headers for a Claude Code OAuth request (usage, model list, …). One place to
