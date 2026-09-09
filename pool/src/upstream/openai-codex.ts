@@ -16,14 +16,8 @@ import { refreshOpenAIToken } from "../accounts/openai-oauth.ts";
 import { anthropicToCodexRequest, CodexToAnthropicStream } from "./codex-translate.ts";
 import { durationToWindowKey } from "./codex-windows.ts";
 import { CODEX_RESPONSES_URL, CODEX_ORIGINATOR, CODEX_ACCOUNT_ID_HEADER, CODEX_RATE_LIMIT_HEADERS } from "./codex-constants.ts";
-import { anthropicError, makeAbort, fetchWithIdleTimeout, SseParser, isRateLimit, retryAfterMs, parseJson, stringProp, objectProp } from "./shared.ts";
-
-interface ProxyHooks {
-  onFailover?: (from: string, to: string) => void;
-  /** false: do not read or refresh the session's account pin (see anthropic.ts). */
-  sessionAffinity?: boolean;
-  slotWaitBudget?: { remainingMs: number };
-}
+import { anthropicError, clientAbortedResponse, makeAbort, fetchWithIdleTimeout, SseParser, isRateLimit, retryAfterMs, parseJson, stringProp, objectProp, RETRYABLE_TRANSPORT_HEADER } from "./shared.ts";
+import type { ProxyHooks } from "./shared.ts";
 
 interface RetryReason {
   status: number;
@@ -31,6 +25,8 @@ interface RetryReason {
   message: string;
   rateLimited: boolean;
   resetAt?: number;
+  /** No bytes reached the caller and the upstream inference transport failed. */
+  transport?: boolean;
 }
 
 type AttemptResult =
@@ -146,18 +142,16 @@ export async function proxyCodexMessages(
     previous = account.name;
   }
 
-  return anthropicError(
+  const response = anthropicError(
     lastRetry?.status ?? 503,
     lastRetry?.type ?? "overloaded_error",
     lastRetry?.message ?? noOpenAIAccountMessage(mgr),
   );
+  if (lastRetry?.transport) response.headers.set(RETRYABLE_TRANSPORT_HEADER, "1");
+  return response;
 }
 
 /** Response for a request whose client disconnected mid-flight; nobody reads it. */
-function clientAbortedResponse(): Response {
-  return anthropicError(499, "request_aborted", "Request aborted by client");
-}
-
 function authReason(message: string, status = 401): RetryReason {
   return { status, type: "authentication_error", message, rateLimited: false };
 }
@@ -202,7 +196,7 @@ async function tryCodexAccount(
     if (signal.aborted) return { kind: "terminal", response: clientAbortedResponse() };
     const message = (err as Error).message;
     mgr.recordError(account.name, message);
-    return { kind: "retry", reason: { status: 502, type: "api_error", message, rateLimited: false } };
+    return { kind: "retry", reason: { status: 502, type: "api_error", message, rateLimited: false, transport: true } };
   }
 
   if (res.status === 401 || res.status === 403) {
@@ -229,7 +223,7 @@ async function tryCodexAccount(
       if (signal.aborted) return { kind: "terminal", response: clientAbortedResponse() };
       const message = (err as Error).message;
       mgr.recordError(account.name, message);
-      return { kind: "retry", reason: { status: 502, type: "api_error", message, rateLimited: false } };
+      return { kind: "retry", reason: { status: 502, type: "api_error", message, rateLimited: false, transport: true } };
     }
     if (res.status === 401 || res.status === 403) {
       abortCleanup();
@@ -420,10 +414,10 @@ async function streamCodexResponse(
     if (!signal.aborted) mgr.recordError(account.name, error instanceof Error ? error.message : String(error));
     outputController?.error(error);
   };
-  const failRetry = (message: string): AttemptResult => {
+  const failRetry = (message: string, transport: boolean): AttemptResult => {
     teardown();
     mgr.recordError(account.name, message);
-    return { kind: "retry", reason: { status: 502, type: "api_error", message, rateLimited: false } };
+    return { kind: "retry", reason: { status: 502, type: "api_error", message, rateLimited: false, transport } };
   };
   /**
    * Settles a response that failed before anything reached the client. Both
@@ -435,7 +429,7 @@ async function streamCodexResponse(
    */
   const failedBeforeCommit = (upstreamError: { type: string; message: string } | null): AttemptResult => {
     translator.finish();
-    if (upstreamError && isRateLimit(upstreamError.message)) {
+    if (upstreamError && isRateLimit(`${upstreamError.type} ${upstreamError.message}`)) {
       teardown();
       mgr.markRateLimited(account.name);
       return {
@@ -448,7 +442,10 @@ async function streamCodexResponse(
       mgr.recordError(account.name, upstreamError.message);
       return { kind: "terminal", response: anthropicError(502, upstreamError.type, upstreamError.message) };
     }
-    return failRetry(translator.sawError?.message ?? "Codex stream ended before any content");
+    return failRetry(
+      translator.sawError?.message ?? "Codex stream ended before any content",
+      !translator.hasTerminalEvent,
+    );
   };
   const readFailed = (err: unknown): AttemptResult => {
     // The client hung up: not the account's fault, and nobody to retry for.
@@ -456,7 +453,7 @@ async function streamCodexResponse(
       teardown();
       return { kind: "terminal", response: clientAbortedResponse() };
     }
-    return failRetry((err as Error).message);
+    return failRetry((err as Error).message, true);
   };
 
   if (streamRequested) {
@@ -541,7 +538,7 @@ async function streamCodexResponse(
       if (translator.sawError) {
         // Bytes are already committed, so the error frame is the client's
         // answer; still sideline the account like the non-stream path does.
-        if (isRateLimit(translator.sawError.message)) mgr.markRateLimited(account.name);
+        if (isRateLimit(`${translator.sawError.type} ${translator.sawError.message}`)) mgr.markRateLimited(account.name);
         else mgr.recordError(account.name, translator.sawError.message);
       } else {
         recordTerminalContext();

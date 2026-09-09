@@ -14,6 +14,7 @@ import { modelFamilyOf, sortRateLimitWindows, windowModelOf } from "../accounts/
 import type { CliUsage } from "../subprocess/types.ts";
 import {
   anthropicError,
+  clientAbortedResponse,
   makeAbort,
   fetchWithIdleTimeout,
   SseParser,
@@ -27,22 +28,12 @@ import {
   overloadBackoffMs,
   sleepWithAbort,
   anthropicUrl,
+  RETRYABLE_TRANSPORT_HEADER,
 } from "./shared.ts";
-import type { SseEvent } from "./shared.ts";
+import type { ProxyHooks, SseEvent } from "./shared.ts";
 import { accessTokenFor } from "./oauth-token.ts";
 import { stripCodexThinking } from "./codex-translate.ts";
 import { maybeRefreshUsage } from "./usage.ts";
-
-interface ProxyHooks {
-  onFailover?: (from: string, to: string) => void;
-  /**
-   * false: neither read nor refresh the session's account pin. Used for
-   * side requests (auto-mode classifier) that share the session id but must
-   * not steer which provider/account the session's real turns land on.
-   */
-  sessionAffinity?: boolean;
-  slotWaitBudget?: { remainingMs: number };
-}
 
 interface RetryReason {
   status: number;
@@ -58,6 +49,8 @@ interface RetryReason {
   /** Anthropic refused the account itself (HTTP 403) — sideline it and fail over. */
   accessDenied?: boolean;
   resetAt?: number;
+  /** No bytes reached the caller and the upstream inference transport failed. */
+  transport?: boolean;
   /** Raw upstream error body + headers, captured so surfaceOverload can replay them verbatim (HTTP path only). */
   bodyText?: string;
   headers?: Headers;
@@ -79,6 +72,13 @@ type ByteReadResult = { done: true; value?: undefined } | { done: false; value: 
 interface ByteReader {
   read(): Promise<ByteReadResult>;
   cancel(reason?: unknown): Promise<void>;
+}
+
+class InferenceTransportError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "InferenceTransportError";
+  }
 }
 
 export async function proxyAnthropicMessages(
@@ -103,7 +103,7 @@ export async function proxyAnthropicMessages(
 
   while (true) {
     const lease = await mgr.reserveInFlight(sessionKey, tried, "anthropic", modelFamily, signal, budget);
-    if (signal.aborted) { lease?.release(); return anthropicError(499, "request_aborted", "Request aborted by client"); }
+    if (signal.aborted) { lease?.release(); return clientAbortedResponse(); }
     if (!lease) break;
     const { account, release } = lease;
     let streaming = false;
@@ -117,7 +117,7 @@ export async function proxyAnthropicMessages(
         return release;
       });
     } finally { if (!streaming) release(); }
-    if (signal.aborted) { release(); return anthropicError(499, "request_aborted", "Request aborted by client"); }
+    if (signal.aborted) { release(); return clientAbortedResponse(); }
     if (attempt.kind === "response") {
       if (sessionKey) mgr.setAffinity(sessionKey, account.name);
       return attempt.response;
@@ -127,11 +127,13 @@ export async function proxyAnthropicMessages(
     previous = account.name;
   }
 
-  return anthropicError(
+  const response = anthropicError(
     lastRetry?.status ?? 503,
     lastRetry?.type ?? "overloaded_error",
     lastRetry?.message ?? noAccountMessage(mgr),
   );
+  if (lastRetry?.transport) response.headers.set(RETRYABLE_TRANSPORT_HEADER, "1");
+  return response;
 }
 
 async function tryAccount(
@@ -148,7 +150,7 @@ async function tryAccount(
   // Backoff budget spent (or client gone): record the overload once, at surface
   // time, and hand the caller the faithful upstream error.
   const surface = (reason: RetryReason): AttemptResult => {
-    if (signal.aborted) return { kind: "terminal", response: anthropicError(499, "request_aborted", "Request aborted by client") };
+    if (signal.aborted) return { kind: "terminal", response: clientAbortedResponse() };
     mgr.recordError(account.name, reason.message);
     return { kind: "terminal", response: surfaceOverload(reason, account.name) };
   };
@@ -188,10 +190,10 @@ async function attemptOnce(
   try {
     upstream = await fetchWithAccount(account, bodyText, incomingHeaders, mgr, config, signal, false);
   } catch (err) {
-    if (signal.aborted) return { kind: "terminal", response: anthropicError(499, "request_aborted", "Request aborted by client") };
+    if (signal.aborted) return { kind: "terminal", response: clientAbortedResponse() };
     const message = (err as Error).message;
     mgr.recordError(account.name, message);
-    return { kind: "retry", reason: authOrNetworkReason(message) };
+    return { kind: "retry", reason: authOrNetworkReason(message, err instanceof InferenceTransportError) };
   }
 
   if (upstream.response.status === 401) {
@@ -199,10 +201,10 @@ async function attemptOnce(
     try {
       upstream = await fetchWithAccount(account, bodyText, incomingHeaders, mgr, config, signal, true);
     } catch (err) {
-      if (signal.aborted) return { kind: "terminal", response: anthropicError(499, "request_aborted", "Request aborted by client") };
+      if (signal.aborted) return { kind: "terminal", response: clientAbortedResponse() };
       const message = (err as Error).message;
       mgr.recordError(account.name, message);
-      return { kind: "retry", reason: authOrNetworkReason(message) };
+      return { kind: "retry", reason: authOrNetworkReason(message, err instanceof InferenceTransportError) };
     }
   }
 
@@ -216,7 +218,7 @@ async function attemptOnce(
   if (!upstream.response.ok) {
     const text = await upstream.response.text().catch(() => "");
     upstream.cleanup();
-    if (signal.aborted) return { kind: "terminal", response: anthropicError(499, "request_aborted", "Request aborted by client") };
+    if (signal.aborted) return { kind: "terminal", response: clientAbortedResponse() };
     const reason = classifyHttpError(upstream.response.status, upstream.response.headers, text);
     if (reason.rejected) {
       // Benching here would sideline every account for rateLimitCooldownMs on
@@ -260,10 +262,13 @@ async function attemptOnce(
   try {
     text = await upstream.response.text();
   } catch (err) {
-    if (signal.aborted) return { kind: "terminal", response: anthropicError(499, "request_aborted", "Request aborted by client") };
+    if (signal.aborted) return { kind: "terminal", response: clientAbortedResponse() };
     const message = (err as Error).message;
     mgr.recordError(account.name, message);
-    return { kind: "terminal", response: anthropicError(502, "api_error", message) };
+    return {
+      kind: "retry",
+      reason: { status: 502, type: "api_error", message, rateLimited: false, transient: false, transport: true },
+    };
   } finally { upstream.cleanup(); }
   recordJsonUsage(text, mgr, account.name);
   return {
@@ -294,7 +299,7 @@ async function fetchWithAccount(
   } catch (err) {
     abort.cleanup();
     if (signal.aborted) throw new Error("Request aborted by client");
-    throw err;
+    throw new InferenceTransportError(err);
   }
 }
 
@@ -368,7 +373,7 @@ async function prepareStreamingResponse(
     };
   } catch (err) {
     upstream.cleanup();
-    if (signal.aborted) return { kind: "terminal", response: anthropicError(499, "request_aborted", "Request aborted by client") };
+    if (signal.aborted) return { kind: "terminal", response: clientAbortedResponse() };
     // Nothing reached the client yet (the prefix is still buffered), so a
     // transport fault here — an idle-watchdog abort on an upstream that sent
     // headers and then went silent, say — is worth another account rather than
@@ -383,6 +388,7 @@ async function prepareStreamingResponse(
         message: `Streaming proxy error: ${message}`,
         rateLimited: false,
         transient: false,
+        transport: true,
       },
     };
   }
@@ -675,8 +681,8 @@ function resetAtFromHeaders(headers: Headers): number | undefined {
   return undefined;
 }
 
-function authOrNetworkReason(message: string): RetryReason {
-  return { status: 401, type: "authentication_error", message, rateLimited: false, transient: false };
+function authOrNetworkReason(message: string, transport = false): RetryReason {
+  return { status: 401, type: "authentication_error", message, rateLimited: false, transient: false, transport };
 }
 
 function upstreamHeaders(incoming: Headers, token: string): Headers {

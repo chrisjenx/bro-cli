@@ -6,6 +6,7 @@ import { loadConfig } from "../config.ts";
 import { AccountManager } from "../accounts/manager.ts";
 import { OPENAI_CREDS_FILENAME } from "../accounts/types.ts";
 import { describeCodexError, parseCodexRateLimitSnapshot, proxyCodexMessages, resetAtFromCodexHeaders } from "./openai-codex.ts";
+import { RETRYABLE_TRANSPORT_HEADER } from "./shared.ts";
 
 function tempOpenAIPool(accountNames: string[]): { poolDir: string; mgr: AccountManager } {
   const poolDir = mkdtempSync(join(tmpdir(), "cmp-codex-"));
@@ -1167,6 +1168,20 @@ describe("proxyCodexMessages review fixes", () => {
     }
   });
 
+  test("streaming: a pre-commit rate-limit code fails over even when the message is generic", async () => {
+    const { poolDir, mgr } = tempOpenAIPool(["gpt1", "gpt2"]);
+    try {
+      const limited = 'data: {"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"Please try again later."}}}\n\n';
+      const { fn, hits } = fetchBodies([limited, sse]);
+      const res = await proxyCodexMessages({ model: CODEX_ROUTE.id, messages, stream: true }, mgr, codexConfig(poolDir), new AbortController().signal, CODEX_ROUTE, {}, fn);
+      expect(res.status).toBe(200);
+      expect(hits()).toBe(2);
+      expect(mgr.getAccount("gpt1").usage.rateLimitedUntil).toBeGreaterThan(Date.now());
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
   test("streaming: a pre-commit response.failed is a 502 like the non-stream path, not a 200 with a lone error frame", async () => {
     const { poolDir, mgr } = tempOpenAIPool(["gpt1"]);
     try {
@@ -1174,8 +1189,26 @@ describe("proxyCodexMessages review fixes", () => {
       const { fn } = fetchBodies([failed]);
       const res = await proxyCodexMessages({ model: CODEX_ROUTE.id, messages, stream: true }, mgr, codexConfig(poolDir), new AbortController().signal, CODEX_ROUTE, {}, fn);
       expect(res.status).toBe(502);
+      expect(res.headers.get(RETRYABLE_TRANSPORT_HEADER)).toBeNull();
       expect(await res.text()).toContain("upstream failed");
       expect(mgr.getAccount("gpt1").usage.lastError).toContain("upstream failed");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("exhausted fetch transport failures are marked for cross-provider fallback", async () => {
+    const { poolDir, mgr } = tempOpenAIPool(["gpt1", "gpt2"]);
+    try {
+      const fn = (async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) => {
+        throw new Error("network unavailable");
+      }) as unknown as typeof fetch;
+      const res = await proxyCodexMessages(
+        { model: CODEX_ROUTE.id, messages }, mgr, codexConfig(poolDir),
+        new AbortController().signal, CODEX_ROUTE, {}, fn,
+      );
+      expect(res.status).toBe(502);
+      expect(res.headers.get(RETRYABLE_TRANSPORT_HEADER)).toBe("1");
     } finally {
       rmSync(poolDir, { recursive: true, force: true });
     }

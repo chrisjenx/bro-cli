@@ -11,6 +11,7 @@ import { AccountManager } from "../accounts/manager.ts";
 import { loadConfig } from "../config.ts";
 import { anthropicServePlan, chooseMappedService, CROSS_PROVIDER_RETRY_STATUSES, serveWithCrossProviderFallback } from "./server.ts";
 import type { FailoverHooks } from "./failover.ts";
+import { RETRYABLE_TRANSPORT_HEADER } from "../upstream/shared.ts";
 
 /**
  * handleOpenAI/handleAnthropic in server.ts (the CLI-subprocess backend path)
@@ -199,6 +200,36 @@ describe("serveWithCrossProviderFallback", () => {
     expect(res).toBe(first503);
     expect(res).not.toBe(retry429);
     expect(res.headers.get("X-Marker")).toBe("first");
+  });
+
+  test("mapped transport exhaustion falls back even when surfaced as 401 or 502", async () => {
+    for (const status of [401, 502]) {
+      const called: Array<"anthropic" | "openai"> = [];
+      const retry200 = new Response("ok", { status: 200 });
+      const serve = async (svc: "anthropic" | "openai") => {
+        called.push(svc);
+        return svc === "anthropic"
+          ? new Response("transport failed", { status, headers: { [RETRYABLE_TRANSPORT_HEADER]: "1" } })
+          : retry200;
+      };
+
+      expect(await serveWithCrossProviderFallback("anthropic", serve, {})).toBe(retry200);
+      expect(called).toEqual(["anthropic", "openai"]);
+    }
+  });
+
+  test("auth 401 and deterministic 502 do not fall back without transport classification", async () => {
+    for (const status of [401, 502]) {
+      const called: Array<"anthropic" | "openai"> = [];
+      const first = new Response("terminal", { status });
+      const serve = async (svc: "anthropic" | "openai") => {
+        called.push(svc);
+        return svc === "anthropic" ? first : new Response("should not be called", { status: 200 });
+      };
+
+      expect(await serveWithCrossProviderFallback("anthropic", serve, {})).toBe(first);
+      expect(called).toEqual(["anthropic"]);
+    }
   });
 
   test("non-retry error (400) from first -> returned as-is, no retry", async () => {

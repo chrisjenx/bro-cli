@@ -4,6 +4,15 @@
 
 import type { Config } from "../config.ts";
 
+export const RETRYABLE_TRANSPORT_HEADER = "X-Pool-Retryable-Transport";
+
+export interface ProxyHooks {
+  onFailover?: (from: string, to: string) => void;
+  /** false: neither read nor refresh the session's account pin. */
+  sessionAffinity?: boolean;
+  slotWaitBudget?: { remainingMs: number };
+}
+
 export interface SseEvent {
   event: string;
   data: string;
@@ -86,6 +95,10 @@ export function anthropicError(status: number, type: string, message: string): R
     status,
     headers: { "content-type": "application/json" },
   });
+}
+
+export function clientAbortedResponse(): Response {
+  return anthropicError(499, "request_aborted", "Request aborted by client");
 }
 
 export function makeAbort(config: Config, signal: AbortSignal): { signal: AbortSignal; cleanup: () => void } {

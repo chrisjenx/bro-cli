@@ -48,7 +48,7 @@ import {
   streamAnthropic,
   type AnthropicRequest,
 } from "../adapters/anthropic.ts";
-import { anthropicError, asObject, stringProp } from "../upstream/shared.ts";
+import { anthropicError, asObject, stringProp, RETRYABLE_TRANSPORT_HEADER } from "../upstream/shared.ts";
 import { installGracefulShutdown } from "./shutdown.ts";
 import { bypassMappingForClassifier, classifierShapeMatches, isAutoModeClassifierRequest } from "./classifier.ts";
 
@@ -403,23 +403,27 @@ function noteClassifierMarkerDrift(config: Config, body: unknown, model: string)
 }
 
 /** Serves a mapped request on `first`, retrying once on the other provider when
- * the first attempt reports whole-pool exhaustion (429/503/529 — the proxies
- * return these only before any bytes stream). A retry that also exhausts
- * returns the FIRST response so the caller sees the primary provider's error. */
+ * the first attempt reports whole-pool exhaustion (429/503/529) or explicitly
+ * marks an exhausted pre-commit transport failure. Untagged auth and protocol
+ * errors remain terminal. A retry that also exhausts returns the FIRST response
+ * so the caller sees the primary provider's error. */
 export async function serveWithCrossProviderFallback(
   first: "anthropic" | "openai",
   serve: (svc: "anthropic" | "openai") => Promise<Response>,
   hooks: FailoverHooks,
 ): Promise<Response> {
+  const retryable = (response: Response) =>
+    CROSS_PROVIDER_RETRY_STATUSES.has(response.status)
+      || response.headers.get(RETRYABLE_TRANSPORT_HEADER) === "1";
   const res = await serve(first);
-  if (!CROSS_PROVIDER_RETRY_STATUSES.has(res.status)) return res;
+  if (!retryable(res)) return res;
   // A per-request upstream refusal is not exhaustion; the other pool would
   // refuse it just the same.
   if (res.headers.get(UPSTREAM_REJECTED_HEADER)) return res;
   const other = first === "anthropic" ? "openai" : "anthropic";
   hooks.onFailover?.(`${first} pool`, `${other} pool`);
   const retry = await serve(other);
-  return CROSS_PROVIDER_RETRY_STATUSES.has(retry.status) ? res : retry;
+  return retryable(retry) ? res : retry;
 }
 
 async function handleAnthropic(

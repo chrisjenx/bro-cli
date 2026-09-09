@@ -192,8 +192,12 @@ export class AccountManager {
     };
   }
 
+  private maxInFlight(provider: Provider): number {
+    return provider === "openai" ? this.config.codexMaxInFlight : this.config.anthropicMaxInFlight;
+  }
+
   private atCap(a: Account): boolean {
-    const cap = a.provider === "openai" ? this.config.codexMaxInFlight : this.config.anthropicMaxInFlight;
+    const cap = this.maxInFlight(a.provider);
     return cap > 0 && this.inFlightOf(a.name) >= cap;
   }
 
@@ -1013,7 +1017,7 @@ export class AccountManager {
 
     const busy = accounts
       .filter(a => this.usableFor(a, provider, family, now, undefined, true) && this.atCap(a))
-      .map(a => ({ account: a.name, inFlight: a.inFlight, limit: provider === "openai" ? this.config.codexMaxInFlight : this.config.anthropicMaxInFlight }));
+      .map(a => ({ account: a.name, inFlight: a.inFlight, limit: this.maxInFlight(provider) }));
     const available = accounts.filter((a) => this.usableFor(a, provider, family, now));
     if (available.length === 0) return { activeTier: null, nextPick: null, tiers, busy };
 

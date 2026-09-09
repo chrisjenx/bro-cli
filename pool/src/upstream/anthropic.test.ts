@@ -5,6 +5,7 @@ import { join } from "path";
 import { loadConfig, type Config } from "../config.ts";
 import { AccountManager } from "../accounts/manager.ts";
 import { proxyAnthropicMessages } from "./anthropic.ts";
+import { RETRYABLE_TRANSPORT_HEADER } from "./shared.ts";
 
 interface FetchCall {
   url: string;
@@ -825,6 +826,54 @@ test("sessionAffinity: false serves the request without creating or refreshing a
 // an upstream that answered 200 and then went silent, most importantly) has
 // committed nothing to the client, so it must fail over like any other
 // pre-commit fault rather than hand back a hard 502.
+test("a non-streaming body that fails before commit fails over instead of returning 502", async () => {
+  const { poolDir, mgr, config } = tempPool(["a", "b"]);
+  try {
+    const calls = mockFetch((_, init) => {
+      const token = new Headers(init.headers).get("authorization");
+      if (token === "Bearer tok-a") {
+        return new Response(new ReadableStream<Uint8Array>({
+          start(controller) { controller.error(new Error("body read failed")); },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return jsonResponse({ id: "msg_1", type: "message", role: "assistant", content: [], usage: { input_tokens: 1, output_tokens: 1 } });
+    });
+
+    const response = await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", max_tokens: 8, messages: [{ role: "user", content: "hi" }] },
+      new Headers(),
+      mgr,
+      config,
+      new AbortController().signal,
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-Pool-Account")).toBe("b");
+    expect(calls.map((c) => c.headers.get("authorization"))).toEqual(["Bearer tok-a", "Bearer tok-b"]);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("exhausted non-streaming transport failures are marked for cross-provider fallback", async () => {
+  const { poolDir, mgr, config } = tempPool(["a", "b"]);
+  try {
+    mockFetch(() => new Response(new ReadableStream<Uint8Array>({
+      start(controller) { controller.error(new Error("body read failed")); },
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+
+    const response = await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", max_tokens: 8, messages: [{ role: "user", content: "hi" }] },
+      new Headers(), mgr, config, new AbortController().signal,
+    );
+
+    expect(response.status).toBe(502);
+    expect(response.headers.get(RETRYABLE_TRANSPORT_HEADER)).toBe("1");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
 test("a streaming body that fails before commit fails over instead of returning 502", async () => {
   const { poolDir, mgr, config } = tempPool(["a", "b"]);
   try {
