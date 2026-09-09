@@ -411,7 +411,13 @@ async function streamCodexResponse(
     if (closed) return;
     const error = failureSignal.reason;
     teardown(error);
-    if (!signal.aborted) mgr.recordError(account.name, error instanceof Error ? error.message : String(error));
+    // The client hung up, which is what aborted the upstream in the first
+    // place: it isn't the account's fault, and there is nobody left to tell.
+    // Erroring the response stream after its socket has gone leaves Bun with
+    // a rejected promise no one can handle — a fatal unhandled rejection that
+    // takes the whole pool down, not just this request.
+    if (signal.aborted) return;
+    mgr.recordError(account.name, error instanceof Error ? error.message : String(error));
     outputController?.error(error);
   };
   const failRetry = (message: string, transport: boolean): AttemptResult => {

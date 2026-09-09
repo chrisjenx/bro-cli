@@ -49,7 +49,7 @@ import {
   type AnthropicRequest,
 } from "../adapters/anthropic.ts";
 import { anthropicError, asObject, stringProp, RETRYABLE_TRANSPORT_HEADER } from "../upstream/shared.ts";
-import { installGracefulShutdown } from "./shutdown.ts";
+import { installGracefulShutdown, installRejectionGuard } from "./shutdown.ts";
 import { bypassMappingForClassifier, classifierShapeMatches, isAutoModeClassifierRequest } from "./classifier.ts";
 
 const APPEND_SYSTEM_PROMPT =
@@ -57,6 +57,7 @@ const APPEND_SYSTEM_PROMPT =
   "Do not ask clarifying questions unless strictly necessary; produce the best answer you can from the information given.";
 
 export function startServer(config: Config): void {
+  installRejectionGuard();
   const mgr = new AccountManager(config);
   const modelConfig = loadModelConfig(config.modelsFile);
   const modelTable = modelConfig.models;

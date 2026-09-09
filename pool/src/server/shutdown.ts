@@ -32,6 +32,23 @@ export async function drainAndStop(
 }
 
 /**
+ * Keep one request's stray promise rejection from killing the daemon.
+ *
+ * Bun treats an unhandled rejection as fatal. In a pool serving many Claude
+ * Code sessions that trades one dropped request for every live session at
+ * once: the process dies mid-stream and each client then retries against a
+ * port with nothing listening (ConnectionRefused). Log it loudly — the prefix
+ * is greppable in ~/.bro/pool-proxy.log — and keep serving.
+ */
+export function installRejectionGuard(): void {
+  process.on("unhandledRejection", (reason: unknown) => {
+    const detail =
+      reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason);
+    console.error(`pool: unhandled rejection (request dropped, server still up): ${detail}`);
+  });
+}
+
+/**
  * Install SIGTERM/SIGINT handlers that drain the server before exiting.
  * A second signal skips the drain and force-stops immediately.
  */

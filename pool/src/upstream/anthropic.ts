@@ -412,8 +412,16 @@ function streamWithTap(
   const fail = (error: unknown) => {
     if (finished) return;
     finished = true;
-    if (signal.aborted) tap.cancel();
-    else tap.error(error instanceof Error ? error.message : String(error));
+    if (signal.aborted) {
+      // Client gone. Erroring a response stream whose socket has already
+      // closed leaves Bun with a rejected promise nobody can handle, and an
+      // unhandled rejection kills the pool process — see the codex path's
+      // onFailure() and client-disconnect.test.ts.
+      tap.cancel();
+      stop();
+      return;
+    }
+    tap.error(error instanceof Error ? error.message : String(error));
     stop();
     output.error(error);
   };
