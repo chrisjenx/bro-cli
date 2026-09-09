@@ -32,7 +32,8 @@ export type TurnEvent =
   | { kind: "text_block_boundary" }
   | { kind: "tool_use"; id: string; name: string }
   | { kind: "done"; usage: CliUsage; stopReason: string; costUsd: number }
-  | { kind: "error"; message: string; rateLimited: boolean; resetAt?: number };
+  /** `aborted`: the client hung up or the turn timed out — not the account's fault. */
+  | { kind: "error"; message: string; rateLimited: boolean; resetAt?: number; aborted?: boolean };
 
 function buildArgs(opts: RunOptions): string[] {
   const args = [
@@ -246,6 +247,7 @@ export async function* runClaude(
         ? "Request aborted or timed out"
         : `Stream error: ${(err as Error).message}`,
       rateLimited: false,
+      aborted,
     };
   } finally {
     // Always run — including when the consumer abandons this generator early

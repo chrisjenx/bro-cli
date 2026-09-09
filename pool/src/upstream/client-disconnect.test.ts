@@ -13,7 +13,7 @@
  * raw socket, because the fault only appears with a genuine HTTP client going
  * away — an in-process `fetch` client would attribute the rejection to itself.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
@@ -22,6 +22,7 @@ import { loadConfig, type Config } from "../config.ts";
 import { AccountManager } from "../accounts/manager.ts";
 import { OPENAI_CREDS_FILENAME } from "../accounts/types.ts";
 import { proxyCodexMessages } from "./openai-codex.ts";
+import type { ModelRoute } from "../models.ts";
 import { proxyAnthropicMessages } from "./anthropic.ts";
 
 const enc = new TextEncoder();
@@ -63,6 +64,9 @@ function tempPool(): { poolDir: string; mgr: AccountManager; config: Config } {
     accountsDir,
     usageFile: join(poolDir, "usage.json"),
     sessionsFile: join(poolDir, "sessions.json"),
+    // The anthropic path fires a fire-and-forget usage refresh; against the
+    // stalling stub upstream its body would never settle.
+    usageRefreshEnabled: false,
   });
   return { poolDir, mgr: new AccountManager(config), config };
 }
@@ -81,6 +85,12 @@ function stallingUpstream(frames: string[]): Response {
     { headers: { "content-type": "text/event-stream" } },
   );
 }
+
+const CODEX_ROUTE: ModelRoute = {
+  id: "gpt",
+  provider: "openai",
+  upstreamModel: "gpt-5.2-codex",
+};
 
 const CODEX_FRAMES = [
   'data: {"type":"response.created","response":{"id":"r1"}}',
@@ -132,22 +142,20 @@ async function disconnectMidStream(port: number, model: string): Promise<string>
   return received.join("");
 }
 
-/** Fails the assertion if any unhandled rejection lands while `run` executes. */
-async function withRejectionWatch(
-  run: () => Promise<string>,
-): Promise<{ seen: unknown[]; response: string }> {
-  const seen: unknown[] = [];
-  const onRejection = (reason: unknown) => seen.push(reason);
-  process.on("unhandledRejection", onRejection);
-  let response = "";
-  try {
-    response = await run();
-    // Unhandled rejections are reported a turn later; give them time to land.
-    await Bun.sleep(600);
-  } finally {
-    process.off("unhandledRejection", onRejection);
-  }
-  return { seen, response };
+/**
+ * Collects unhandled rejections for the whole file. A per-case listener with a
+ * fixed deadline would both miss a late rejection (false pass) and let it reach
+ * the runner with nothing listening, killing the test process.
+ */
+const rejections: unknown[] = [];
+const onRejection = (reason: unknown) => rejections.push(reason);
+
+async function withRejectionWatch(run: () => Promise<string>): Promise<{ seen: unknown[]; response: string }> {
+  const before = rejections.length;
+  const response = await run();
+  // Unhandled rejections are reported a turn later; give them time to land.
+  await Bun.sleep(600);
+  return { seen: rejections.slice(before), response };
 }
 
 describe("a client disconnecting mid-stream", () => {
@@ -156,12 +164,24 @@ describe("a client disconnecting mid-stream", () => {
   let config: Config;
   let server: Server<unknown> | undefined;
 
+  beforeAll(() => {
+    process.on("unhandledRejection", onRejection);
+  });
+
+  afterAll(() => {
+    process.off("unhandledRejection", onRejection);
+    // Nothing may have leaked after the last case's watch window closed.
+    expect(rejections).toEqual([]);
+  });
+
   beforeEach(() => {
     ({ poolDir, mgr, config } = tempPool());
   });
 
-  afterEach(() => {
-    server?.stop(true);
+  afterEach(async () => {
+    // Await the stop: tearing the pool dir out from under a server still
+    // draining a stalled request is its own source of late rejections.
+    await server?.stop(true);
     server = undefined;
     rmSync(poolDir, { recursive: true, force: true });
   });
@@ -179,7 +199,7 @@ describe("a client disconnecting mid-stream", () => {
           mgr,
           config,
           req.signal,
-          { id: "gpt", provider: "openai", upstreamModel: "gpt-5.2-codex" } as never,
+          CODEX_ROUTE,
           {},
           upstream,
         );
@@ -192,6 +212,8 @@ describe("a client disconnecting mid-stream", () => {
     // Guard against a vacuous pass: the stream must really have opened.
     expect(response).toContain("message_start");
     expect(seen).toEqual([]);
+    // A client hanging up is not the account's failure.
+    expect(mgr.listAccounts().find((a) => a.name === "codex-a")?.usage.lastError).toBeNull();
   });
 
   test("does not leave an unhandled rejection on the Anthropic path", async () => {
@@ -213,6 +235,7 @@ describe("a client disconnecting mid-stream", () => {
       const { seen, response } = await withRejectionWatch(() => disconnectMidStream(port, "claude-sonnet-5"));
       expect(response).toContain("message_start");
       expect(seen).toEqual([]);
+      expect(mgr.listAccounts().find((a) => a.name === "claude-a")?.usage.lastError).toBeNull();
     } finally {
       globalThis.fetch = realFetch;
     }

@@ -1,5 +1,8 @@
 /**
- * Graceful shutdown for the pool server. `bro pool down`/`restart` send
+ * Process lifecycle for the pool server: graceful shutdown, and the guard
+ * that keeps one request's stray rejection from killing the daemon.
+ *
+ * Graceful shutdown: `bro pool down`/`restart` send
  * SIGTERM; instead of dying mid-stream we stop accepting new connections and
  * let in-flight requests (including long SSE generations) run to completion,
  * force-closing only after a generous drain timeout.
@@ -42,8 +45,10 @@ export async function drainAndStop(
  */
 export function installRejectionGuard(): void {
   process.on("unhandledRejection", (reason: unknown) => {
+    // Keep the stack: without it a genuine bug becomes an unlocatable one-liner
+    // in a daemon that keeps running.
     const detail =
-      reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason);
+      reason instanceof Error ? (reason.stack ?? `${reason.name}: ${reason.message}`) : String(reason);
     console.error(`pool: unhandled rejection (request dropped, server still up): ${detail}`);
   });
 }

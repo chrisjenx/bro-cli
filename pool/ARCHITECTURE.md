@@ -133,6 +133,10 @@ fallback, not just Sonnet or Opus. The legacy subprocess backend is unchanged.
 ## Failure modes
 
 - **No accounts / none available** → `503` with an OpenAI- or Anthropic-shaped error body.
-- **Client disconnects** → the request's `AbortSignal` aborts the upstream fetch or subprocess.
+- **Client disconnects** → the request's `AbortSignal` aborts the upstream fetch or subprocess. Two rules bind every streaming path once `signal.aborted`:
+  1. **Never `controller.error()` a client-facing stream.** Its socket is gone, so Bun is left holding a rejected promise nobody can handle — and Bun treats an unhandled rejection as fatal, so one abandoned request kills the daemon and every other live session with it. Tear down quietly instead.
+  2. **Never `recordError` against the account.** The client hung up; the account did nothing wrong, and blaming it degrades a healthy account's dashboard health.
+
+  `installRejectionGuard()` (`server/shutdown.ts`) is the backstop for a missed case, not a substitute for either rule. Covered by `upstream/client-disconnect.test.ts`, which kills a raw socket mid-stream — reproduce with a real socket, never an in-process `fetch` client, which misattributes the rejection to itself.
 - **Timeout** → provider idle limits bound inference header/read waiting. `REQUEST_TIMEOUT_MS` bounds each fetch attempt or subprocess, not the complete retry lifecycle.
 - **CLI missing** → only affects `CLAUDE_POOL_BACKEND=cli` or OpenAI compatibility requests; a spawn error is surfaced as an `error` TurnEvent (→ `502`).

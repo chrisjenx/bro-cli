@@ -27,8 +27,11 @@ export async function* instrument(
     if (ev.kind === "done") {
       mgr.recordSuccess(accountName, ev.usage, ev.costUsd);
     } else if (ev.kind === "error") {
+      // A client that hung up (or a turn that timed out) is not the account's
+      // fault; blaming it would degrade a healthy account's health on the
+      // dashboard. Matches the OAuth proxies' client-abort handling.
       if (ev.rateLimited) mgr.markRateLimited(accountName, ev.resetAt);
-      else mgr.recordError(accountName, ev.message);
+      else if (!ev.aborted) mgr.recordError(accountName, ev.message);
     }
     yield ev;
   }

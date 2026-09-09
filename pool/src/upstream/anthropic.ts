@@ -412,18 +412,15 @@ function streamWithTap(
   const fail = (error: unknown) => {
     if (finished) return;
     finished = true;
-    if (signal.aborted) {
-      // Client gone. Erroring a response stream whose socket has already
-      // closed leaves Bun with a rejected promise nobody can handle, and an
-      // unhandled rejection kills the pool process — see the codex path's
-      // onFailure() and client-disconnect.test.ts.
-      tap.cancel();
-      stop();
-      return;
-    }
-    tap.error(error instanceof Error ? error.message : String(error));
+    // Client gone: tear down, but never error the response stream. Its socket
+    // has closed, so Bun would be left with a rejected promise nobody can
+    // handle — a fatal unhandled rejection that takes the whole pool down.
+    // See the codex path's onFailure() and client-disconnect.test.ts.
+    const aborted = signal.aborted;
+    if (aborted) tap.cancel();
+    else tap.error(error instanceof Error ? error.message : String(error));
     stop();
-    output.error(error);
+    if (!aborted) output.error(error);
   };
   const onFailure = () => fail(failureSignal.reason);
 

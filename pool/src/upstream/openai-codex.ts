@@ -588,7 +588,10 @@ async function streamCodexResponse(
         } catch (err) {
           if (closed) return;
           teardown();
-          if (!signal.aborted) mgr.recordError(account.name, (err as Error).message);
+          // Same rule as onFailure(): once the client is gone there is nobody
+          // to blame and nobody to tell, and erroring a dead stream is fatal.
+          if (signal.aborted) return;
+          mgr.recordError(account.name, (err as Error).message);
           controller.error(err);
         }
       },

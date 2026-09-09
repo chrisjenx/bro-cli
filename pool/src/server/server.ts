@@ -271,7 +271,7 @@ async function handleOpenAI(
     modelFamily,
   );
   if (parsed.stream) {
-    return sseResponse(streamOpenAI(events, parsed), first.name);
+    return sseResponse(streamOpenAI(events, parsed), first.name, signal);
   }
   const { status, body: out } = await collectOpenAI(events, parsed);
   return json(out, status, { "X-Pool-Account": first.name });
@@ -497,7 +497,7 @@ async function handleAnthropic(
     modelFamily,
   );
   if (parsed.stream) {
-    return sseResponse(streamAnthropic(events, parsed), first.name);
+    return sseResponse(streamAnthropic(events, parsed), first.name, signal);
   }
   const { status, body: out } = await collectAnthropic(events, parsed);
   return json(out, status, { "X-Pool-Account": first.name });
@@ -671,7 +671,7 @@ function html(body: string): Response {
   return new Response(body, { headers: { "content-type": "text/html; charset=utf-8" } });
 }
 
-function sseResponse(gen: AsyncGenerator<string>, accountName: string): Response {
+function sseResponse(gen: AsyncGenerator<string>, accountName: string, signal: AbortSignal): Response {
   const stream = new ReadableStream<Uint8Array>({
     async pull(controller) {
       const encoder = new TextEncoder();
@@ -683,8 +683,21 @@ function sseResponse(gen: AsyncGenerator<string>, accountName: string): Response
         }
         controller.enqueue(encoder.encode(value));
       } catch (err) {
+        // Never error a stream whose client has already gone: its socket is
+        // closed, so Bun is left with a rejection nobody can handle — a fatal
+        // unhandled rejection that would take the whole pool down. Same rule
+        // as the OAuth proxies (see upstream/client-disconnect.test.ts).
+        if (signal.aborted) {
+          void gen.return(undefined).catch(() => {});
+          return;
+        }
         controller.error(err);
       }
+    },
+    cancel() {
+      // Client hung up: let the generator run its cleanup instead of leaving
+      // it suspended mid-turn.
+      void gen.return(undefined).catch(() => {});
     },
   });
   return new Response(stream, {
