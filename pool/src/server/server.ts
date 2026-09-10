@@ -179,6 +179,7 @@ export function startServer(config: Config): void {
           return json({ error: { message: "Invalid JSON body" } }, 400);
         }
 
+        srv.timeout(req, 0);
         return path === "/v1/chat/completions"
           ? handleOpenAI(body as OpenAIChatRequest, mgr, config, req.signal, modelTable)
           : handleAnthropic(body, req.headers, mgr, config, req.signal, modelTable, mappingState);
@@ -325,7 +326,7 @@ export function nonOauthOpenAIBackendError(route: ModelRoute, backend: Config["b
   );
 }
 
-export const CROSS_PROVIDER_RETRY_STATUSES: ReadonlySet<number> = new Set([429, 503, 529]);
+export const CROSS_PROVIDER_RETRY_STATUSES: ReadonlySet<number> = new Set([429, 500, 503, 529]);
 
 /**
  * Which provider serves a mapped Claude-family request first. Anthropic is
@@ -404,10 +405,11 @@ function noteClassifierMarkerDrift(config: Config, body: unknown, model: string)
 }
 
 /** Serves a mapped request on `first`, retrying once on the other provider when
- * the first attempt reports whole-pool exhaustion (429/503/529) or explicitly
- * marks an exhausted pre-commit transport failure. Untagged auth and protocol
- * errors remain terminal. A retry that also exhausts returns the FIRST response
- * so the caller sees the primary provider's error. */
+ * the first attempt reports whole-pool exhaustion or upstream overload
+ * (429/500/503/529), or explicitly marks an exhausted pre-commit transport
+ * failure. Untagged auth and protocol errors remain terminal. A retry that also
+ * exhausts returns the FIRST response so the caller sees the primary provider's
+ * error. */
 export async function serveWithCrossProviderFallback(
   first: "anthropic" | "openai",
   serve: (svc: "anthropic" | "openai") => Promise<Response>,
@@ -422,9 +424,25 @@ export async function serveWithCrossProviderFallback(
   // refuse it just the same.
   if (res.headers.get(UPSTREAM_REJECTED_HEADER)) return res;
   const other = first === "anthropic" ? "openai" : "anthropic";
-  hooks.onFailover?.(`${first} pool`, `${other} pool`);
-  const retry = await serve(other);
-  return retryable(retry) ? res : retry;
+  let retry: Response;
+  try {
+    hooks.onFailover?.(`${first} pool`, `${other} pool`);
+    retry = await serve(other);
+  } catch (err) {
+    // Neither the hook nor the alternate attempt produced a response to take
+    // ownership of the primary's body, so this boundary must cancel it itself
+    // — otherwise a cancellable primary stream is stranded open — and the
+    // original failure (not a cancellation error) is what the caller sees.
+    void res.body?.cancel().catch(() => {});
+    throw err;
+  }
+  const keepPrimary = retryable(retry);
+  const response = keepPrimary ? res : retry;
+  const discarded = keepPrimary ? retry : res;
+  // Do not await a potentially unbounded cancel, and never cancel the response
+  // that we are returning when a provider reuses the identical Response object.
+  if (discarded !== response) void discarded.body?.cancel().catch(() => {});
+  return response;
 }
 
 async function handleAnthropic(

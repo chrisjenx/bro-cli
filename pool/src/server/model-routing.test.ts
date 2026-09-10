@@ -9,7 +9,7 @@ import type { RateLimitSnapshot, RateLimitWindow } from "../accounts/types.ts";
 import { OPENAI_CREDS_FILENAME } from "../accounts/types.ts";
 import { AccountManager } from "../accounts/manager.ts";
 import { loadConfig } from "../config.ts";
-import { anthropicServePlan, chooseMappedService, CROSS_PROVIDER_RETRY_STATUSES, serveWithCrossProviderFallback } from "./server.ts";
+import { anthropicServePlan, chooseMappedService, serveWithCrossProviderFallback } from "./server.ts";
 import type { FailoverHooks } from "./failover.ts";
 import { RETRYABLE_TRANSPORT_HEADER } from "../upstream/shared.ts";
 
@@ -129,14 +129,128 @@ describe("chooseMappedService", () => {
   });
 });
 
-describe("CROSS_PROVIDER_RETRY_STATUSES", () => {
-  test("covers exhaustion statuses only", () => {
-    expect([...CROSS_PROVIDER_RETRY_STATUSES].sort()).toEqual([429, 503, 529]);
-    expect(CROSS_PROVIDER_RETRY_STATUSES.has(400)).toBe(false);
-  });
-});
-
 describe("serveWithCrossProviderFallback", () => {
+  test("exhausted HTTP 500 can use the mapped alternate", async () => {
+    const providers: string[] = [];
+    const response = await serveWithCrossProviderFallback("anthropic", async (provider) => {
+      providers.push(provider);
+      return new Response(provider === "anthropic" ? "failed" : "recovered", {
+        status: provider === "anthropic" ? 500 : 200,
+      });
+    }, {});
+
+    expect(await response.text()).toBe("recovered");
+    expect(providers).toEqual(["anthropic", "openai"]);
+  });
+
+  test("exhausted HTTP 500 can use the mapped alternate in the reverse order", async () => {
+    const providers: string[] = [];
+    const response = await serveWithCrossProviderFallback("openai", async (provider) => {
+      providers.push(provider);
+      return new Response(provider === "openai" ? "failed" : "recovered", {
+        status: provider === "openai" ? 500 : 200,
+      });
+    }, {});
+
+    expect(await response.text()).toBe("recovered");
+    expect(providers).toEqual(["openai", "anthropic"]);
+  });
+
+  test("a recovered fallback cancels the discarded primary response", async () => {
+    let cancelled = false;
+    const primary = new Response(new ReadableStream({
+      cancel() { cancelled = true; },
+    }), { status: 503 });
+
+    const response = await serveWithCrossProviderFallback(
+      "anthropic",
+      async (provider) => provider === "anthropic" ? primary : new Response("ok"),
+      {},
+    );
+
+    expect(await response.text()).toBe("ok");
+    await Promise.resolve();
+    expect(cancelled).toBe(true);
+  });
+
+  test("both exhausted providers retain the readable primary and cancel the alternate", async () => {
+    let alternateCancelled = false;
+    const primary = new Response("primary", { status: 503 });
+    const alternate = new Response(new ReadableStream({
+      cancel() { alternateCancelled = true; },
+    }), { status: 503 });
+
+    const response = await serveWithCrossProviderFallback(
+      "anthropic",
+      async (provider) => provider === "anthropic" ? primary : alternate,
+      {},
+    );
+
+    expect(response).toBe(primary);
+    expect(await response.text()).toBe("primary");
+    await Promise.resolve();
+    expect(alternateCancelled).toBe(true);
+  });
+
+  test("a rejected alternate serve cancels the primary stream and the rejection propagates", async () => {
+    let cancelled = false;
+    const primary = new Response(new ReadableStream({
+      cancel() { cancelled = true; },
+    }), { status: 503 });
+    const failure = new Error("alternate transport exploded");
+
+    const attempt = serveWithCrossProviderFallback(
+      "anthropic",
+      async (provider) => {
+        if (provider === "anthropic") return primary;
+        throw failure;
+      },
+      {},
+    );
+
+    await expect(attempt).rejects.toBe(failure);
+    await Promise.resolve();
+    expect(cancelled).toBe(true);
+  });
+
+  test("a throwing onFailover hook cancels the primary stream and the throw propagates", async () => {
+    let cancelled = false;
+    const primary = new Response(new ReadableStream({
+      cancel() { cancelled = true; },
+    }), { status: 503 });
+    const failure = new Error("hook exploded");
+
+    const attempt = serveWithCrossProviderFallback(
+      "anthropic",
+      async (provider) => provider === "anthropic" ? primary : new Response("ok"),
+      { onFailover: () => { throw failure; } },
+    );
+
+    await expect(attempt).rejects.toBe(failure);
+    await Promise.resolve();
+    expect(cancelled).toBe(true);
+  });
+
+  test("does not cancel an identical response object kept after both providers exhaust", async () => {
+    let cancelled = false;
+    let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const shared = new Response(new ReadableStream<Uint8Array>({
+      start(streamController) {
+        controller = streamController;
+        streamController.enqueue(new TextEncoder().encode("shared"));
+      },
+      cancel() { cancelled = true; },
+    }), { status: 503 });
+
+    const response = await serveWithCrossProviderFallback("anthropic", async () => shared, {});
+
+    expect(response).toBe(shared);
+    const first = await response.body!.getReader().read();
+    expect(new TextDecoder().decode(first.value)).toBe("shared");
+    expect(cancelled).toBe(false);
+    controller!.close();
+  });
+
   test("does not hop providers for a per-request upstream refusal", async () => {
     const failoverCalls: [string, string][] = [];
     const served: string[] = [];

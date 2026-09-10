@@ -3,6 +3,7 @@
  */
 
 import type { Config } from "../config.ts";
+import { UpstreamTransportError } from "./transport-error.ts";
 
 export const RETRYABLE_TRANSPORT_HEADER = "X-Pool-Retryable-Transport";
 
@@ -106,7 +107,10 @@ export function makeAbort(config: Config, signal: AbortSignal): { signal: AbortS
   const onAbort = () => controller.abort(signal.reason);
   signal.addEventListener("abort", onAbort, { once: true });
   if (signal.aborted) onAbort();
-  const timeout = setTimeout(() => controller.abort(), config.requestTimeoutMs);
+  const timeout = setTimeout(
+    () => controller.abort(new DOMException("Upstream request timeout", "TimeoutError")),
+    config.requestTimeoutMs,
+  );
   return {
     signal: controller.signal,
     cleanup: () => {
@@ -114,6 +118,10 @@ export function makeAbort(config: Config, signal: AbortSignal): { signal: AbortS
       signal.removeEventListener("abort", onAbort);
     },
   };
+}
+
+function transportFailure(cause: unknown, phase: "headers" | "body"): UpstreamTransportError {
+  return cause instanceof UpstreamTransportError ? cause : new UpstreamTransportError(cause, phase);
 }
 
 /** Bun 1.3.14 ignores numeric fetch timeout values. Disable its implicit socket
@@ -125,11 +133,15 @@ export async function fetchWithIdleTimeout(
   init: RequestInit,
   idleMs: number,
   fetchFn: typeof fetch = fetch,
+  // The uncomposed caller signal when init.signal also carries a pool deadline.
+  clientSignal: AbortSignal | undefined = init.signal ?? undefined,
 ): Promise<{ response: Response; cleanup: () => void; failureSignal: AbortSignal }> {
   const abort = new AbortController();
   // Error-only notification: intentional cleanup/EOF must not report failure.
   const failure = new AbortController();
   const incoming = init.signal;
+  const classifyFailure = (cause: unknown, phase: "headers" | "body") =>
+    clientSignal?.aborted ? clientSignal.reason : transportFailure(cause, phase);
   let timer: ReturnType<typeof setTimeout> | undefined;
   let reader: Pick<ReadableStreamDefaultReader<Uint8Array>, "read" | "cancel"> | undefined;
   let output: ReadableStreamDefaultController<Uint8Array> | undefined;
@@ -146,8 +158,9 @@ export async function fetchWithIdleTimeout(
   };
   const onAbort = () => {
     if (closed) return;
-    output?.error(abort.signal.reason);
-    failure.abort(abort.signal.reason);
+    const reason = classifyFailure(abort.signal.reason, "body");
+    output?.error(reason);
+    failure.abort(reason);
     cleanup();
   };
   const onIncomingAbort = () => abort.abort(incoming?.reason);
@@ -184,8 +197,9 @@ export async function fetchWithIdleTimeout(
           }
         } catch (err) {
           if (closed) return;
-          controller.error(err);
-          failure.abort(err);
+          const reason = classifyFailure(err, "body");
+          controller.error(reason);
+          failure.abort(reason);
           cleanup();
         }
       },
@@ -193,7 +207,7 @@ export async function fetchWithIdleTimeout(
     }, { highWaterMark: 0 });
     return { response: new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers }), cleanup, failureSignal: failure.signal };
   } catch (err) {
-    const reason = abort.signal.aborted ? abort.signal.reason : err;
+    const reason = classifyFailure(abort.signal.aborted ? abort.signal.reason : err, "headers");
     cleanup();
     throw reason;
   }

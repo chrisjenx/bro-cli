@@ -152,6 +152,114 @@ test("forwards Anthropic messages verbatim with the selected account OAuth token
   }
 });
 
+test("header transport reset is an API failure, not an authentication failure", async () => {
+  const { poolDir, mgr, config } = tempPool(["a"]);
+  try {
+    mockFetch(() => {
+      throw Object.assign(new Error("socket reset"), { code: "ECONNRESET" });
+    });
+
+    const response = await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", messages: [] },
+      new Headers(),
+      mgr,
+      config,
+      new AbortController().signal,
+    );
+
+    expect(response.status).toBe(502);
+    expect(response.headers.get(RETRYABLE_TRANSPORT_HEADER)).toBe("1");
+    expect(await response.json()).toMatchObject({ error: { type: "api_error" } });
+    expect(mgr.getAccount("a").usage.totalRequests).toBe(0);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("header idle timeout is an API failure marked for fallback", async () => {
+  const { poolDir, mgr, config } = tempPool(["a"]);
+  try {
+    mockFetch((_, init) => new Promise<Response>((_, reject) => {
+      init.signal?.addEventListener("abort", () => {
+        reject(new DOMException("Upstream idle timeout", "TimeoutError"));
+      }, { once: true });
+    }));
+
+    const response = await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", messages: [] },
+      new Headers(),
+      mgr,
+      { ...config, anthropicIdleTimeoutMs: 10 },
+      new AbortController().signal,
+    );
+
+    expect(response.status).toBe(502);
+    expect(response.headers.get(RETRYABLE_TRANSPORT_HEADER)).toBe("1");
+    expect(await response.json()).toMatchObject({ error: { type: "api_error" } });
+    expect(mgr.getAccount("a").usage.totalRequests).toBe(0);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("attempt deadline is a transport failure rather than an authentication failure", async () => {
+  const { poolDir, mgr, config } = tempPool(["a"]);
+  try {
+    // loadConfig clamps idle timeout to the request deadline, so simulate the
+    // independently-owned clocks after configuration is loaded.
+    config.requestTimeoutMs = 20;
+    config.anthropicIdleTimeoutMs = 1_000;
+    mockFetch((_, init) => new Promise<Response>((_, reject) => {
+      init.signal?.addEventListener("abort", () => reject(init.signal!.reason), { once: true });
+    }));
+
+    const response = await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", messages: [] },
+      new Headers(),
+      mgr,
+      config,
+      new AbortController().signal,
+    );
+
+    expect(response.status).toBe(502);
+    expect(response.headers.get(RETRYABLE_TRANSPORT_HEADER)).toBe("1");
+    expect(await response.json()).toMatchObject({ error: { type: "api_error" } });
+    expect(mgr.getAccount("a").usage.totalRequests).toBe(0);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("client cancellation returns 499 without blaming the account", async () => {
+  const { poolDir, mgr, config } = tempPool(["a"]);
+  try {
+    let started!: () => void;
+    const fetchStarted = new Promise<void>((resolve) => { started = resolve; });
+    mockFetch((_, init) => new Promise<Response>((_, reject) => {
+      started();
+      init.signal?.addEventListener("abort", () => reject(init.signal!.reason), { once: true });
+    }));
+    const client = new AbortController();
+    const request = proxyAnthropicMessages(
+      { model: "claude-sonnet-5", messages: [] },
+      new Headers(),
+      mgr,
+      config,
+      client.signal,
+    );
+    await fetchStarted;
+    client.abort(new DOMException("Client left", "AbortError"));
+
+    const response = await request;
+    expect(response.status).toBe(499);
+    expect(await response.json()).toMatchObject({ error: { type: "request_aborted" } });
+    expect(mgr.getAccount("a").usage.totalRequests).toBe(0);
+    expect(mgr.getAccount("a").usage.lastError).toBeNull();
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
 test("refreshes an expired access token and persists rotated credentials", async () => {
   const { poolDir, mgr, config } = tempPool(["a"]);
   try {
@@ -202,7 +310,7 @@ test("refreshes an expired access token and persists rotated credentials", async
   }
 });
 
-test("token refresh call times out instead of hanging forever on a stalled OAuth endpoint", async () => {
+test("token refresh timeout remains an authentication failure instead of hanging forever", async () => {
   const { poolDir, mgr, config } = tempPool(["a"]);
   try {
     const credsPath = join(poolDir, "accounts", "a", ".credentials.json");
@@ -232,8 +340,11 @@ test("token refresh call times out instead of hanging forever on a stalled OAuth
       new AbortController().signal,
     );
 
+    expect(response.status).toBe(401);
+    expect(response.headers.has(RETRYABLE_TRANSPORT_HEADER)).toBe(false);
     const text = await response.text();
     expect(text).toContain("timed out");
+    expect(JSON.parse(text)).toMatchObject({ error: { type: "authentication_error" } });
   } finally {
     rmSync(poolDir, { recursive: true, force: true });
   }
@@ -869,6 +980,252 @@ test("exhausted non-streaming transport failures are marked for cross-provider f
 
     expect(response.status).toBe(502);
     expect(response.headers.get(RETRYABLE_TRANSPORT_HEADER)).toBe("1");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+for (const prefix of ["", 'event: ping\ndata: {"type":"ping"}\n\n', 'event: message_start\ndata: {"type":']) {
+  test(`incomplete precommit SSE is not success: ${JSON.stringify(prefix)}`, async () => {
+    const { poolDir, mgr, config } = tempPool(["a"]);
+    try {
+      mockFetch(() => sseResponse(prefix));
+      const res = await proxyAnthropicMessages(
+        { model: "claude-sonnet-5", stream: true, messages: [] },
+        new Headers(),
+        mgr,
+        config,
+        new AbortController().signal,
+      );
+      expect(res.status).toBe(502);
+      expect(res.headers.get(RETRYABLE_TRANSPORT_HEADER)).toBe("1");
+      expect(mgr.getAccount("a").usage.totalRequests).toBe(0);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+}
+
+test("an empty precommit SSE body fails over to the next account", async () => {
+  const { poolDir, mgr, config } = tempPool(["a", "b"]);
+  try {
+    const calls = mockFetch((_, init) => {
+      const token = new Headers(init.headers).get("authorization");
+      if (token === "Bearer tok-a") return sseResponse("");
+      return sseResponse(
+        'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\n' +
+          'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+      );
+    });
+
+    const response = await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", max_tokens: 8, stream: true, messages: [{ role: "user", content: "hi" }] },
+      new Headers(),
+      mgr,
+      config,
+      new AbortController().signal,
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-Pool-Account")).toBe("b");
+    expect(await drain(response)).toContain("message_stop");
+    expect(calls.map((c) => c.headers.get("authorization"))).toEqual(["Bearer tok-a", "Bearer tok-b"]);
+    expect(mgr.getAccount("a").usage.totalRequests).toBe(0);
+    expect(mgr.getAccount("b").usage.totalRequests).toBe(1);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("a post-commit truncation (EOF before message_stop) rejects the response and never records success", async () => {
+  const { poolDir, mgr, config } = tempPool(["a", "b"]);
+  try {
+    const calls = mockFetch(() =>
+      sseResponse(
+        'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":0}}}\n\n',
+      ),
+    );
+
+    const response = await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", max_tokens: 8, stream: true, messages: [{ role: "user", content: "hi" }] },
+      new Headers(),
+      mgr,
+      config,
+      new AbortController().signal,
+    );
+
+    // Headers/status already committed before the fault surfaces in the body.
+    expect(response.status).toBe(200);
+    await expect(response.text()).rejects.toThrow("message_stop");
+    expect(mgr.getAccount("a").usage.lastError).toBe("Anthropic stream ended before message_stop");
+    expect(mgr.getAccount("a").usage.totalRequests).toBe(0);
+    // Never fails over: the body already reached the real client.
+    expect(calls).toHaveLength(1);
+    expect(mgr.getAccount("b").usage.totalRequests).toBe(0);
+    expect(mgr.inFlightOf("a")).toBe(0);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+for (const variant of ["prefix", "later"] as const) {
+  test(`terminal completion releases the account despite downstream backpressure (${variant})`, async () => {
+    const { poolDir, mgr, config } = tempPool(["a"]);
+    const start = 'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\n';
+    const stop = 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+    const chunks = variant === "prefix" ? [start + stop] : [start, stop];
+    let response: Response | undefined;
+    let reader: Pick<ReadableStreamDefaultReader<Uint8Array>, "read" | "cancel"> | undefined;
+    try {
+      mockFetch(() => new Response(new ReadableStream<Uint8Array>({
+        pull(controller) {
+          const chunk = chunks.shift();
+          if (chunk) controller.enqueue(new TextEncoder().encode(chunk));
+          // Deliberately leave the transport open after protocol completion.
+        },
+      }), { headers: { "content-type": "text/event-stream" } }));
+      response = await proxyAnthropicMessages(
+        { model: "claude-sonnet-5", max_tokens: 8, stream: true, messages: [{ role: "user", content: "hi" }] },
+        new Headers(), mgr, config, new AbortController().signal,
+      );
+      let text = "";
+      if (variant === "later") {
+        reader = response.body!.getReader();
+        text = new TextDecoder().decode((await reader.read()).value);
+      }
+      // Let the automatic pull fill the downstream queue, without consuming it.
+      await Bun.sleep(10);
+      expect(mgr.inFlightOf("a")).toBe(0);
+      expect(mgr.getAccount("a").usage.totalRequests).toBe(1);
+      if (reader) {
+        while (true) {
+          const part = await reader.read();
+          if (part.done) break;
+          text += new TextDecoder().decode(part.value);
+        }
+      } else text = await response.text();
+      expect(text).toBe(start + stop);
+    } finally {
+      if (reader) await reader.cancel().catch(() => {});
+      else await response?.body?.cancel().catch(() => {});
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+}
+
+test("a complete stream held open by the upstream still closes promptly and releases the connection", async () => {
+  const { poolDir, mgr, config } = tempPool(["a"]);
+  try {
+    const sse =
+      'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":2,"output_tokens":0}}}\n\n' +
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n' +
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+    let cancelled!: () => void;
+    const wasCancelled = new Promise<void>((resolve) => { cancelled = resolve; });
+    mockFetch(() =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(c) { c.enqueue(new TextEncoder().encode(sse)); },
+          cancel() { cancelled(); },
+        }),
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      ),
+    );
+
+    const response = await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", max_tokens: 8, stream: true, messages: [{ role: "user", content: "hi" }] },
+      new Headers(),
+      mgr,
+      // Deliberately large: a working "release promptly" fix must not need it.
+      { ...config, anthropicIdleTimeoutMs: 5000 },
+      new AbortController().signal,
+    );
+
+    expect(response.status).toBe(200);
+    const start = Date.now();
+    const text = await Promise.race([
+      response.text(),
+      Bun.sleep(1000).then(() => { throw new Error("response.text() did not resolve promptly"); }),
+    ]);
+    expect(Date.now() - start).toBeLessThan(1000);
+    expect(text).toBe(sse);
+    await Promise.race([
+      wasCancelled,
+      Bun.sleep(1000).then(() => { throw new Error("upstream was never cancelled"); }),
+    ]);
+    expect(mgr.getAccount("a").usage.totalRequests).toBe(1);
+    expect(mgr.inFlightOf("a")).toBe(0);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("a post-commit protocol error frame held open by the upstream still releases promptly", async () => {
+  const { poolDir, mgr, config } = tempPool(["a"]);
+  try {
+    const sse =
+      'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":2,"output_tokens":0}}}\n\n' +
+      'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"upstream fault"}}\n\n';
+    let cancelled!: () => void;
+    const wasCancelled = new Promise<void>((resolve) => { cancelled = resolve; });
+    mockFetch(() =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(c) { c.enqueue(new TextEncoder().encode(sse)); },
+          cancel() { cancelled(); },
+        }),
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      ),
+    );
+
+    const response = await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", max_tokens: 8, stream: true, messages: [{ role: "user", content: "hi" }] },
+      new Headers(),
+      mgr,
+      { ...config, anthropicIdleTimeoutMs: 5000 },
+      new AbortController().signal,
+    );
+
+    const start = Date.now();
+    const text = await Promise.race([
+      response.text(),
+      Bun.sleep(1000).then(() => { throw new Error("response.text() did not resolve promptly"); }),
+    ]);
+    expect(Date.now() - start).toBeLessThan(1000);
+    expect(text).toBe(sse);
+    await Promise.race([
+      wasCancelled,
+      Bun.sleep(1000).then(() => { throw new Error("upstream was never cancelled"); }),
+    ]);
+    expect(mgr.getAccount("a").usage.totalRequests).toBe(0);
+    expect(mgr.getAccount("a").usage.lastError).toBe("upstream fault");
+    expect(mgr.inFlightOf("a")).toBe(0);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("a post-commit protocol error frame is accounted as an error, not a success", async () => {
+  const { poolDir, mgr, config } = tempPool(["a"]);
+  try {
+    const committedThenError =
+      'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":0}}}\n\n' +
+      'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"mid-stream failure"}}\n\n';
+    const calls = mockFetch(() => sseResponse(committedThenError));
+
+    const response = await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", max_tokens: 8, stream: true, messages: [{ role: "user", content: "hi" }] },
+      new Headers(),
+      mgr,
+      config,
+      new AbortController().signal,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await drain(response)).toBe(committedThenError);
+    expect(calls).toHaveLength(1);
+    expect(mgr.getAccount("a").usage.lastError).toBe("mid-stream failure");
+    expect(mgr.getAccount("a").usage.totalRequests).toBe(0);
   } finally {
     rmSync(poolDir, { recursive: true, force: true });
   }

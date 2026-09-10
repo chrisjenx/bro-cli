@@ -57,6 +57,34 @@ The direct backend intentionally does not synthesize Anthropic protocol headers
 such as `anthropic-version` or `anthropic-beta`. Those come from the harness
 request. Claude Code already sends the OAuth beta header it needs.
 
+## Ingress ownership and completion
+
+The Bun server's ordinary idle timer still protects request upload, authentication,
+JSON parsing, status, dashboard, and every non-inference route. Only after a
+`POST /v1/messages` or `/v1/chat/completions` request has passed proxy auth and
+`req.json()` has succeeded does the server call `srv.timeout(req, 0)`. The pool
+then owns the inference lifetime; this avoids Bun's ingress timer terminating a
+legitimate long generation while retaining bounded untrusted ingestion. Provider
+watchdogs and `REQUEST_TIMEOUT_MS` remain active after that handoff, so disabling
+the ingress timer is not an unbounded upstream wait.
+
+For Anthropic SSE, protocol completion is distinct from transport EOF. A complete
+`message_stop` (or terminal `error`) is forwarded unchanged and releases the
+account reservation even when the peer holds the HTTP stream open afterwards. EOF
+before a complete terminal event is truncation, not a successful turn: it remains
+observable as a stream failure and is not silently recorded as normal completion.
+
+Failures preserve their source classification. A real transport/header/read
+failure before response commitment is a structured `502 api_error`; authentication
+failures remain `401 authentication_error`. Direct Anthropic HTTP overload
+passthrough preserves the surfaced upstream diagnostic headers and body; this does
+not apply to synthesized transport `502`s or translated Codex responses. Mapped
+cross-provider fallback makes at most one alternate-provider attempt for an eligible
+pre-commit `429`, `500`, `503`, `529`, or marked transport failure; request-specific
+upstream rejections, auth failures, protocol errors, and a second retryable response
+are terminal. In the last case the primary response is returned rather than masking
+it with a second failure.
+
 ## Legacy CLI backend
 
 Set `CLAUDE_POOL_BACKEND=cli` to use the previous `/v1/messages` path. That path calls `runClaude(prompt, { configDir, model, ... })`, spawns the CLI with `--print --output-format stream-json --verbose --include-partial-messages`, parses newline-delimited CLI JSON into normalized `TurnEvent`s, and re-serializes those events through the Anthropic adapter.
@@ -108,8 +136,11 @@ waiting and each demanded upstream body read instead. The timer is paused when
 backpressure means no upstream read is pending. It does not alter response bytes,
 status or headers, and it is not equivalent to Codex's complete-SSE-event idle timer.
 `REQUEST_TIMEOUT_MS` remains a per-fetch-attempt deadline, not a whole-request deadline
-covering token refresh, slot waiting, backoff and retries. Client watchdogs and the
-server's 255-second idle limit remain independent and can expire earlier.
+covering token refresh, slot waiting, backoff and retries. External client watchdogs
+remain independent and can expire earlier. The server's 255-second ingress idle limit
+continues to bound uploads and ordinary routes, but is disabled only for accepted
+inference requests after their proxy authentication and JSON parsing complete; their
+provider watchdogs and request deadlines remain in force.
 
 Account selection and reservation happen synchronously before asynchronous token
 refresh. Reservations remain live through streaming, non-stream body consumption,

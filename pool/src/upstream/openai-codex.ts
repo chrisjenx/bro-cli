@@ -314,7 +314,7 @@ async function fetchCodex(
       },
       body: JSON.stringify(codexBody),
       signal: abort.signal,
-    }, config.codexIdleTimeoutMs, fetchFn);
+    }, config.codexIdleTimeoutMs, fetchFn, signal);
     return { response: upstream.response, cleanup: () => { upstream.cleanup(); abort.cleanup(); }, failureSignal: upstream.failureSignal };
   } catch (err) {
     abort.cleanup();

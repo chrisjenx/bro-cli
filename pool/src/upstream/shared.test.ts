@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { SseParser, overloadBackoffMs, sleepWithAbort } from "./shared.ts";
+import { SseParser, fetchWithIdleTimeout, overloadBackoffMs, sleepWithAbort } from "./shared.ts";
+import { UpstreamTransportError } from "./transport-error.ts";
 
 describe("SseParser", () => {
   test("parses events split across chunks and across lines", () => {
@@ -58,6 +59,65 @@ describe("overloadBackoffMs", () => {
 
   test("zeroed delays collapse to 0 (test-mode fast path)", () => {
     expect(overloadBackoffMs(5, { baseMs: 0, maxDelayMs: 0 }, undefined, () => 1)).toBe(0);
+  });
+});
+
+describe("fetchWithIdleTimeout", () => {
+  test("normalizes an inference fetch failure as a headers transport error", async () => {
+    const cause = Object.assign(new Error("socket reset"), { code: "ECONNRESET", headers: { authorization: "secret" } });
+    const fetchFn = Object.assign(async () => { throw cause; }, { preconnect() {} }) as typeof fetch;
+
+    let error: unknown;
+    try {
+      await fetchWithIdleTimeout("https://example.invalid", {}, 100, fetchFn);
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBeInstanceOf(UpstreamTransportError);
+    expect((error as Error).message).toContain("headers");
+    expect((error as Error).message).toContain("ECONNRESET");
+    expect((error as Error).message).not.toContain("secret");
+    expect((error as Error).cause).toBe(cause);
+  });
+
+  test("forwards one normalized body failure to the reader and failure signal", async () => {
+    const cause = Object.assign(new Error("socket reset"), { code: "ECONNRESET" });
+    const upstream = new Response(new ReadableStream<Uint8Array>({
+      start(controller) { controller.error(cause); },
+    }));
+    const fetchFn = Object.assign(async () => upstream, { preconnect() {} }) as typeof fetch;
+    const { response, cleanup, failureSignal } = await fetchWithIdleTimeout("https://example.invalid", {}, 100, fetchFn);
+
+    try {
+      let error: unknown;
+      try {
+        await response.text();
+      } catch (caught) {
+        error = caught;
+      }
+      expect(error).toBeInstanceOf(UpstreamTransportError);
+      expect((error as Error).message).toContain("body");
+      expect((error as Error).message).toContain("ECONNRESET");
+      expect(failureSignal.aborted).toBe(true);
+      expect(failureSignal.reason).toBe(error);
+      expect((error as Error).cause).toBe(cause);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("preserves an external abort reason", async () => {
+    const client = new AbortController();
+    const reason = new DOMException("Client left", "AbortError");
+    const fetchFn = Object.assign(async (_input: string | URL, init?: RequestInit) => {
+      await new Promise<never>((_resolve, reject) => init!.signal!.addEventListener("abort", () => reject(init!.signal!.reason), { once: true }));
+      throw new Error("unreachable");
+    }, { preconnect() {} }) as typeof fetch;
+    const request = fetchWithIdleTimeout("https://example.invalid", { signal: client.signal }, 100, fetchFn);
+    client.abort(reason);
+
+    await expect(request).rejects.toBe(reason);
   });
 });
 

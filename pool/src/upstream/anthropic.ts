@@ -31,6 +31,7 @@ import {
   RETRYABLE_TRANSPORT_HEADER,
 } from "./shared.ts";
 import type { ProxyHooks, SseEvent } from "./shared.ts";
+import { UpstreamTransportError } from "./transport-error.ts";
 import { accessTokenFor } from "./oauth-token.ts";
 import { stripCodexThinking } from "./codex-translate.ts";
 import { maybeRefreshUsage } from "./usage.ts";
@@ -72,13 +73,6 @@ type ByteReadResult = { done: true; value?: undefined } | { done: false; value: 
 interface ByteReader {
   read(): Promise<ByteReadResult>;
   cancel(reason?: unknown): Promise<void>;
-}
-
-class InferenceTransportError extends Error {
-  constructor(cause: unknown) {
-    super(cause instanceof Error ? cause.message : String(cause), { cause });
-    this.name = "InferenceTransportError";
-  }
 }
 
 export async function proxyAnthropicMessages(
@@ -193,7 +187,7 @@ async function attemptOnce(
     if (signal.aborted) return { kind: "terminal", response: clientAbortedResponse() };
     const message = (err as Error).message;
     mgr.recordError(account.name, message);
-    return { kind: "retry", reason: authOrNetworkReason(message, err instanceof InferenceTransportError) };
+    return { kind: "retry", reason: authOrNetworkReason(message, err instanceof UpstreamTransportError) };
   }
 
   if (upstream.response.status === 401) {
@@ -204,7 +198,7 @@ async function attemptOnce(
       if (signal.aborted) return { kind: "terminal", response: clientAbortedResponse() };
       const message = (err as Error).message;
       mgr.recordError(account.name, message);
-      return { kind: "retry", reason: authOrNetworkReason(message, err instanceof InferenceTransportError) };
+      return { kind: "retry", reason: authOrNetworkReason(message, err instanceof UpstreamTransportError) };
     }
   }
 
@@ -294,12 +288,12 @@ async function fetchWithAccount(
       headers: upstreamHeaders(incomingHeaders, token),
       body: bodyText,
       signal: abort.signal,
-    }, config.anthropicIdleTimeoutMs);
+    }, config.anthropicIdleTimeoutMs, fetch, signal);
     return { response: upstream.response, cleanup: () => { upstream.cleanup(); abort.cleanup(); }, failureSignal: upstream.failureSignal };
   } catch (err) {
     abort.cleanup();
     if (signal.aborted) throw new Error("Request aborted by client");
-    throw new InferenceTransportError(err);
+    throw err;
   }
 }
 
@@ -423,6 +417,12 @@ function streamWithTap(
     if (!aborted) output.error(error);
   };
   const onFailure = () => fail(failureSignal.reason);
+  const finish = (controller: ReadableStreamDefaultController<Uint8Array>) => {
+    tap.finish();
+    finished = true;
+    stop();
+    controller.close();
+  };
 
   return new ReadableStream<Uint8Array>({
     start(controller) {
@@ -432,21 +432,23 @@ function streamWithTap(
     },
     async pull(controller) {
       if (finished) return;
-      if (prefixIndex < prefix.length) {
-        controller.enqueue(prefix[prefixIndex++]!);
-        return;
-      }
       try {
+        // Close after enqueueing the terminal bytes, not on the next pull:
+        // backpressure may prevent that pull while the request deadline runs.
+        // Closing preserves queued bytes; every prefix chunk must be forwarded.
+        if (prefixIndex < prefix.length) {
+          controller.enqueue(prefix[prefixIndex++]!);
+          if (prefixIndex === prefix.length && tap.terminal) finish(controller);
+          return;
+        }
         const { value, done } = await reader.read();
         if (finished) return;
         if (done) {
-          tap.finish();
-          finished = true;
-          stop();
-          controller.close();
+          finish(controller);
         } else if (value) {
           tap.push(value);
           controller.enqueue(value);
+          if (tap.terminal) finish(controller);
         }
       } catch (err) { fail(err); }
     },
@@ -464,6 +466,11 @@ class StreamUsageTap {
   committed = false;
   initialRateLimit: RetryReason | null = null;
   initialTransient: RetryReason | null = null;
+  /** Set once a protocol-terminal SSE event (message_stop or error) is
+   * parsed. finish() refuses to record success without it — an EOF (or a
+   * caller settling early once this is already set) that never reached one
+   * is a truncated turn, not a completed one. */
+  terminal = false;
 
   private parser = new SseParser((event) => this.onEvent(event));
   private usage: CliUsage = { input_tokens: 0, output_tokens: 0 };
@@ -480,10 +487,20 @@ class StreamUsageTap {
     this.parser.push(chunk);
   }
 
+  /**
+   * Settles the tap: success, or the captured terminal SSE error — but only
+   * once the protocol actually completed. Throws (without marking `done`)
+   * when it didn't, so a caller's catch can still route the fault through
+   * `error()`/`cancel()` instead of the truncation being silently recorded
+   * as a successful turn.
+   */
   finish(): void {
     if (this.done) return;
-    this.done = true;
     this.parser.end();
+    if (!this.terminal) {
+      throw new Error("Anthropic stream ended before message_stop");
+    }
+    this.done = true;
     if (this.sawError && this.finalError) {
       if (this.finalError.rateLimited) this.mgr.markRateLimited(this.accountName, this.finalError.resetAt);
       else this.mgr.recordError(this.accountName, this.finalError.message);
@@ -506,6 +523,7 @@ class StreamUsageTap {
     const data = parseJson(event.data);
     const type = stringProp(data, "type") ?? event.event;
 
+    if (type === "message_stop" || type === "error") this.terminal = true;
     if (type === "ping") return;
 
     if (type === "message_start") {
@@ -687,7 +705,14 @@ function resetAtFromHeaders(headers: Headers): number | undefined {
 }
 
 function authOrNetworkReason(message: string, transport = false): RetryReason {
-  return { status: 401, type: "authentication_error", message, rateLimited: false, transient: false, transport };
+  return {
+    status: transport ? 502 : 401,
+    type: transport ? "api_error" : "authentication_error",
+    message,
+    rateLimited: false,
+    transient: false,
+    transport,
+  };
 }
 
 function upstreamHeaders(incoming: Headers, token: string): Headers {

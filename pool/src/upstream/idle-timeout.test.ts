@@ -1,6 +1,7 @@
 import { test, expect } from "bun:test";
 import * as shared from "./shared.ts";
 import { loadConfig } from "../config.ts";
+import { UpstreamTransportError } from "./transport-error.ts";
 
 const enc = new TextEncoder();
 
@@ -96,6 +97,35 @@ test("cancelling a wrapped HTTP body cancels the upstream connection", async () 
   } finally { server.stop(true); }
 });
 
+test("an attempt deadline is one normalized body failure when client origin is separate", async () => {
+  let interval: ReturnType<typeof setInterval>;
+  const server = Bun.serve({ port: 0, idleTimeout: 0, fetch() {
+    return new Response(new ReadableStream<Uint8Array>({
+      start(c) { c.enqueue(enc.encode(".")); interval = setInterval(() => c.enqueue(enc.encode(".")), 10); },
+      cancel() { clearInterval(interval); },
+    }));
+  } });
+  const client = new AbortController();
+  const attempt = shared.makeAbort(loadConfig({ requestTimeoutMs: 100 }), client.signal);
+  try {
+    const { response, cleanup, failureSignal } = await shared.fetchWithIdleTimeout(
+      server.url,
+      { signal: attempt.signal },
+      50,
+      fetch,
+      client.signal,
+    );
+    try {
+      let error: unknown;
+      try { await response.text(); } catch (caught) { error = caught; }
+      expect(error).toBeInstanceOf(UpstreamTransportError);
+      expect((error as Error).message).toContain("body");
+      expect((error as Error).cause).toBe(attempt.signal.reason);
+      expect(failureSignal.reason).toBe(error);
+    } finally { cleanup(); }
+  } finally { attempt.cleanup(); clearInterval(interval!); server.stop(true); }
+});
+
 test("the attempt deadline still wins while upstream sends continuous progress", async () => {
   let interval: ReturnType<typeof setInterval>;
   const server = Bun.serve({ port: 0, idleTimeout: 0, fetch() {
@@ -107,7 +137,14 @@ test("the attempt deadline still wins while upstream sends continuous progress",
   const attempt = shared.makeAbort(loadConfig({ requestTimeoutMs: 100 }), new AbortController().signal);
   try {
     const { response, cleanup } = await shared.fetchWithIdleTimeout(server.url, { signal: attempt.signal }, 50);
-    try { await expect(response.text()).rejects.toThrow(); expect(attempt.signal.aborted).toBe(true); }
-    finally { cleanup(); }
+    try {
+      let error: unknown;
+      try { await response.text(); } catch (caught) { error = caught; }
+      expect(attempt.signal.aborted).toBe(true);
+      expect(attempt.signal.reason).toBeInstanceOf(DOMException);
+      expect((attempt.signal.reason as DOMException).name).toBe("TimeoutError");
+      expect((attempt.signal.reason as DOMException).message).toBe("Upstream request timeout");
+      expect(error).toBe(attempt.signal.reason);
+    } finally { cleanup(); }
   } finally { attempt.cleanup(); clearInterval(interval!); server.stop(true); }
 });
