@@ -875,7 +875,12 @@ async function refresh() {
               headers: { "content-type": "application/json" },
               body: JSON.stringify({ account: name, priority }),
             });
-            if (res.ok) { accountSettingsDirty = false; refresh(); }
+            // Chromium keeps focus on the button after a click, and that focus
+            // sits inside #grid — which would otherwise block refresh() from
+            // ever re-rendering (its dirty-guard treats any focus inside the
+            // grid as an in-progress edit). Blur before refreshing so the
+            // card can actually move to its new priority tier.
+            if (res.ok) { accountSettingsDirty = false; btn.blur(); refresh(); }
           } catch (e) { /* transient; retain the draft until the user retries */ }
         });
       });
@@ -892,7 +897,7 @@ async function refresh() {
               headers: { "content-type": "application/json" },
               body: JSON.stringify({ account: name, weight }),
             });
-            if (res.ok) { accountSettingsDirty = false; refresh(); }
+            if (res.ok) { accountSettingsDirty = false; btn.blur(); refresh(); }
           } catch (e) { /* transient; retain the draft until the user retries */ }
         });
       });
@@ -956,7 +961,11 @@ function wireMapping(targets) {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ enabled: document.getElementById("mapping-enabled").checked, mappings }),
       });
-      if (finishSettingsSave("mapping-panel", res, document.getElementById("mapping-status"))) refresh();
+      // Blur before refreshing: Chromium keeps focus on saveBtn after the click,
+      // and that focus sits inside #mapping-panel — which would otherwise block
+      // renderSettings() from ever re-rendering (see the priority/weight "Set"
+      // buttons above for the same fix).
+      if (finishSettingsSave("mapping-panel", res, document.getElementById("mapping-status"))) { saveBtn.blur(); refresh(); }
     } catch (e) { /* transient; next poll will reconcile */ }
   });
 }
@@ -985,7 +994,7 @@ function wireTuning() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify(patch),
       });
-      if (finishSettingsSave("tuning-panel", res, status)) refresh();
+      if (finishSettingsSave("tuning-panel", res, status)) { apply.blur(); refresh(); }
     } catch (e) {
       if (status) status.textContent = "offline";
     }
