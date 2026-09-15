@@ -5,7 +5,7 @@ import { tmpdir } from "os";
 import { loadConfig, type Config } from "../config.ts";
 import { AccountManager, type KeychainOps, DEFAULT_WEIGHT, isValidWeight } from "./manager.ts";
 import type { RateLimitSnapshot, RateLimitWindow } from "./types.ts";
-import { OPENAI_CREDS_FILENAME } from "./types.ts";
+import { emptyUsage, OPENAI_CREDS_FILENAME } from "./types.ts";
 
 function tempPool(
   accountNames: string[],
@@ -945,6 +945,190 @@ test("routingSnapshot is read-only: it does not advance the round-robin cursor",
   }
 });
 
+test("combined routing snapshot merges providers and uses the live provider winner", () => {
+  const { poolDir, mgr } = tempPool([], undefined, { routingStrategy: "weighted" });
+  try {
+    mgr.create("claude");
+    writeFileSync(
+      join(mgr.configDirFor("claude"), ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "at" } }),
+    );
+    mgr.create("codex");
+    writeFileSync(join(mgr.configDirFor("codex"), OPENAI_CREDS_FILENAME), JSON.stringify({ accessToken: "at" }));
+    mgr.setWeight("claude", 0.2);
+    mgr.setWeight("codex", 2);
+    mgr.setPriority("claude", 1);
+    mgr.setPriority("codex", 100);
+
+    const candidates = [
+      { provider: "anthropic" as const, modelFamily: "opus" },
+      { provider: "openai" as const, modelFamily: null },
+    ];
+    const snapshot = mgr.routingSnapshotForProviders(candidates);
+
+    expect(snapshot.nextPick?.account).toBe("codex");
+    expect(snapshot.activeTier).toBe(1);
+    expect(snapshot.candidates?.map((candidate) => candidate.account).sort()).toEqual(["claude", "codex"]);
+    expect(snapshot.tiers.flatMap((tier) => tier.accounts).sort()).toEqual(["claude", "codex"]);
+    expect(snapshot.providerPicks).toEqual([
+      expect.objectContaining({ provider: "anthropic", activeTier: 1, nextPick: expect.objectContaining({ account: "claude" }) }),
+      expect.objectContaining({ provider: "openai", activeTier: 100, nextPick: expect.objectContaining({ account: "codex" }) }),
+    ]);
+    expect(mgr.pickProvider(undefined, candidates)?.provider).toBe("openai");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+for (const strategy of ["headroom", "expiring"] as const) {
+  test(`combined routing snapshot exposes factor rows for the ${strategy} strategy`, () => {
+    const { poolDir, mgr } = tempPool([], undefined, { routingStrategy: strategy });
+    try {
+      mgr.create("claude");
+      writeFileSync(
+        join(mgr.configDirFor("claude"), ".credentials.json"),
+        JSON.stringify({ claudeAiOauth: { accessToken: "at" } }),
+      );
+      mgr.create("codex");
+      writeFileSync(join(mgr.configDirFor("codex"), OPENAI_CREDS_FILENAME), JSON.stringify({ accessToken: "at" }));
+      mgr.setWeight("claude", 0.2);
+      mgr.setWeight("codex", 2);
+      mgr.setAffinity("claude-session", "claude", "anthropic");
+      const releaseCodex = mgr.acquireInFlight("codex");
+
+      try {
+        const snapshot = mgr.routingSnapshotForProviders([
+          { provider: "anthropic", modelFamily: "opus" },
+          { provider: "openai", modelFamily: null },
+        ]);
+
+        expect(snapshot.candidates).toEqual([
+          {
+            account: "claude",
+            weight: 0.2,
+            expiryShare: 5,
+            activeSessions: 1,
+            inFlight: 0,
+            fiveHourFactor: 1,
+            viable: true,
+            urgency: 5,
+            loadFactor: 0.5,
+            headroom: 1,
+            score: 0.5,
+          },
+          {
+            account: "codex",
+            weight: 2,
+            expiryShare: 5,
+            activeSessions: 0,
+            inFlight: 1,
+            fiveHourFactor: 1,
+            viable: true,
+            urgency: 5,
+            loadFactor: 1,
+            headroom: 1,
+            score: 10,
+          },
+        ]);
+      } finally {
+        releaseCodex();
+      }
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+}
+
+test("combined routing snapshot mirrors the live ignore-cap fallback", () => {
+  const { poolDir, mgr } = tempPool([], undefined, {
+    routingStrategy: "weighted",
+    anthropicMaxInFlight: 1,
+    codexMaxInFlight: 1,
+  });
+  try {
+    mgr.create("claude");
+    writeFileSync(
+      join(mgr.configDirFor("claude"), ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "at" } }),
+    );
+    mgr.create("codex");
+    writeFileSync(join(mgr.configDirFor("codex"), OPENAI_CREDS_FILENAME), JSON.stringify({ accessToken: "at" }));
+    mgr.setWeight("claude", 0.2);
+    mgr.setWeight("codex", 2);
+    const releaseClaude = mgr.acquireInFlight("claude");
+    const releaseCodex = mgr.acquireInFlight("codex");
+    const candidates = [
+      { provider: "anthropic" as const, modelFamily: "opus" },
+      { provider: "openai" as const, modelFamily: null },
+    ];
+
+    try {
+      const live = mgr.pickProvider(undefined, candidates)
+        ?? mgr.pickProvider(undefined, candidates, true);
+      expect(live?.provider).toBe("openai");
+
+      const preview = mgr.routingSnapshotForProviders(candidates);
+      expect(preview.nextPick?.account).toBe("codex");
+      expect(preview.candidates?.map((candidate) => candidate.account)).toEqual(["claude", "codex"]);
+      expect(preview.busy?.map((candidate) => candidate.account)).toEqual(["claude", "codex"]);
+    } finally {
+      releaseCodex();
+      releaseClaude();
+    }
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("combined fixed-time snapshot uses read-only account state at the supplied timestamp", () => {
+  const poolDir = mkdtempSync(join(process.env.CLAUDE_JOB_DIR ? join(process.env.CLAUDE_JOB_DIR, "tmp") : tmpdir(), "cmp-manager-fixed-time-"));
+  const accountsDir = join(poolDir, "accounts");
+  const usageFile = join(poolDir, "usage.json");
+  const wallNow = Date.now();
+  const usageWindowMs = 10_000;
+  const windowStart = wallNow - usageWindowMs - 1_000;
+  const previewNow = windowStart + usageWindowMs - 1;
+
+  try {
+    mkdirSync(join(accountsDir, "claude"), { recursive: true });
+    mkdirSync(join(accountsDir, "codex"), { recursive: true });
+    writeFileSync(
+      join(accountsDir, "claude", ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "at" } }),
+    );
+    writeFileSync(
+      join(accountsDir, "codex", OPENAI_CREDS_FILENAME),
+      JSON.stringify({ accessToken: "at" }),
+    );
+    writeFileSync(usageFile, JSON.stringify({
+      usage: {
+        claude: { ...emptyUsage(windowStart), windowRequests: 4, totalRequests: 4 },
+        codex: emptyUsage(windowStart),
+      },
+    }));
+    const mgr = new AccountManager(loadConfig({
+      poolDir,
+      accountsDir,
+      usageFile,
+      sessionsFile: join(poolDir, "sessions.json"),
+      usageWindowMs,
+      routingStrategy: "headroom",
+    }));
+    const candidates = [
+      { provider: "anthropic" as const, modelFamily: "opus" },
+      { provider: "openai" as const, modelFamily: null },
+    ];
+
+    const preview = mgr.routingSnapshotForProviders(candidates, previewNow);
+
+    expect(preview.nextPick?.account).toBe("codex");
+    expect(mgr.getAccount("claude", true, previewNow).usage.windowRequests).toBe(4);
+    expect(JSON.parse(readFileSync(usageFile, "utf8")).usage.claude.windowRequests).toBe(4);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
 test("routingSnapshot reason: 7d expiry is the decisive factor and names the runner-up", () => {
   const { poolDir, mgr } = tempPool(["burn-me", "keep"]);
   try {
@@ -1746,8 +1930,8 @@ test("recordUsageSnapshot clears a still-future cooldown once ground truth shows
 describe("pickProvider", () => {
   // One anthropic account + one openai account, mirroring the "provider-aware
   // pick" describe block's fixture-construction calls.
-  function crossProviderPool() {
-    const { poolDir, mgr } = tempPool([]);
+  function crossProviderPool(routingStrategy: "weighted" | "expiring" | "headroom" = "weighted") {
+    const { poolDir, mgr } = tempPool([], undefined, { routingStrategy });
     mgr.create("claude1");
     writeFileSync(
       join(mgr.configDirFor("claude1"), ".credentials.json"),
@@ -1784,6 +1968,142 @@ describe("pickProvider", () => {
       expect(pick?.provider).toBe("openai");
     } finally {
       rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("weighted strategy compares provider winners by placement score", () => {
+    const { poolDir, mgr } = crossProviderPool();
+    try {
+      mgr.setWeight("claude1", 0.2);
+      mgr.setWeight("gpt1", 2);
+
+      expect(mgr.routingSnapshot("anthropic").candidates?.[0]?.score).toBe(1);
+      expect(mgr.routingSnapshot("openai").candidates?.[0]?.score).toBe(10);
+      expect(mgr.pickProvider(undefined, candidates)?.provider).toBe("openai");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("weighted provider comparison ranks expiry shares across providers", () => {
+    const { poolDir, mgr } = crossProviderPool();
+    try {
+      const now = Date.now();
+      mgr.recordRateLimitSnapshot("claude1", snapshot([
+        win("5h", { utilization: 0, reset: now + 4 * 60 * 60_000 }),
+        win("7d-fable", { utilization: 0.2, reset: now + 6 * 86_400_000 }),
+      ]));
+      mgr.recordRateLimitSnapshot("gpt1", snapshot([
+        win("5h", { utilization: 0, reset: now + 4 * 60 * 60_000 }),
+        win("7d", { utilization: 0.2, reset: now + 86_400_000 }),
+      ]));
+
+      expect(mgr.pickProvider(undefined, candidates)?.provider).toBe("openai");
+      const combined = mgr.routingSnapshotForProviders(candidates, now);
+      expect(combined.nextPick?.account).toBe("gpt1");
+      expect(combined.candidates?.find((row) => row.account === "gpt1")?.expiryShare).toBe(5);
+      expect(combined.candidates?.find((row) => row.account === "claude1")?.expiryShare).toBe(3);
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("weighted provider comparison scores the account that provider-local pick will serve", () => {
+    const { poolDir, mgr } = crossProviderPool();
+    try {
+      mgr.create("claude2");
+      writeFileSync(
+        join(mgr.configDirFor("claude2"), ".credentials.json"),
+        JSON.stringify({ claudeAiOauth: { accessToken: "at" } }),
+      );
+      const now = Date.now();
+      mgr.setWeight("claude1", 1);
+      mgr.setWeight("claude2", 2);
+      mgr.setWeight("gpt1", 1.5);
+      mgr.recordRateLimitSnapshot("claude1", snapshot([
+        win("5h", { utilization: 0, reset: now + 4 * 60 * 60_000 }),
+        win("7d-fable", { utilization: 0.2, reset: now + 86_400_000 }),
+      ]));
+      mgr.recordRateLimitSnapshot("gpt1", snapshot([
+        win("5h", { utilization: 0, reset: now + 4 * 60 * 60_000 }),
+        win("7d", { utilization: 0.2, reset: now + 2 * 86_400_000 }),
+      ]));
+      mgr.recordRateLimitSnapshot("claude2", snapshot([
+        win("5h", { utilization: 0, reset: now + 4 * 60 * 60_000 }),
+        win("7d-fable", { utilization: 0.2, reset: now + 3 * 86_400_000 }),
+      ]));
+
+      // Provider-local ranking picks claude2 (2 × share 3 = 6) over claude1
+      // (1 × share 5 = 5). On the shared cross-provider scale, however, that
+      // actual Claude contender scores 4 while gpt1 scores 4.5. claude1's
+      // unused score of 5 must not make the Anthropic provider win.
+      expect(mgr.routingSnapshot("anthropic", now, "fable").nextPick?.account).toBe("claude2");
+      expect(mgr.pickProvider(undefined, candidates)?.provider).toBe("openai");
+      const combined = mgr.routingSnapshotForProviders(candidates, now);
+      expect(combined.nextPick?.account).toBe("gpt1");
+      expect(combined.nextPick?.reason.factors.find((factor) => factor.label === "Score")?.detail)
+        .toContain("4.50");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a usable provider pin still wins over a higher weighted score", () => {
+    const { poolDir, mgr } = crossProviderPool();
+    try {
+      mgr.setWeight("claude1", 0.2);
+      mgr.setWeight("gpt1", 2);
+      mgr.setAffinity("s1", "claude1", "anthropic");
+
+      expect(mgr.pickProvider("s1", candidates)?.provider).toBe("anthropic");
+      mgr.markRateLimited("claude1", Date.now() + 60 * 60_000);
+      expect(mgr.pickProvider("s1", candidates)?.provider).toBe("openai");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a reserve-tier pin stops forcing its provider when the primary tier recovers", () => {
+    const { poolDir, mgr } = crossProviderPool();
+    try {
+      mgr.create("claude-reserve");
+      writeFileSync(
+        join(mgr.configDirFor("claude-reserve"), ".credentials.json"),
+        JSON.stringify({ claudeAiOauth: { accessToken: "at" } }),
+      );
+      mgr.setPriority("claude1", 100);
+      mgr.setPriority("claude-reserve", 110);
+      mgr.setWeight("claude1", 0.1);
+      mgr.setWeight("gpt1", 10);
+
+      mgr.markRateLimited("claude1", Date.now() + 60 * 60_000);
+      mgr.setAffinity("s1", "claude-reserve", "anthropic");
+      expect(mgr.pickProvider("s1", candidates)?.provider).toBe("anthropic");
+
+      mgr.clearRateLimit("claude1");
+      expect(mgr.pickProvider("s1", candidates)?.provider).toBe("openai");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
+  test("headroom and expiring compare their own provider winners", () => {
+    for (const strategy of ["headroom", "expiring"] as const) {
+      const { poolDir, mgr } = crossProviderPool(strategy);
+      try {
+        const now = Date.now();
+        mgr.recordRateLimitSnapshot("claude1", snapshot([
+          win("5h", { utilization: 0.8 }),
+          win("7d-fable", { utilization: 0.2, reset: now + 4 * 86_400_000 }),
+        ]));
+        mgr.recordRateLimitSnapshot("gpt1", snapshot([
+          win("5h", { utilization: 0.1 }),
+          win("7d", { utilization: 0.2, reset: now + 2 * 86_400_000 }),
+        ]));
+        expect(mgr.pickProvider(undefined, candidates)?.provider).toBe("openai");
+      } finally {
+        rmSync(poolDir, { recursive: true, force: true });
+      }
     }
   });
 

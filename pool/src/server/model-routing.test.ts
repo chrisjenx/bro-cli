@@ -9,7 +9,8 @@ import type { RateLimitSnapshot, RateLimitWindow } from "../accounts/types.ts";
 import { OPENAI_CREDS_FILENAME } from "../accounts/types.ts";
 import { AccountManager } from "../accounts/manager.ts";
 import { loadConfig } from "../config.ts";
-import { anthropicServePlan, chooseMappedService, serveWithCrossProviderFallback } from "./server.ts";
+import { DEFAULT_MODEL_TABLE, type ModelConfig } from "../models.ts";
+import { anthropicServePlan, chooseMappedService, routingCandidatesForPreview, serveWithCrossProviderFallback } from "./server.ts";
 import type { FailoverHooks } from "./failover.ts";
 import { RETRYABLE_TRANSPORT_HEADER } from "../upstream/shared.ts";
 
@@ -78,6 +79,57 @@ function win(key: string, overrides: Partial<RateLimitWindow> = {}): RateLimitWi
 function snapshot(windows: RateLimitWindow[]): RateLimitSnapshot {
   return { unifiedStatus: "allowed", windows, updatedAt: Date.now() };
 }
+
+describe("routingCandidatesForPreview", () => {
+  const config: ModelConfig = {
+    models: DEFAULT_MODEL_TABLE,
+    mappingEnabled: true,
+    mappings: [
+      { from: "opus", to: "gpt-5.6-sol" },
+      { from: "sonnet", to: "sonnet" },
+    ],
+  };
+
+  test("account-wide and actively mapped previews combine both providers", () => {
+    expect(routingCandidatesForPreview(config, null).map((candidate) => candidate.provider)).toEqual([
+      "anthropic",
+      "openai",
+    ]);
+    expect(routingCandidatesForPreview(config, "opus")).toEqual([
+      { provider: "anthropic", modelFamily: "opus" },
+      { provider: "openai", modelFamily: null },
+    ]);
+  });
+
+  test("an explicit OpenAI model previews only OpenAI without changing account-wide eligibility", () => {
+    expect(routingCandidatesForPreview(config, "gpt-5.6-sol")).toEqual([
+      { provider: "openai", modelFamily: null },
+    ]);
+    expect(routingCandidatesForPreview(config, null).map((candidate) => candidate.provider)).toEqual([
+      "anthropic",
+      "openai",
+    ]);
+  });
+
+  test("inert and disabled mappings remain Anthropic-only", () => {
+    expect(routingCandidatesForPreview(config, "sonnet")).toEqual([
+      { provider: "anthropic", modelFamily: "sonnet" },
+    ]);
+    expect(routingCandidatesForPreview({ ...config, mappingEnabled: false }, "opus")).toEqual([
+      { provider: "anthropic", modelFamily: "opus" },
+    ]);
+  });
+
+  test("the CLI backend previews only routes it can actually serve", () => {
+    expect(routingCandidatesForPreview(config, null, "cli")).toEqual([
+      { provider: "anthropic", modelFamily: null },
+    ]);
+    expect(routingCandidatesForPreview(config, "opus", "cli")).toEqual([
+      { provider: "anthropic", modelFamily: "opus" },
+    ]);
+    expect(routingCandidatesForPreview(config, "gpt-5.6-sol", "cli")).toEqual([]);
+  });
+});
 
 describe("chooseMappedService", () => {
   test("returns the provider pickProvider selects, anthropic listed first", () => {

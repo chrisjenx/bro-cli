@@ -9,7 +9,7 @@
  */
 
 import type { Config } from "../config.ts";
-import { AccountManager, isValidPriority, isValidWeight, type RoutingTuning } from "../accounts/manager.ts";
+import { AccountManager, isValidPriority, isValidWeight, type ProviderCandidate, type RoutingTuning } from "../accounts/manager.ts";
 import {
   loadModelConfig,
   resolveModel,
@@ -99,20 +99,32 @@ export function startServer(config: Config): void {
       }
       if (req.method === "GET" && path === "/api/status") {
         const provider = url.searchParams.get("provider") ?? "anthropic";
-        if (provider !== "anthropic" && provider !== "openai") return json({ error: { message: "Unknown preview provider" } }, 400);
+        if (provider !== "anthropic" && provider !== "openai") {
+          return json({ error: { message: "Unknown preview provider" } }, 400);
+        }
         const model = url.searchParams.get("model") || null;
         const family = modelFamilyOf(model);
-        const accounts = mgr.listAccounts();
         const now = Date.now();
-        const routing = mgr.routingSnapshot("anthropic", now);
+        const accounts = mgr.listAccounts(true, now);
+        const candidates = routingCandidatesForPreview(mappingState.config, model, config.backend);
+        // Preserve the original status fields for existing clients; the dashboard
+        // opts into the cross-provider view separately.
+        const routing = mgr.routingSnapshot("anthropic", now, null, false, accounts);
         const routingPreview = provider === "anthropic" && family === null
           ? routing
-          : mgr.routingSnapshot(provider, now, family);
+          : mgr.routingSnapshot(provider, now, family, false, accounts);
+        const routingCombined = mgr.routingSnapshotForProviders(candidates, now, accounts);
         return json({
           accounts,
           routing,
           routingPreview,
-          routingContext: { provider, model, modelFamily: family },
+          routingCombined,
+          routingContext: {
+            provider,
+            model,
+            modelFamily: family,
+            providers: candidates.map((candidate) => candidate.provider),
+          },
           tuning: mgr.getTuning(),
           mapping: {
             enabled: mappingState.config.mappingEnabled,
@@ -329,9 +341,41 @@ export function nonOauthOpenAIBackendError(route: ModelRoute, backend: Config["b
 export const CROSS_PROVIDER_RETRY_STATUSES: ReadonlySet<number> = new Set([429, 500, 503, 529]);
 
 /**
+ * Provider/family rows eligible for a read-only status preview. An empty model
+ * is account-wide, an explicit OpenAI route is OpenAI-only, and a Claude model
+ * includes OpenAI only when its family has an active mapping.
+ */
+export function routingCandidatesForPreview(
+  config: ModelConfig,
+  model: string | null,
+  backend: Config["backend"] = "oauth",
+): ProviderCandidate[] {
+  if (backend !== "oauth") {
+    if (model !== null && resolveModel(config.models, model).provider === "openai") return [];
+    return [{ provider: "anthropic", modelFamily: modelFamilyOf(model) }];
+  }
+
+  if (model === null) {
+    return [
+      { provider: "anthropic", modelFamily: null },
+      { provider: "openai", modelFamily: null },
+    ];
+  }
+
+  if (resolveModel(config.models, model).provider === "openai") {
+    return [{ provider: "openai", modelFamily: null }];
+  }
+
+  const modelFamily = modelFamilyOf(model);
+  const candidates: ProviderCandidate[] = [{ provider: "anthropic", modelFamily }];
+  if (mappingFor(config, model)) candidates.push({ provider: "openai", modelFamily: null });
+  return candidates;
+}
+
+/**
  * Which provider serves a mapped Claude-family request first. Anthropic is
- * listed first so ties keep Claude subscriptions primary. Codex accounts have
- * no per-family windows, so the openai candidate uses a null family.
+ * listed first so exact strategy ties keep Claude subscriptions primary.
+ * Codex accounts have no per-family windows, so OpenAI uses a null family.
  */
 export function chooseMappedService(
   mgr: AccountManager,

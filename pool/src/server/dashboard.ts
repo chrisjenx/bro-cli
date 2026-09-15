@@ -206,18 +206,12 @@ export function dashboardHtml(): string {
   .tier-meta { font-size: 12px; color: var(--muted); font-family: var(--sans); }
   .tier-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 18px; }
   .badge.next { background: var(--accent-soft); color: var(--accent); border-color: transparent; font-weight: 600; }
-  /* Live "next pick" panel: standalone card, always visible (not settings). */
-  .routing-panel { display: none; background: var(--surface); border: 1px solid var(--border);
-    border-left: 3px solid var(--accent); border-radius: 12px; padding: 14px 18px; margin-bottom: 20px;
-    font-size: 13.5px; color: var(--text); box-shadow: var(--shadow);
-    gap: 28px; align-items: flex-start; flex-wrap: wrap; }
-  .routing-panel .muted { color: var(--muted); }
-  .routing-panel .pick b { font-family: var(--serif); font-size: 16px; font-weight: 600; }
-  .routing-panel .summary { font-size: 12px; margin-top: 2px; }
-  .routing-panel .why { list-style: none; margin: 0; padding: 0; display: grid; gap: 3px; }
-  .routing-panel .why .fact { display: grid; grid-template-columns: 110px 1fr; gap: 10px; font-size: 12.5px; }
-  .routing-panel .why .fk { color: var(--muted); }
-  .routing-panel .why .fact.decisive .fv { color: var(--accent); font-weight: 600; }
+  .routing-note { color: var(--text); }
+  .routing-why { list-style: none; margin: 7px 0 0; padding: 0; display: grid; gap: 4px; }
+  .routing-factor { display: grid; grid-template-columns: 100px 1fr; gap: 8px; }
+  .routing-factor .factor-label { color: var(--muted); }
+  .routing-factor.decisive .factor-detail { color: var(--accent); font-weight: 600; }
+  .routing-wait { color: var(--warn); margin-top: 5px; }
 
   /* Settings group: one collapsible card wrapping the config disclosures
      (Model mapping, Routing tuning). Collapsed by default; open state persists
@@ -303,10 +297,8 @@ export function dashboardHtml(): string {
 </header>
 <main>
   <div class="hint">
-    <label>Preview provider <select id="routing-provider" onchange="refresh()"><option value="anthropic">Anthropic</option><option value="openai">OpenAI / Codex</option></select></label>
-    <label>Model family <select id="routing-model" onchange="refresh()"><option value="">Account-wide only</option>${MODEL_FAMILIES.map((family) => `<option value="${family}">${family}</option>`).join("")}</select></label>
+    <label>Routing model family <select id="routing-model" onchange="refresh()"><option value="">Account-wide</option>${MODEL_FAMILIES.map((family) => `<option value="${family}">${family}</option>`).join("")}</select></label>
   </div>
-  <div class="routing-panel" id="routing-panel"></div>
   <details class="settings-group" id="settings-group">
     <summary>Settings<span class="caret">▶</span></summary>
     <div class="settings-body">
@@ -437,13 +429,13 @@ function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<
 function dotState(a) { return a.available ? "ok" : (a.authenticated ? "warn" : "err"); }
 function priorityOf(a) { return a.priority == null ? 100 : a.priority; }
 function weightOf(a) { return a.weight == null ? 1 : a.weight; }
-function groupAccountsByPriority(accounts) {
+function groupAccountsByPriority(accounts, eligibleProviders) {
   const byPriority = new Map();
   accounts.forEach((a) => {
     const priority = priorityOf(a);
     const group = byPriority.get(priority) || { priority, accounts: [], available: 0 };
     group.accounts.push(a);
-    if (a.available) group.available += 1;
+    if (a.available && (!eligibleProviders || eligibleProviders.has(a.provider || "anthropic"))) group.available += 1;
     byPriority.set(priority, group);
   });
   return Array.from(byPriority.values()).sort((a, b) => a.priority - b.priority);
@@ -481,25 +473,6 @@ function rollOver(w) {
   }
   return { ...w, utilization: 0, reset };
 }
-function routingPanelHtml(routing) {
-  if (!routing) return "";
-  const busy = (routing.busy || []).map(function (c) {
-    return '<div class="summary muted">Busy: ' + esc(c.account) + ' · ' + esc(String(c.inFlight)) + ' / ' + esc(String(c.limit)) + ' soft limit</div>';
-  }).join("");
-  if (!routing.nextPick) return busy;
-  const r = routing.nextPick.reason || { summary: "", factors: [] };
-  const items = (r.factors || []).map((f) =>
-    '<li class="fact' + (f.decisive ? " decisive" : "") + '">'
-      + '<span class="fk">' + esc(f.label) + "</span>"
-      + '<span class="fv">' + esc(f.detail) + (f.decisive ? " ◀" : "") + "</span></li>"
-  ).join("");
-  return busy + '<div class="pick">Next new session &rarr; <b>' + esc(routing.nextPick.account) + "</b>"
-    + '<div class="summary muted" title="' + esc(r.summary) + '">' + esc(r.summary) + "</div></div>"
-    + '<ul class="why">' + items + "</ul>"
-    + ((routing.candidates || []).length ? '<div style="overflow-x:auto"><table><thead><tr><th>Account</th><th>Manual weight</th><th>Expiry share</th><th>Pinned sessions</th><th>In-flight</th><th>5h headroom</th><th>5h factor</th><th>Viability</th><th>Score</th></tr></thead><tbody>'
-      + routing.candidates.map(function (c) { return "<tr><td>" + esc(c.account) + "</td><td>" + esc(String(c.weight)) + "</td><td>" + esc(String(c.expiryShare)) + "</td><td>" + esc(String(c.activeSessions)) + "</td><td>" + esc(String(c.inFlight ?? 0)) + "</td><td>" + Math.round(c.headroom * 100) + "%</td><td>" + Number(c.fiveHourFactor).toFixed(2) + "</td><td>" + (c.viable ? "Viable" : "Below 5h gate") + "</td><td>" + Number(c.score).toFixed(2) + "</td></tr>"; }).join("") + "</tbody></table></div>" : "");
-}
-
 // Cross-subscription model mapping: each Claude family (fable/opus/sonnet/haiku)
 // can be routed to a Codex/OpenAI-provider target model, with a per-source-tier
 // reasoning-effort override translated into the target's own effort values.
@@ -634,9 +607,52 @@ function windowBar(w0) {
     + '</span></div><div class="bar"><span style="width:' + p + '%"></span></div></div>';
 }
 
+function routingCandidatesByAccount(routing) {
+  return new Map(((routing && routing.candidates) || []).map(function (candidate) {
+    return [candidate.account, candidate];
+  }));
+}
+
+function routingBusyByAccount(routing) {
+  return new Map(((routing && routing.busy) || []).map(function (busy) {
+    return [busy.account, busy];
+  }));
+}
+
+function routingReasonHtml(reason, busy) {
+  if (!reason) return "";
+  const factors = Array.isArray(reason.factors) ? reason.factors : [];
+  const why = factors.length
+    ? '<ul class="routing-why">' + factors.map(function (factor) {
+        return '<li class="routing-factor' + (factor.decisive ? " decisive" : "") + '">'
+          + '<span class="factor-label">' + esc(factor.label) + '</span>'
+          + '<span class="factor-detail">' + esc(factor.detail)
+          + (factor.decisive ? ' <span aria-label="decisive">◀</span>' : "") + '</span></li>';
+      }).join("") + "</ul>"
+    : "";
+  const waiting = busy
+    ? '<div class="routing-wait">' + fmtInt(busy.inFlight) + " / " + fmtInt(busy.limit)
+      + " soft limit · requests wait for a slot</div>"
+    : "";
+  return '<div>Next new session · ' + esc(reason.summary || "") + "</div>" + waiting + why;
+}
+
+function routingCandidateValue(candidate, key) {
+  if (!candidate) return "–";
+  if (key === "activeSessions" || key === "inFlight") return fmtInt(candidate[key]);
+  if (key === "headroom") return Math.round(candidate.headroom * 100) + "%";
+  if (key === "viable") return candidate.viable ? "Viable" : "Below gate";
+  return Number(candidate[key]).toFixed(2);
+}
+
+function routingCell(value, className) {
+  return '<td' + (className ? ' class="' + className + '"' : "") + '>'
+    + (value == null ? "–" : esc(value)) + "</td>";
+}
+
 // Compact glance row: status dot, name (+next tag), plan, account-wide 5h/7d
-// mini-bars, priority, recency. Model-scoped windows stay on the detail card.
-function summaryRowHtml(a, isNext) {
+// mini-bars, priority, routing factors, recency. Model-scoped windows stay on the detail card.
+function summaryRowHtml(a, candidate, isNext, busy) {
   const dot = dotState(a);
   const rl = a.usage.rateLimitStatus;
   const wins = (rl && Array.isArray(rl.windows) ? rl.windows : [])
@@ -657,18 +673,33 @@ function summaryRowHtml(a, isNext) {
     + '<td><span class="chip plan">' + esc(a.subscriptionType || "unknown") + "</span></td>"
     + winCell("5h") + winCell("7d")
     + '<td class="num">' + pr + "</td>"
+    + routingCell(candidate ? routingCandidateValue(candidate, "weight") : null, "num")
+    + routingCell(candidate ? routingCandidateValue(candidate, "expiryShare") : null, "num")
+    + routingCell(candidate ? routingCandidateValue(candidate, "activeSessions") : null, "num")
+    + routingCell(busy ? fmtInt(busy.inFlight) + " / " + fmtInt(busy.limit) : (candidate ? routingCandidateValue(candidate, "inFlight") : null), "num")
+    + routingCell(candidate ? routingCandidateValue(candidate, "headroom") : null, "num")
+    + routingCell(candidate ? routingCandidateValue(candidate, "fiveHourFactor") : null, "num")
+    + routingCell(candidate ? routingCandidateValue(candidate, "viable") : null, candidate && !candidate.viable ? "muted" : "")
+    + routingCell(candidate ? routingCandidateValue(candidate, "score") : null, "num")
     + '<td class="muted">' + ago(a.usage.lastUsedAt) + "</td></tr>";
 }
 
-function summaryTableHtml(accounts, nextAcct) {
+function summaryTableHtml(accounts, routing) {
   if (!accounts.length) return "";
-  const rows = accounts.map((a) => summaryRowHtml(a, a.name === nextAcct)).join("");
+  const byAccount = routingCandidatesByAccount(routing);
+  const busyByAccount = routingBusyByAccount(routing);
+  const nextAcct = routing && routing.nextPick && routing.nextPick.account;
+  const rows = accounts.map(function (a) {
+    return summaryRowHtml(a, byAccount.get(a.name), a.name === nextAcct, busyByAccount.get(a.name));
+  }).join("");
   return "<table><thead><tr><th></th><th>Account</th><th>Plan</th><th>5h window</th>"
-    + "<th>7d window</th><th>Priority</th><th>Last used</th></tr></thead><tbody>"
+    + "<th>7d window</th><th>Priority</th><th>Manual weight</th><th>Expiry share</th>"
+    + "<th>Pinned sessions</th><th>In-flight</th><th>5h headroom</th><th>5h factor</th>"
+    + "<th>Viability</th><th>Weighted score</th><th>Last used</th></tr></thead><tbody>"
     + rows + "</tbody></table>";
 }
 
-function card(a, isNext) {
+function card(a, candidate, isNext, nextReason, busy) {
   const dot = dotState(a);
   const state = a.available ? "Ready" : (a.authenticated ? "Sidelined" : "Logged out");
   const u = a.usage;
@@ -699,11 +730,11 @@ function card(a, isNext) {
     ? '<span class="k">Cooldown</span><span class="v">' + timeUntil(u.rateLimitedUntil) + "</span>" : "";
   const usageCheckRow = u.lastUsageCheckAt
     ? '<span class="k">Usage checked</span><span class="v">' + ago(u.lastUsageCheckAt) + "</span>" : "";
-  return \`<div class="card \${a.available ? "" : "down"}\${isNext ? " next" : ""}" id="card-\${esc(a.name)}">
+  return \`<div class="card \${a.available ? "" : "down"}\${isNext ? " next" : ""}" id="card-\${esc(a.name)}" data-account-card="\${esc(a.name)}">
     <div class="card-top">
       <span class="status"><span class="dot \${dot}"></span><span class="acct-name">\${esc(a.name)}</span></span>
       <span class="badge">\${esc(a.provider || "anthropic")}</span>
-      \${isNext ? '<span class="badge next">next</span>' : ""}
+      <span class="badge next" data-next-badge\${isNext ? "" : ' style="display:none"'}>next</span>
       <span class="chip plan">\${esc(a.subscriptionType || "unknown")}</span>
     </div>
     <div class="dl">
@@ -713,12 +744,19 @@ function card(a, isNext) {
       <span class="k">Token</span><span class="v">\${a.tokenExpired ? "auto-refreshing" : "valid · " + timeUntil(a.tokenExpiresAt)}</span>
       <span class="k">Cost (window)</span><span class="v">\${fmtUsd(u.windowCostUsd)}</span>
       <span class="k">Requests</span><span class="v">\${fmtInt(u.totalRequests)} · \${ago(u.lastUsedAt)}</span>
-      <span class="k">Sessions</span><span class="v">\${fmtInt(a.activeSessions ?? 0)} active</span>
-      <span class="k">In-flight</span><span class="v">\${fmtInt(a.inFlight ?? 0)}</span>
+      <span class="k">Sessions</span><span class="v" data-routing-value="activeSessions" data-account-value="\${fmtInt(a.activeSessions)} active">\${candidate ? routingCandidateValue(candidate, "activeSessions") : fmtInt(a.activeSessions)} active</span>
+      <span class="k">In-flight</span><span class="v" data-routing-value="inFlight" data-account-value="\${fmtInt(a.inFlight)}">\${busy ? fmtInt(busy.inFlight) + " / " + fmtInt(busy.limit) + " soft limit" : (candidate ? routingCandidateValue(candidate, "inFlight") : fmtInt(a.inFlight))}</span>
+      <span class="k">Manual weight</span><span class="v" data-routing-value="weight">\${routingCandidateValue(candidate, "weight")}</span>
+      <span class="k">Expiry share</span><span class="v" data-routing-value="expiryShare">\${routingCandidateValue(candidate, "expiryShare")}</span>
+      <span class="k">5h headroom</span><span class="v" data-routing-value="headroom">\${routingCandidateValue(candidate, "headroom")}</span>
+      <span class="k">5h factor</span><span class="v" data-routing-value="fiveHourFactor">\${routingCandidateValue(candidate, "fiveHourFactor")}</span>
+      <span class="k">Viability</span><span class="v" data-routing-value="viable">\${routingCandidateValue(candidate, "viable")}</span>
+      <span class="k">Weighted score</span><span class="v" data-routing-value="score">\${routingCandidateValue(candidate, "score")}</span>
       \${limitStatusRow}
       \${cooldownRow}
       \${usageCheckRow}
     </div>
+    <div class="note routing-note" data-routing-note\${isNext && nextReason ? "" : ' style="display:none"'}>\${isNext ? routingReasonHtml(nextReason, busy) : ""}</div>
     <div class="bars">\${barsHtml}</div>
     \${errNote}\${usageErrNote}
     <div class="tier-edit">Priority
@@ -729,6 +767,46 @@ function card(a, isNext) {
       <button data-set-weight="\${esc(a.name)}">Set</button>
     </div>
   </div>\`;
+}
+
+// Polling must keep routing state live even while the card editors are dirty or
+// focused. Update only routing-owned nodes so unsaved input values and focus are
+// never replaced by a grid re-render.
+function updateCardRouting(grid, routing) {
+  if (!grid.querySelectorAll) return;
+  const candidates = routingCandidatesByAccount(routing);
+  const busyAccounts = routingBusyByAccount(routing);
+  const nextAcct = routing && routing.nextPick && routing.nextPick.account;
+  const nextReason = routing && routing.nextPick && routing.nextPick.reason;
+  grid.querySelectorAll("[data-account-card]").forEach(function (cardEl) {
+    const account = cardEl.getAttribute("data-account-card");
+    const candidate = candidates.get(account);
+    const busy = busyAccounts.get(account);
+    const isNext = account === nextAcct;
+    cardEl.classList.toggle("next", isNext);
+    const badge = cardEl.querySelector("[data-next-badge]");
+    if (badge) badge.style.display = isNext ? "" : "none";
+    const note = cardEl.querySelector("[data-routing-note]");
+    if (note) {
+      note.style.display = isNext && nextReason ? "" : "none";
+      note.innerHTML = isNext ? routingReasonHtml(nextReason, busy) : "";
+    }
+    cardEl.querySelectorAll("[data-routing-value]").forEach(function (valueEl) {
+      const key = valueEl.getAttribute("data-routing-value");
+      if (key === "activeSessions") {
+        valueEl.textContent = candidate
+          ? routingCandidateValue(candidate, key) + " active"
+          : (valueEl.getAttribute("data-account-value") || "0 active");
+      } else if (key === "inFlight") {
+        if (busy) valueEl.textContent = fmtInt(busy.inFlight) + " / " + fmtInt(busy.limit) + " soft limit";
+        else valueEl.textContent = candidate
+          ? routingCandidateValue(candidate, key)
+          : (valueEl.getAttribute("data-account-value") || "0");
+      } else {
+        valueEl.textContent = routingCandidateValue(candidate, key);
+      }
+    });
+  });
 }
 
 // Fill the real origin into the walkthrough's curl example, wire copy buttons.
@@ -783,9 +861,8 @@ var refreshSequence = 0;
 async function refresh() {
   const sequence = ++refreshSequence;
   try {
-    const provider = document.getElementById("routing-provider")?.value || "anthropic";
     const model = document.getElementById("routing-model")?.value || "";
-    const r = await fetch("/api/status?provider=" + encodeURIComponent(provider) + "&model=" + encodeURIComponent(model));
+    const r = await fetch("/api/status?model=" + encodeURIComponent(model));
     const d = await r.json();
     if (sequence !== refreshSequence) return;
 
@@ -793,7 +870,9 @@ async function refresh() {
     const onboard = document.getElementById("onboard");
     const banner = document.getElementById("banner");
     const accounts = d.accounts || [];
-    const avail = accounts.filter((a) => a.available).length;
+    const eligibleProviders = new Set((d.routingContext && d.routingContext.providers) || ["anthropic"]);
+    const eligibleAccounts = accounts.filter((a) => eligibleProviders.has(a.provider || "anthropic"));
+    const avail = eligibleAccounts.filter((a) => a.available).length;
     let accountCardsRendered = false;
 
     if (accounts.length === 0) {
@@ -803,13 +882,16 @@ async function refresh() {
       document.getElementById("summary").style.display = "none";
     } else {
       onboard.style.display = "none";
-      const routing = d.routingPreview || d.routing || { tiers: [], nextPick: null, activeTier: null };
+      const routing = d.routingCombined || d.routingPreview || d.routing || { tiers: [], nextPick: null, activeTier: null, candidates: [], busy: [] };
       const nextAcct = routing.nextPick && routing.nextPick.account;
-      const groups = groupAccountsByPriority(accounts);
+      const nextReason = routing.nextPick && routing.nextPick.reason;
+      const candidatesByAccount = routingCandidatesByAccount(routing);
+      const busyByAccount = routingBusyByAccount(routing);
+      const groups = groupAccountsByPriority(accounts, eligibleProviders);
       if (!accountSettingsDirty && !grid.contains(document.activeElement)) {
         grid.innerHTML = groups.map((t) => {
           const cardsHtml = t.accounts
-            .map((a) => card(a, a.name === nextAcct))
+            .map((a) => card(a, candidatesByAccount.get(a.name), a.name === nextAcct, a.name === nextAcct ? nextReason : null, busyByAccount.get(a.name)))
             .join("");
           const head = '<div class="tier-head' + (t.available === 0 ? " dim" : "") + '">' + esc(tierLabel(t.priority))
             + ' <span class="tier-meta">' + t.available + " available</span></div>";
@@ -817,20 +899,12 @@ async function refresh() {
         }).join("");
         accountCardsRendered = true;
       }
+      updateCardRouting(grid, routing);
 
       const summary = document.getElementById("summary");
       const ordered = groups.flatMap((t) => t.accounts);
-      summary.innerHTML = summaryTableHtml(ordered, nextAcct);
+      summary.innerHTML = summaryTableHtml(ordered, routing);
       summary.style.display = ordered.length ? "block" : "none";
-
-      const panel = document.getElementById("routing-panel");
-      const panelHtml = routingPanelHtml(routing);
-      if (panelHtml) {
-        panel.innerHTML = panelHtml;
-        panel.style.display = "flex";
-      } else {
-        panel.style.display = "none";
-      }
 
       // Settings forms are user-editable; renderSettings only rewrites them when
       // safe (not mid-edit, and the data actually changed), so a poll tick can
@@ -847,10 +921,12 @@ async function refresh() {
       document.getElementById("settings-group").style.display = (mapVisible || tuneVisible) ? "block" : "none";
 
       if (avail === 0) {
-        const anyAuthed = accounts.some((a) => a.authenticated);
-        banner.innerHTML = anyAuthed
-          ? "<b>No accounts are available right now.</b> Every account is rate-limited or its token needs attention &mdash; requests will 503 until one frees up. See the cards below."
-          : "<b>No accounts are logged in.</b> Authenticate one to start serving requests: <code>bun run src/index.ts accounts login &lt;name&gt;</code>";
+        const anyAuthed = eligibleAccounts.some((a) => a.authenticated);
+        banner.innerHTML = eligibleProviders.size === 0
+          ? "<b>This model cannot run on the configured backend.</b> Choose a Claude family, or use the direct OAuth backend for OpenAI models."
+          : anyAuthed
+            ? "<b>No accounts are available right now.</b> Every eligible account is rate-limited or its token needs attention &mdash; requests will 503 until one frees up. See the cards below."
+            : "<b>No eligible accounts are logged in.</b> Authenticate one to start serving requests: <code>bun run src/index.ts accounts login &lt;name&gt;</code>";
         banner.style.display = "block";
       } else {
         banner.style.display = "none";

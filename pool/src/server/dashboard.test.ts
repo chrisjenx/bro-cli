@@ -1,8 +1,9 @@
 import { test, expect, describe } from "bun:test";
 import { dashboardHtml } from "./dashboard.ts";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { OPENAI_CREDS_FILENAME } from "../accounts/types.ts";
 
 /**
  * The dashboard's per-account card is rendered client-side by a `card(a)`
@@ -33,6 +34,52 @@ function loadCard(): (account: unknown) => string {
     documentElement: noopEl,
   };
   return factory(doc, { getItem: () => null, setItem() {} }, () => ({ matches: false }));
+}
+
+async function startStatusServer(
+  dir: string,
+  configOverrides: Record<string, unknown> = {},
+): Promise<{ origin: string; stop: () => Promise<void> }> {
+  const config = { host: "127.0.0.1", port: 0, usageRefreshEnabled: false, ...configOverrides };
+  const proc = Bun.spawn([process.execPath, "-e", `
+    import { loadConfig } from "../config.ts";
+    import { startServer } from "./server.ts";
+    startServer(loadConfig(${JSON.stringify(config)}));
+  `], {
+    cwd: import.meta.dir,
+    env: { ...process.env, CLAUDE_POOL_DIR: dir },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const ready = (async () => {
+      let output = "";
+      for await (const chunk of proc.stdout) {
+        output += new TextDecoder().decode(chunk);
+        const origin = output.match(/listening on (http:\/\/127\.0\.0\.1:\d+)/)?.[1];
+        if (origin) return origin;
+      }
+      throw new Error("Pool exited before listening: " + await new Response(proc.stderr).text());
+    })();
+    const origin = await Promise.race([
+      ready,
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("Pool startup timed out")), 5000); }),
+    ]);
+    return {
+      origin,
+      stop: async () => {
+        proc.kill();
+        await proc.exited;
+      },
+    };
+  } catch (error) {
+    proc.kill();
+    await proc.exited;
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function baseAccount(overrides: Record<string, unknown> = {}) {
@@ -68,7 +115,7 @@ function baseAccount(overrides: Record<string, unknown> = {}) {
 
 test("card() shows live in-flight count separately from pinned sessions", () => {
   const html = loadCard()(baseAccount({ inFlight: 3, activeSessions: 7 }));
-  expect(html).toContain('In-flight</span><span class="v">3');
+  expect(html).toMatch(/In-flight<\/span><span class="v" data-routing-value="inFlight"[^>]*>3/);
   expect(html).toContain('7 active');
 });
 
@@ -158,10 +205,13 @@ test("card() shows the last usage-check time when present, and omits the row whe
 });
 
 function loadFns(): {
-  card: (a: unknown, isNext?: boolean) => string;
+  card: (a: unknown, candidate?: unknown, isNext?: boolean, nextReason?: unknown, busy?: unknown) => string;
   tierLabel: (p: number) => string;
-  summaryTableHtml: (accounts: unknown[], nextAcct: string | null) => string;
-  groupAccountsByPriority: (accounts: any[]) => { priority: number; accounts: any[]; available: number }[];
+  summaryTableHtml: (accounts: unknown[], routing: unknown) => string;
+  routingCandidatesByAccount: (routing: unknown) => Map<string, unknown>;
+  routingReasonHtml: (reason: unknown, busy?: unknown) => string;
+  updateCardRouting: (grid: unknown, routing: unknown) => void;
+  groupAccountsByPriority: (accounts: any[], eligibleProviders?: Set<string>) => { priority: number; accounts: any[]; available: number }[];
 } {
   const html = dashboardHtml();
   const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
@@ -173,7 +223,7 @@ function loadFns(): {
     "document",
     "localStorage",
     "matchMedia",
-    `${stubbed}\nreturn { card, tierLabel, summaryTableHtml, groupAccountsByPriority };`,
+    `${stubbed}\nreturn { card, tierLabel, summaryTableHtml, routingCandidatesByAccount, routingReasonHtml, updateCardRouting, groupAccountsByPriority };`,
   );
   const noopEl = { addEventListener() {}, setAttribute() {}, getAttribute() { return null; }, textContent: "", style: {} };
   const doc = {
@@ -208,62 +258,20 @@ test("mixed providers are grouped in numeric priority order", () => {
   ]);
 });
 
+test("priority availability counts only providers eligible for the selected model/backend", () => {
+  const { groupAccountsByPriority } = loadFns();
+  const groups = groupAccountsByPriority([
+    baseAccount({ name: "claude", provider: "anthropic", priority: 100 }),
+    baseAccount({ name: "codex", provider: "openai", priority: 100 }),
+  ], new Set(["anthropic"]));
+  expect(groups[0]?.available).toBe(1);
+});
+
 test("card() marks the next-pick account and shows its priority", () => {
   const { card } = loadFns();
-  const html = card({ ...baseAccount(), priority: 1 }, true);
+  const html = card({ ...baseAccount(), priority: 1 }, undefined, true);
   expect(html).toContain("next");
   expect(html.toLowerCase()).toContain("priority");
-});
-
-function loadRoutingPanel(): (routing: unknown) => string {
-  const html = dashboardHtml();
-  const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
-  if (!script) throw new Error("dashboard <script> block not found");
-  const stubbed = script
-    .replace(/^refresh\(\);$/m, "")
-    .replace(/^setInterval\(refresh, 4000\);$/m, "");
-  const noopEl = { addEventListener() {}, setAttribute() {}, getAttribute() { return null; }, textContent: "", style: {} };
-  const doc = { getElementById: () => noopEl, querySelectorAll: () => [], documentElement: noopEl };
-  const factory = new Function("document", "localStorage", "matchMedia", `${stubbed}\nreturn routingPanelHtml;`);
-  return factory(doc, { getItem: () => null, setItem() {} }, () => ({ matches: false }));
-}
-
-test("routingPanelHtml lists every decision factor and marks the decisive one", () => {
-  const routingPanelHtml = loadRoutingPanel();
-  const html = routingPanelHtml({
-    nextPick: {
-      account: "burn-me",
-      reason: {
-        summary: "tier 100 · 7d resets in ~2.6d · 98% 5h headroom",
-        factors: [
-          { label: "Priority tier", detail: "100 active (2 accounts) · no lower tiers in reserve", decisive: false },
-          { label: "5h gate", detail: "2/2 eligible (≥10% headroom) · chosen 98% headroom", decisive: false },
-          { label: "7d expiry", detail: "resets in ~2.6d · soonest eligible (next: keep ~5.3d)", decisive: true },
-          { label: "Tie-break", detail: "not needed", decisive: false },
-        ],
-      },
-    },
-  });
-  expect(html).toContain("burn-me");
-  expect(html).toContain("Priority tier");
-  expect(html).toContain("7d expiry");
-  expect(html).toContain("◀"); // decisive marker
-  expect(html).toContain("98% 5h headroom"); // summary present
-});
-
-test("routingPanelHtml is empty when there is no next pick", () => {
-  const routingPanelHtml = loadRoutingPanel();
-  expect(routingPanelHtml({ nextPick: null })).toBe("");
-  expect(routingPanelHtml(null)).toBe("");
-});
-
-test("routingPanelHtml wraps the pick and factors as flex siblings", () => {
-  const routingPanelHtml = loadRoutingPanel();
-  const html = routingPanelHtml({
-    nextPick: { account: "a", reason: { summary: "s", factors: [{ label: "Tier", detail: "100", decisive: true }] } },
-  });
-  expect(html).toContain('<div class="pick">');
-  expect(html).toContain('<ul class="why">');
 });
 
 test("outer #grid container is not itself a CSS grid (tier sections span full width)", () => {
@@ -278,16 +286,16 @@ test("outer #grid container is not itself a CSS grid (tier sections span full wi
 
 test("card() gives the next pick an accent class and every card a scroll-target id", () => {
   const { card } = loadFns();
-  const next = card({ ...baseAccount(), name: "pick-me" }, true);
+  const next = card({ ...baseAccount(), name: "pick-me" }, undefined, true);
   expect(next).toContain('id="card-pick-me"');
   expect(next).toMatch(/class="card[^"]*\bnext\b/);
-  const other = card(baseAccount(), false);
+  const other = card(baseAccount(), undefined, false);
   expect(other).not.toMatch(/class="card[^"]*\bnext\b/);
 });
 
 test("card() merges request count and recency into one row", () => {
   const { card } = loadFns();
-  const html = card(baseAccount(), false);
+  const html = card(baseAccount(), undefined, false);
   expect(html).toContain("Requests</span>");
   expect(html).toContain("10 · ");           // totalRequests · ago(lastUsedAt)
   expect(html).not.toContain("Total requests");
@@ -311,7 +319,11 @@ test("summaryTableHtml renders one row per account with dot, next tag, windows, 
     },
   });
   const b = baseAccount({ name: "beta", priority: 50, usage: { lastUsedAt: null } });
-  const html = summaryTableHtml([a, b], "alpha");
+  const routing = {
+    nextPick: { account: "alpha", reason: { summary: "score 10.00", factors: [] } },
+    candidates: [],
+  };
+  const html = summaryTableHtml([a, b], routing);
   expect(html).toContain("alpha");
   expect(html).toContain("beta");
   expect((html.match(/<tr class="acct"/g) || []).length).toBe(2);
@@ -326,21 +338,141 @@ test("summaryTableHtml renders one row per account with dot, next tag, windows, 
   expect(html).toContain("never");
 });
 
+test("summaryTableHtml merges routing factors for both providers", () => {
+  const { summaryTableHtml } = loadFns();
+  const accounts = [
+    baseAccount({ name: "claude", provider: "anthropic" }),
+    baseAccount({ name: "codex", provider: "openai", weight: 2 }),
+  ];
+  const routing = {
+    nextPick: { account: "codex", reason: { summary: "tier 100 · score 10.00", factors: [] } },
+    candidates: [
+      { account: "claude", weight: 0.2, expiryShare: 5, activeSessions: 0, inFlight: 0, headroom: 1, fiveHourFactor: 1, viable: true, score: 1 },
+      { account: "codex", weight: 2, expiryShare: 5, activeSessions: 0, inFlight: 0, headroom: 1, fiveHourFactor: 1, viable: true, score: 10 },
+    ],
+  };
+
+  const html = summaryTableHtml(accounts, routing);
+  expect(html).toContain("Manual weight");
+  expect(html).toContain("Expiry share");
+  expect(html).toContain("Pinned sessions");
+  expect(html).toContain("5h headroom");
+  expect(html).toContain("5h factor");
+  expect(html).toContain("Viability");
+  expect(html).toContain("Weighted score");
+  expect(html).toContain("10.00");
+  const codexRow = html.slice(html.indexOf("codex"));
+  expect(codexRow).toContain("next");
+});
+
+test("summaryTableHtml uses dashes for accounts outside the preview candidate set", () => {
+  const { summaryTableHtml } = loadFns();
+  const html = summaryTableHtml(
+    [baseAccount({ name: "reserve" })],
+    { nextPick: null, candidates: [] },
+  );
+  expect(html).toContain("reserve");
+  expect(html).toContain("–");
+});
+
+test("card() renders server-computed routing factors and the winning summary", () => {
+  const { card } = loadFns();
+  const candidate = {
+    account: "acct",
+    weight: 2,
+    expiryShare: 5,
+    activeSessions: 2,
+    inFlight: 1,
+    headroom: 0.75,
+    fiveHourFactor: 1,
+    viable: true,
+    score: 10,
+  };
+  const html = card(
+    baseAccount({ weight: 2, activeSessions: 2, inFlight: 1 }),
+    candidate,
+    true,
+    {
+      summary: "tier 100 · score 10.00",
+      factors: [
+        { label: "5h gate", detail: "75% headroom", decisive: false },
+        { label: "Tie-break", detail: "fewer requests than runner-up", decisive: true },
+      ],
+    },
+  );
+  for (const text of ["Manual weight", "Expiry share", "5h headroom", "5h factor", "Viability", "Weighted score", "10.00"]) {
+    expect(html).toContain(text);
+  }
+  expect(html).toContain("Next new session");
+  expect(html).toContain("tier 100 · score 10.00");
+  expect(html).toContain("5h gate");
+  expect(html).toContain("Tie-break");
+  expect(html).toContain("fewer requests than runner-up");
+  expect(html).toContain('aria-label="decisive">◀');
+});
+
+test("busy next pick shows its soft limit and queueing behavior", () => {
+  const { card, summaryTableHtml } = loadFns();
+  const account = baseAccount({ name: "busy", inFlight: 4 });
+  const candidate = {
+    account: "busy", weight: 1, expiryShare: 5, activeSessions: 0, inFlight: 4,
+    headroom: 1, fiveHourFactor: 1, viable: true, score: 5,
+  };
+  const routing = {
+    nextPick: { account: "busy", reason: { summary: "best effort", factors: [] } },
+    candidates: [candidate],
+    busy: [{ account: "busy", inFlight: 4, limit: 4 }],
+  };
+
+  const detail = card(account, candidate, true, routing.nextPick.reason, routing.busy[0]);
+  expect(detail).toContain("4 / 4 soft limit");
+  expect(detail).toContain("requests wait for a slot");
+  expect(summaryTableHtml([account], routing)).toContain("4 / 4");
+});
+
+test("routing-only card updates restore account values when an account leaves the candidate set", () => {
+  const { updateCardRouting } = loadFns();
+  const value = (key: string, fallback: string, textContent: string) => ({
+    textContent,
+    getAttribute(name: string) {
+      if (name === "data-routing-value") return key;
+      if (name === "data-account-value") return fallback;
+      return null;
+    },
+  });
+  const sessions = value("activeSessions", "3 active", "8 active");
+  const inFlight = value("inFlight", "2", "4 / 4 soft limit");
+  const cardEl = {
+    getAttribute: (name: string) => name === "data-account-card" ? "acct" : null,
+    classList: { toggle() {} },
+    querySelector: () => null,
+    querySelectorAll: () => [sessions, inFlight],
+  };
+  const grid = {
+    querySelectorAll: () => [cardEl],
+  };
+
+  updateCardRouting(grid, { nextPick: null, candidates: [], busy: [] });
+
+  expect(sessions.textContent).toBe("3 active");
+  expect(inFlight.textContent).toBe("2");
+});
+
 test("summaryTableHtml rows are keyboard-focusable buttons (a11y)", () => {
   const { summaryTableHtml } = loadFns();
-  const html = summaryTableHtml([baseAccount({ name: "alpha" })], null);
+  const html = summaryTableHtml([baseAccount({ name: "alpha" })], { nextPick: null, candidates: [] });
   expect(html).toContain('role="button"');
   expect(html).toContain('tabindex="0"');
 });
 
 test("summaryTableHtml is empty for an empty pool", () => {
   const { summaryTableHtml } = loadFns();
-  expect(summaryTableHtml([], null)).toBe("");
+  expect(summaryTableHtml([], { nextPick: null, candidates: [] })).toBe("");
 });
 
 test("card() shows active sessions and the manual weight", () => {
   const { card } = loadFns();
-  const html = card({ ...baseAccount(), priority: 100, weight: 2.5, activeSessions: 3 }, false);
+  const html = card({ ...baseAccount(), priority: 100, weight: 2.5, activeSessions: 3 }, undefined, false);
   expect(html).toContain("Sessions</span>");
   expect(html).toContain("3 active");
   expect(html).toContain('data-set-weight="acct"');
@@ -349,7 +481,7 @@ test("card() shows active sessions and the manual weight", () => {
 
 test("card() weight editor defaults to 1 when weight is missing (older /api/status)", () => {
   const { card } = loadFns();
-  const html = card({ ...baseAccount(), priority: 100 }, false);
+  const html = card({ ...baseAccount(), priority: 100 }, undefined, false);
   expect(html).toContain('data-set-weight="acct"');
   expect(html).toContain('value="1"');
 });
@@ -366,6 +498,105 @@ function loadMappingCard(): (mapping: unknown) => string {
   const factory = new Function("document", "localStorage", "matchMedia", `${stubbed}\nreturn mappingCardHtml;`);
   return factory(doc, { getItem: () => null, setItem() {} }, () => ({ matches: false }));
 }
+
+for (const strategy of ["headroom", "expiring"] as const) {
+  test(`status and dashboard expose candidate factors for the ${strategy} strategy`, async () => {
+    const dir = mkdtempSync(join(process.env.CLAUDE_JOB_DIR ? join(process.env.CLAUDE_JOB_DIR, "tmp") : tmpdir(), "routing-factors-status-"));
+    const accountsDir = join(dir, "accounts");
+    mkdirSync(join(accountsDir, "claude"), { recursive: true });
+    mkdirSync(join(accountsDir, "codex"), { recursive: true });
+    writeFileSync(
+      join(accountsDir, "claude", ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "at" } }),
+    );
+    writeFileSync(
+      join(accountsDir, "codex", OPENAI_CREDS_FILENAME),
+      JSON.stringify({ accessToken: "at" }),
+    );
+    const proc = Bun.spawn([process.execPath, "-e", `
+      import { loadConfig } from "../config.ts";
+      import { startServer } from "./server.ts";
+      startServer(loadConfig({
+        host: "127.0.0.1",
+        port: 0,
+        usageRefreshEnabled: false,
+        routingStrategy: "${strategy}",
+      }));
+    `], {
+      cwd: import.meta.dir,
+      env: { ...process.env, CLAUDE_POOL_DIR: dir },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const ready = (async () => {
+        let output = "";
+        for await (const chunk of proc.stdout) {
+          output += new TextDecoder().decode(chunk);
+          const origin = output.match(/listening on (http:\/\/127\.0\.0\.1:\d+)/)?.[1];
+          if (origin) return origin;
+        }
+        throw new Error("Pool exited before listening: " + await new Response(proc.stderr).text());
+      })();
+      const origin = await Promise.race([
+        ready,
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("Pool startup timed out")), 5000); }),
+      ]);
+      const response = await fetch(origin + "/api/status");
+      const status = await response.json() as any;
+      expect(response.status).toBe(200);
+      expect(status.routingCombined.candidates).toEqual([
+        expect.objectContaining({ account: "claude", headroom: 1, activeSessions: 0, inFlight: 0, viable: true, score: 5 }),
+        expect.objectContaining({ account: "codex", headroom: 1, activeSessions: 0, inFlight: 0, viable: true, score: 5 }),
+      ]);
+
+      const { card, summaryTableHtml } = loadFns();
+      const table = summaryTableHtml(status.accounts, status.routingCombined);
+      for (const account of ["claude", "codex"]) {
+        const row = table.match(new RegExp(`data-scroll="${account}"[\\s\\S]*?</tr>`))?.[0] ?? "";
+        expect(row).toContain(">1.00</td>");
+        expect(row).toContain(">100%</td>");
+        expect(row).toContain(">Viable</td>");
+        expect(row).toContain(">5.00</td>");
+        const accountData = status.accounts.find((candidate: any) => candidate.name === account);
+        const factors = status.routingCombined.candidates.find((candidate: any) => candidate.account === account);
+        const detail = card(accountData, factors, status.routingCombined.nextPick?.account === account, status.routingCombined.nextPick?.reason);
+        expect(detail).toContain("Weighted score");
+        expect(detail).toContain(">5.00</span>");
+      }
+    } finally {
+      clearTimeout(timer);
+      proc.kill();
+      await proc.exited;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 10000);
+}
+
+test("CLI backend status does not advertise an unusable Codex account", async () => {
+  const dir = mkdtempSync(join(process.env.CLAUDE_JOB_DIR ? join(process.env.CLAUDE_JOB_DIR, "tmp") : tmpdir(), "cli-routing-status-"));
+  const accountsDir = join(dir, "accounts");
+  mkdirSync(join(accountsDir, "codex"), { recursive: true });
+  writeFileSync(join(accountsDir, "codex", OPENAI_CREDS_FILENAME), JSON.stringify({ accessToken: "at" }));
+  const server = await startStatusServer(dir, { backend: "cli" });
+  try {
+    const accountWideResponse = await fetch(server.origin + "/api/status");
+    const accountWide = await accountWideResponse.json() as any;
+    expect(accountWideResponse.status).toBe(200);
+    expect(accountWide.routingContext.providers).toEqual(["anthropic"]);
+    expect(accountWide.routingCombined.nextPick).toBeNull();
+
+    const explicitResponse = await fetch(server.origin + "/api/status?model=gpt-5.6-sol");
+    const explicit = await explicitResponse.json() as any;
+    expect(explicitResponse.status).toBe(200);
+    expect(explicit.routingContext.providers).toEqual([]);
+    expect(explicit.routingCombined.nextPick).toBeNull();
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 10000);
 
 // Each family (fable/opus/sonnet/haiku) renders as its own <div class="map-row"
 // ... <div class="efforts">...</div></div> block with no other nested divs, so
@@ -410,14 +641,44 @@ describe("model mapping card", () => {
       ]);
       const response = await fetch(origin + "/api/status");
       expect(response.status).toBe(200);
-      const previewResponse = await fetch(origin + "/api/status?provider=openai&model=gpt-6-astra");
+      const accountWide = await response.json() as any;
+      expect(accountWide.routingContext).toEqual({
+        provider: "anthropic",
+        model: null,
+        modelFamily: null,
+        providers: ["anthropic", "openai"],
+      });
+      const previewResponse = await fetch(origin + "/api/status?model=fable");
       const preview = await previewResponse.json() as any;
       expect(previewResponse.status).toBe(200);
-      expect(preview.routingContext).toEqual({ provider: "openai", model: "gpt-6-astra", modelFamily: null });
-      expect(preview.routingPreview).toEqual({ activeTier: null, nextPick: null, tiers: [], busy: [] });
-      expect(preview.routing).toBeDefined();
-      expect((await fetch(origin + "/api/status?provider=unknown")).status).toBe(400);
-      const { mapping } = await response.json() as {
+      expect(preview.routingContext).toEqual({
+        provider: "anthropic",
+        model: "fable",
+        modelFamily: "fable",
+        providers: ["anthropic", "openai"],
+      });
+      expect(preview.routing).toEqual({ activeTier: null, nextPick: null, tiers: [], candidates: [], busy: [] });
+      expect(preview.routingPreview).toEqual({ activeTier: null, nextPick: null, tiers: [], candidates: [], busy: [] });
+      expect(preview.routingCombined.providerPicks.map((pick: any) => pick.provider)).toEqual(["anthropic", "openai"]);
+
+      const providerResponse = await fetch(origin + "/api/status?provider=openai&model=fable");
+      const providerPreview = await providerResponse.json() as any;
+      expect(providerResponse.status).toBe(200);
+      expect(providerPreview.routingContext.provider).toBe("openai");
+      expect(providerPreview.routingPreview).toEqual({ activeTier: null, nextPick: null, tiers: [], candidates: [], busy: [] });
+      const invalidProvider = await fetch(origin + "/api/status?provider=unknown");
+      expect(invalidProvider.status).toBe(400);
+
+      const explicitOpenAIResponse = await fetch(origin + "/api/status?model=gpt-5.6-sol");
+      const explicitOpenAI = await explicitOpenAIResponse.json() as any;
+      expect(explicitOpenAIResponse.status).toBe(200);
+      expect(explicitOpenAI.routingContext).toEqual({
+        provider: "anthropic",
+        model: "gpt-5.6-sol",
+        modelFamily: null,
+        providers: ["openai"],
+      });
+      const { mapping } = accountWide as {
         mapping: { targets: { id: string; supportedEfforts: string[] }[] };
       };
       // The shipped dashboard reads target.id before deciding if a saved
@@ -609,8 +870,7 @@ describe("collapsible settings group", () => {
     // Both config panels are themselves nested <details> (independently collapsible).
     expect(html).toMatch(/<details class="mapping-panel" id="mapping-panel">/);
     expect(html).toMatch(/<details class="tuning-panel" id="tuning-panel">/);
-    // The live "next pick" panel stays a plain, always-visible div.
-    expect(html).toMatch(/<div class="routing-panel" id="routing-panel">/);
+    expect(html).not.toContain('id="routing-panel"');
   });
 
   test("open state persists in localStorage and edits are guarded from poll clobber", () => {
@@ -780,7 +1040,7 @@ describe("settings runtime: collapse persistence + anti-clobber", () => {
         baseAccount({ name: "claude-reserve", provider: "anthropic", priority: 110 }),
         baseAccount({ name: "codex-primary", provider: "openai", priority: 100 }),
       ],
-      routing: { tiers: [], nextPick: { account: "claude-reserve" }, activeTier: 110 },
+      routing: { tiers: [], nextPick: { account: "claude-reserve" }, activeTier: 110, candidates: [], busy: [] },
       tuning: { fiveHourExp: 1, loadSlope: 1, urgencyDecay: 0.5, minHeadroom: 0.1 },
       mapping: { enabled: false, targets: [], mappings: [] },
       usageWindowMs: 18_000_000,
@@ -798,7 +1058,7 @@ describe("settings runtime: collapse persistence + anti-clobber", () => {
   test("an account priority edit survives a status poll until it is explicitly saved", async () => {
     const status = {
       accounts: [baseAccount()],
-      routing: { tiers: [], nextPick: null, activeTier: null },
+      routing: { tiers: [], nextPick: null, activeTier: null, candidates: [], busy: [] },
       tuning: { fiveHourExp: 1, loadSlope: 1, urgencyDecay: 0.5, minHeadroom: 0.1 },
       mapping: { enabled: false, targets: [], mappings: [] },
       usageWindowMs: 18_000_000,
@@ -832,31 +1092,14 @@ test("a stale status response cannot overwrite a newer preview context", async (
 
 });
 
-test("routing preview labels fresh placement and displays backend factors", () => {
-  const rendered = loadRoutingPanel()({
-    nextPick: { account: "a", reason: { summary: "test", factors: [] } },
-    candidates: [{ account: "a", expiryShare: 5, activeSessions: 2, headroom: 0.15, fiveHourFactor: 0.75, viable: true, score: 1.25 }],
-  });
-  expect(rendered).toContain("Next new session");
-  for (const label of ["Expiry share", "Pinned sessions", "5h headroom", "5h factor", "Viability", "0.75"]) expect(rendered).toContain(label);
+test("dashboard exposes one model-family preview and no provider-separated routing panel", () => {
   const html = dashboardHtml();
-  expect(html).toContain('id="routing-provider"');
   expect(html).toContain('id="routing-model"');
+  expect(html).not.toContain('id="routing-provider"');
+  expect(html).not.toContain('id="routing-panel"');
+  expect(html).not.toContain("Preview provider");
+  expect(html).toContain("Account-wide");
   expect(html).toContain('data-tuning');
   expect(html).toContain("headroomTaperStart");
   expect(html).not.toContain("urgencyDecay");
-});
-
-test("preview context uses account-wide label and includes manual weight", () => {
-  expect(dashboardHtml()).toContain("Account-wide only");
-  const rendered = loadRoutingPanel()({ nextPick: { account: "a" }, candidates: [{ account: "a", weight: 2, expiryShare: 5, activeSessions: 0, headroom: 1, fiveHourFactor: 1, score: 10, viable: true }] });
-  expect(rendered).toContain("Manual weight");
-});
-
-
-test("routing panel explains capacity-skipped accounts when every slot is busy", () => {
-  const html = loadRoutingPanel()({ nextPick: null, busy: [{ account: "gpt-account", inFlight: 4, limit: 4 }] });
-  expect(html).toContain("gpt-account");
-  expect(html).toContain("4 / 4");
-  expect(html).toContain("soft limit");
 });

@@ -118,9 +118,16 @@ export interface RoutingSnapshot {
   activeTier: number | null;
   nextPick: { account: string; reason: NextPickReason } | null;
   tiers: { priority: number; accounts: string[]; available: number }[];
-  /** Per-candidate factor breakdown; present only for the weighted strategy. */
+  /** Server-computed placement factors for each account in the provider's active tier. */
   candidates?: ({ account: string } & WeightedFactors)[];
   busy?: { account: string; inFlight: number; limit: number }[];
+  /** Per-provider decisions retained by combined previews for fallback inspection. */
+  providerPicks?: {
+    provider: Provider;
+    modelFamily: string | null;
+    activeTier: number | null;
+    nextPick: RoutingSnapshot["nextPick"];
+  }[];
 }
 
 interface PersistedState {
@@ -137,6 +144,11 @@ export interface KeychainOps {
 export interface ProviderCandidate {
   provider: Provider;
   modelFamily: string | null;
+}
+
+interface ProviderPool {
+  candidate: ProviderCandidate;
+  accounts: Account[];
 }
 
 const defaultKeychainOps: KeychainOps = { read: readKeychainCreds, delete: deleteKeychainCreds };
@@ -715,8 +727,8 @@ export class AccountManager {
     };
   }
 
-  listAccounts(): Account[] {
-    return this.listNames().map((n) => this.getAccount(n));
+  listAccounts(readOnly = false, now: number = Date.now()): Account[] {
+    return this.listNames().map((name) => this.getAccount(name, readOnly, now));
   }
 
   // ---- routing -----------------------------------------------------------
@@ -814,51 +826,121 @@ export class AccountManager {
    *      failover — the most-recently-served one wins, so a recovered primary
    *      doesn't snap the session back and discard the current provider's
    *      reasoning context.
-   *   4. otherwise the candidate whose best account has the most headroom;
-   *      ties keep candidate order (callers list anthropic first).
+   *   4. otherwise compare each provider's active-tier winner with the configured
+   *      weighted, expiring, or headroom strategy; exact ties keep candidate
+   *      order (callers list anthropic first).
    */
   pickProvider(sessionKey: string | undefined, candidates: ProviderCandidate[], ignoreCap = false): ProviderCandidate | null {
-    const now = Date.now();
-    // List once — the account set is identical for every candidate, only the
-    // provider/family filter differs (listAccounts() reads creds/usage per account).
-    const all = this.listAccounts();
-    const usable = candidates
-      .map((c) => ({
-        c,
-        accounts: all.filter((a) => this.usableFor(a, c.provider, c.modelFamily, now, undefined, ignoreCap)),
+    return this.pickProviderAt(sessionKey, candidates, ignoreCap, Date.now());
+  }
+
+  private usableProviderPools(
+    candidates: ProviderCandidate[],
+    ignoreCap: boolean,
+    now: number,
+    all: Account[],
+  ): ProviderPool[] {
+    return candidates
+      .map((candidate) => ({
+        candidate,
+        accounts: all.filter((account) =>
+          this.usableFor(account, candidate.provider, candidate.modelFamily, now, undefined, ignoreCap)),
       }))
-      .filter((e) => e.accounts.length > 0);
+      .filter((entry) => entry.accounts.length > 0);
+  }
+
+  private pickProviderAt(
+    sessionKey: string | undefined,
+    candidates: ProviderCandidate[],
+    ignoreCap: boolean,
+    now: number,
+    all: Account[] = this.listAccounts(true, now),
+  ): ProviderCandidate | null {
+    // Use one account snapshot at the selector's timestamp. The read-only usage
+    // copies preserve fixed-time previews while giving live calls rolled values.
+    const usable = this.usableProviderPools(candidates, ignoreCap, now, all);
     if (usable.length === 0) return null;
-    if (usable.length === 1) return usable[0]!.c;
+    if (usable.length === 1) return usable[0]!.candidate;
 
     if (sessionKey) {
-      let pinnedBest: { c: ProviderCandidate; lastSeenAt: number } | null = null;
-      for (const e of usable) {
-        const entry = this.sessions.getEntry(e.c.provider, sessionKey, now);
-        if (entry && e.accounts.some((a) => a.name === entry.account)) {
+      let pinnedBest: { candidate: ProviderCandidate; lastSeenAt: number } | null = null;
+      for (const entry of usable) {
+        const pin = this.sessions.getEntry(entry.candidate.provider, sessionKey, now);
+        if (pin && activeTier(entry.accounts).some((account) => account.name === pin.account)) {
           // Strict > keeps candidate order on ties (anthropic listed first).
-          if (!pinnedBest || entry.lastSeenAt > pinnedBest.lastSeenAt) {
-            pinnedBest = { c: e.c, lastSeenAt: entry.lastSeenAt };
+          if (!pinnedBest || pin.lastSeenAt > pinnedBest.lastSeenAt) {
+            pinnedBest = { candidate: entry.candidate, lastSeenAt: pin.lastSeenAt };
           }
         }
       }
-      if (pinnedBest) return pinnedBest.c;
+      if (pinnedBest) return pinnedBest.candidate;
     }
 
     // Compare on the tier pick() will actually spend: only the highest-priority
     // (lowest-number) usable tier per provider serves requests, so scoring a
-    // provider on a reserved backup tier's headroom would pick a provider whose
-    // serving tier is actually more constrained.
-    let best = usable[0]!;
-    let bestHeadroom = maxHeadroom(activeTier(best.accounts), best.c.modelFamily, now, this.config.routingStrategy !== "headroom");
-    for (const e of usable.slice(1)) {
-      const h = maxHeadroom(activeTier(e.accounts), e.c.modelFamily, now, this.config.routingStrategy !== "headroom");
-      if (h > bestHeadroom) {
-        best = e;
-        bestHeadroom = h;
-      }
+    // provider on a reserved backup tier would pick a provider whose serving
+    // tier is actually more constrained. Weighted expiry ranks must be computed
+    // across those tiers together; provider-local ranks restart at 5 and are not
+    // numerically comparable. Exact ties retain candidate order.
+    if (this.config.routingStrategy === "weighted") {
+      const bestAccount = this.weightedProviderRanking(usable, now).contenders[0]!.account;
+      return usable.find((entry) => entry.accounts.some((account) => account.name === bestAccount.name))!.candidate;
     }
-    return best.c;
+
+    let best = usable[0]!;
+    for (const entry of usable.slice(1)) {
+      if (this.compareProviderPools(entry, best, now) < 0) best = entry;
+    }
+    return best.candidate;
+  }
+
+  private compareProviderPools(a: ProviderPool, b: ProviderPool, now: number): number {
+    const aTier = activeTier(a.accounts);
+    const bTier = activeTier(b.accounts);
+
+    if (this.config.routingStrategy === "expiring") {
+      const ae = this.sortExpiringCandidates(aTier, a.candidate.modelFamily, now)[0]!;
+      const be = this.sortExpiringCandidates(bTier, b.candidate.modelFamily, now)[0]!;
+      if (ae.viable !== be.viable) return ae.viable ? -1 : 1;
+      return compareExpiringCandidates(ae, be);
+    }
+
+    const ah = aTier
+      .map((account) => ({ account, headroom: headroomFraction(account.usage, a.candidate.modelFamily, now) }))
+      .sort(compareHeadroomCandidates)[0]!;
+    const bh = bTier
+      .map((account) => ({ account, headroom: headroomFraction(account.usage, b.candidate.modelFamily, now) }))
+      .sort(compareHeadroomCandidates)[0]!;
+    return compareHeadroomCandidates(ah, bh);
+  }
+
+  /**
+   * Score every provider's active tier on one expiry scale, but compare only the
+   * account that provider-local pick() would actually serve next. Otherwise an
+   * unused account can make its provider win before pick() selects a different,
+   * lower-scoring account from that provider.
+   */
+  private weightedProviderRanking(
+    pools: ProviderPool[],
+    now: number,
+  ): { scored: WeightedCandidate[]; contenders: WeightedCandidate[]; tuning: RoutingTuning } {
+    const rows = pools.flatMap((entry) =>
+      activeTier(entry.accounts).map((account) => ({ account, family: entry.candidate.modelFamily })),
+    );
+    const tuning = this.getTuning();
+    const scored = this.scoreWeightedRows(rows, now, tuning);
+    const scoreByAccount = new Map(scored.map((candidate) => [candidate.account.name, candidate]));
+    const contenders = pools.map((entry) => {
+      const local = this.rankWeighted(
+        this.scoreWeighted(activeTier(entry.accounts), entry.candidate.modelFamily, now, tuning),
+      );
+      const bestScore = local[0]!.score;
+      const winner = this.previewTie(
+        local.filter((candidate) => candidate.score === bestScore).map((candidate) => candidate.account),
+      );
+      return scoreByAccount.get(winner.name)!;
+    });
+    return { scored, contenders: this.rankWeighted(contenders), tuning };
   }
 
   private pickByHeadroom(available: Account[], family: string | null, now: number): Account {
@@ -927,10 +1009,19 @@ export class AccountManager {
     now: number,
     tuning: RoutingTuning = this.getTuning(),
   ): WeightedCandidate[] {
+    return this.scoreWeightedRows(pool.map((account) => ({ account, family })), now, tuning);
+  }
+
+  /** Score rows together so expiry shares use one scale across provider pools. */
+  private scoreWeightedRows(
+    inputs: { account: Account; family: string | null }[],
+    now: number,
+    tuning: RoutingTuning = this.getTuning(),
+  ): WeightedCandidate[] {
     // Gather each account's expiry reset + 5h gate first, then rank over the
     // distinct reset values so tied resets share an urgency rank (a cohort the
     // secondary factors — load, 5h headroom, weight — order among).
-    const rows = pool.map((account) => {
+    const rows = inputs.map(({ account, family }) => {
       const expiryReset = candidateExpiryReset(account.usage, family, now);
       const headroom = candidateGateHeadroom(account.usage, family, now);
       const rankKey = expiryRankKey(account.usage, family, now, expiryReset);
@@ -945,7 +1036,7 @@ export class AccountManager {
       const activeSessions = this.sessions.activeCount(account.name, now);
       const loadFactor = 1 / (activeSessions + 1);
       const fiveHourFactor = Math.min(1, headroom / tuning.headroomTaperStart) ** tuning.fiveHourExp;
-      const weight = this.weightFor(account.name);
+      const weight = account.weight;
       const score = weight * urgency * loadFactor * fiveHourFactor;
       return {
         account,
@@ -992,14 +1083,40 @@ export class AccountManager {
     return best;
   }
 
+  private routingCandidate(candidate: WeightedCandidate): NonNullable<RoutingSnapshot["candidates"]>[number] {
+    return {
+      account: candidate.account.name,
+      weight: candidate.weight,
+      expiryShare: candidate.expiryShare,
+      activeSessions: candidate.activeSessions,
+      inFlight: candidate.inFlight,
+      fiveHourFactor: candidate.fiveHourFactor,
+      viable: candidate.viable,
+      urgency: candidate.urgency,
+      loadFactor: candidate.loadFactor,
+      headroom: candidate.headroom,
+      score: candidate.score,
+    };
+  }
+
   /**
    * Current routing decision for one provider: every tier (grouped by priority,
    * with an available count), the active tier, and the account that would serve
    * the next new session for the requested model family. Reads copied usage
    * and the current round-robin cursor without touching session pins or usage.
+   *
+   * @param ignoreCap mirror the live soft-cap bypass: when every otherwise-usable
+   *   account is at its in-flight limit, live routing still selects one and waits
+   *   for a slot, so the preview must show that same winner rather than nothing.
    */
-  routingSnapshot(provider: Provider = "anthropic", now: number = Date.now(), family: string | null = null): RoutingSnapshot {
-    const accounts = this.listNames().map((name) => this.getAccount(name, true, now)).filter((a) => a.provider === provider);
+  routingSnapshot(
+    provider: Provider = "anthropic",
+    now: number = Date.now(),
+    family: string | null = null,
+    ignoreCap = false,
+    all: Account[] = this.listAccounts(true, now),
+  ): RoutingSnapshot {
+    const accounts = all.filter((a) => a.provider === provider);
 
     const byPriority = new Map<number, Account[]>();
     for (const a of accounts) {
@@ -1012,22 +1129,30 @@ export class AccountManager {
       .map(([priority, accts]) => ({
         priority,
         accounts: accts.map((a) => a.name),
-        available: accts.filter((a) => this.usableFor(a, provider, family, now)).length,
+        available: accts.filter((a) => this.usableFor(a, provider, family, now, undefined, ignoreCap)).length,
       }));
 
     const busy = accounts
       .filter(a => this.usableFor(a, provider, family, now, undefined, true) && this.atCap(a))
       .map(a => ({ account: a.name, inFlight: a.inFlight, limit: this.maxInFlight(provider) }));
-    const available = accounts.filter((a) => this.usableFor(a, provider, family, now));
-    if (available.length === 0) return { activeTier: null, nextPick: null, tiers, busy };
+    const available = accounts.filter((a) => this.usableFor(a, provider, family, now, undefined, ignoreCap));
+    if (available.length === 0) return { activeTier: null, nextPick: null, tiers, candidates: [], busy };
 
     const minPriority = Math.min(...available.map((a) => a.priority));
     const tierPool = available.filter((a) => a.priority === minPriority);
     const reserveTiers = tiers.map((t) => t.priority).filter((p) => p > minPriority);
 
+    // Placement factors for every active-tier account, under every strategy: the
+    // dashboard renders one row per candidate and must never recompute them in
+    // the browser. `score` is the weighted placement score — the decisive value
+    // under `weighted`, and a comparable placement figure under the other two,
+    // whose own decisive factor is spelled out in `nextPick.reason`.
+    const tuning = this.getTuning();
+    const scored = this.scoreWeighted(tierPool, family, now, tuning);
+    const candidates: RoutingSnapshot["candidates"] = scored.map((candidate) => this.routingCandidate(candidate));
+
     let best: Account;
     let reason: NextPickReason;
-    let candidates: RoutingSnapshot["candidates"];
     if (this.config.routingStrategy === "headroom") {
       // Keep the sorted reasons, selecting ties with the same cursor as pick.
       const ranked = tierPool
@@ -1037,33 +1162,87 @@ export class AccountManager {
       ranked.sort((a, b) => Number(b.account === best) - Number(a.account === best));
       reason = buildHeadroomReason(minPriority, reserveTiers, tierPool.length, ranked);
     } else if (this.config.routingStrategy === "expiring") {
-      const minHeadroom = this.getTuning().minHeadroom;
-      const ranked = this.sortExpiringCandidates(tierPool, family, now, minHeadroom);
+      const ranked = this.sortExpiringCandidates(tierPool, family, now, tuning.minHeadroom);
       best = this.previewTie(tiedExpiringAccounts(ranked));
       ranked.sort((a, b) => Number(b.account === best) - Number(a.account === best));
-      reason = buildExpiringReason(minPriority, reserveTiers, minHeadroom, ranked, now, tierPool.length);
+      reason = buildExpiringReason(minPriority, reserveTiers, tuning.minHeadroom, ranked, now, tierPool.length);
     } else {
-      const tuning = this.getTuning();
-      const scored = this.scoreWeighted(tierPool, family, now, tuning);
       const ranked = this.rankWeighted(scored);
       best = this.previewTie(ranked.filter((c) => c.score === ranked[0]!.score).map((c) => c.account));
       ranked.sort((a, b) => Number(b.account === best) - Number(a.account === best));
       reason = buildWeightedReason(minPriority, reserveTiers, ranked, now, tierPool.length, tuning);
-      candidates = scored.map((c) => ({
-        account: c.account.name,
-        weight: c.weight,
-        expiryShare: c.expiryShare,
-        activeSessions: c.activeSessions,
-        inFlight: c.inFlight,
-        fiveHourFactor: c.fiveHourFactor,
-        viable: c.viable,
-        urgency: c.urgency,
-        loadFactor: c.loadFactor,
-        headroom: c.headroom,
-        score: c.score,
-      }));
     }
     return { activeTier: minPriority, nextPick: { account: best.name, reason }, tiers, candidates, busy };
+  }
+
+  /**
+   * Combined read-only routing view for every provider capable of serving a
+   * request, evaluated entirely at `now`. The next pick matches the live
+   * provider selector — including its soft-cap bypass when every eligible
+   * account is busy — without changing session affinity, persisting usage, or
+   * consuming a round-robin turn.
+   */
+  routingSnapshotForProviders(
+    candidates: ProviderCandidate[],
+    now: number = Date.now(),
+    all: Account[] = this.listAccounts(true, now),
+  ): RoutingSnapshot {
+    const preferredWinner = this.pickProviderAt(undefined, candidates, false, now, all);
+    const winner = preferredWinner ?? this.pickProviderAt(undefined, candidates, true, now, all);
+    const ignoreCap = preferredWinner === null && winner !== null;
+    const snapshots = candidates.map((candidate) => ({
+      candidate,
+      snapshot: this.routingSnapshot(candidate.provider, now, candidate.modelFamily, ignoreCap, all),
+    }));
+    const winningEntry = winner
+      ? snapshots.find(({ candidate }) =>
+          candidate.provider === winner.provider && candidate.modelFamily === winner.modelFamily,
+        ) ?? null
+      : null;
+
+    const byPriority = new Map<number, { priority: number; accounts: string[]; available: number }>();
+    for (const { snapshot } of snapshots) {
+      for (const tier of snapshot.tiers) {
+        const merged = byPriority.get(tier.priority) ?? { priority: tier.priority, accounts: [], available: 0 };
+        merged.accounts.push(...tier.accounts);
+        merged.available += tier.available;
+        byPriority.set(tier.priority, merged);
+      }
+    }
+    const tiers = [...byPriority.values()].sort((a, b) => a.priority - b.priority);
+
+    let combinedCandidates = snapshots.flatMap(({ snapshot }) => snapshot.candidates ?? []);
+    let nextPick = winningEntry?.snapshot.nextPick ?? null;
+    if (winner && nextPick && this.config.routingStrategy === "weighted") {
+      const pools = this.usableProviderPools(candidates, ignoreCap, now, all);
+      const { scored, contenders, tuning } = this.weightedProviderRanking(pools, now);
+      combinedCandidates = scored.map((candidate) => this.routingCandidate(candidate));
+      const selectedAccount = nextPick.account;
+      const activeTierForWinner = winningEntry?.snapshot.activeTier
+        ?? all.find((account) => account.name === selectedAccount)?.priority
+        ?? DEFAULT_PRIORITY;
+      const reserveTiers = winningEntry?.snapshot.tiers
+        .map((tier) => tier.priority)
+        .filter((priority) => priority > activeTierForWinner) ?? [];
+      nextPick = {
+        account: selectedAccount,
+        reason: buildWeightedReason(activeTierForWinner, reserveTiers, contenders, now, scored.length, tuning),
+      };
+    }
+
+    return {
+      activeTier: tiers.find((tier) => tier.available > 0)?.priority ?? null,
+      nextPick,
+      tiers,
+      candidates: combinedCandidates,
+      busy: snapshots.flatMap(({ snapshot }) => snapshot.busy ?? []),
+      providerPicks: snapshots.map(({ candidate, snapshot }) => ({
+        provider: candidate.provider,
+        modelFamily: candidate.modelFamily,
+        activeTier: snapshot.activeTier,
+        nextPick: snapshot.nextPick,
+      })),
+    };
   }
 
   /** Pin a session to the account that actually served it (post-failover). */
@@ -1557,13 +1736,6 @@ function viableFirst<T extends { viable: boolean }>(candidates: T[]): T[] {
  */
 function headroomFraction(usage: AccountUsage, modelFamily: string | null, now: number): number {
   return candidateMinHeadroom(usage, modelFamily, now);
-}
-
-/** The most headroom any of these accounts has for `family`, used by pickProvider(). */
-function maxHeadroom(accounts: Account[], family: string | null, now: number, fiveHourOnly = false): number {
-  let best = 0;
-  for (const a of accounts) best = Math.max(best, (fiveHourOnly ? candidateGateHeadroom : headroomFraction)(a.usage, family, now));
-  return best;
 }
 
 /** The highest-priority (lowest-number) tier within a set of accounts — the tier
