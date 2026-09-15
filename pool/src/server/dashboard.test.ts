@@ -1,41 +1,14 @@
-import { test, expect, describe } from "bun:test";
-import { dashboardHtml } from "./dashboard.ts";
+import { test, expect } from "bun:test";
+import { dashboardHtml, dashboardClientScript, buildDashboardDescriptors } from "./dashboard.ts";
+import { createDashboardPresentation } from "./dashboard-presentation.ts";
+import { createDashboardForms } from "./dashboard-forms.ts";
+import type { MappingForm } from "./dashboard-types.ts";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { OPENAI_CREDS_FILENAME } from "../accounts/types.ts";
+import { OPENAI_CREDS_FILENAME, windowDurationMs, sortRateLimitWindows } from "../accounts/types.ts";
 
-/**
- * The dashboard's per-account card is rendered client-side by a `card(a)`
- * function embedded in a <script> block within the HTML string returned by
- * dashboardHtml() — there's no server-side render path to unit test directly.
- * Extract that script and evaluate `card()` in isolation against a synthetic
- * account object to exercise the rendering logic without a browser.
- */
-function loadCard(): (account: unknown) => string {
-  const html = dashboardHtml();
-  const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
-  if (!script) throw new Error("dashboard <script> block not found");
-  // `card` calls refresh()/setInterval() at the bottom of the script; stub
-  // those out so evaluating the module body doesn't touch the DOM or fetch.
-  const stubbed = script
-    .replace(/^refresh\(\);$/m, "")
-    .replace(/^setInterval\(refresh, 4000\);$/m, "");
-  const factory = new Function(
-    "document",
-    "localStorage",
-    "matchMedia",
-    `${stubbed}\nreturn card;`,
-  );
-  const noopEl = { addEventListener() {}, setAttribute() {}, getAttribute() { return null; }, textContent: "", style: {} };
-  const doc = {
-    getElementById: () => noopEl,
-    querySelectorAll: () => [],
-    documentElement: noopEl,
-  };
-  return factory(doc, { getItem: () => null, setItem() {} }, () => ({ matches: false }));
-}
-
+// Server contract regressions remain real isolated HTTP tests; obsolete card markup is gone.
 async function startStatusServer(
   dir: string,
   configOverrides: Record<string, unknown> = {},
@@ -80,423 +53,6 @@ async function startStatusServer(
   } finally {
     clearTimeout(timer);
   }
-}
-
-function baseAccount(overrides: Record<string, unknown> = {}) {
-  return {
-    name: "acct",
-    available: true,
-    authenticated: true,
-    subscriptionType: "max",
-    rateLimitTier: "default_claude_max_5x",
-    tokenExpired: false,
-    tokenExpiresAt: Date.now() + 3_600_000,
-    unavailableReason: null,
-    weight: 1,
-    activeSessions: 0,
-    inFlight: 0,
-    usage: {
-      windowRequests: 3,
-      windowInputTokens: 100,
-      windowOutputTokens: 50,
-      windowCostUsd: 0.01,
-      totalRequests: 10,
-      lastUsedAt: Date.now(),
-      lastError: null,
-      rateLimitedUntil: null,
-      rateLimitStatus: null,
-      lastUsageCheckAt: null,
-      lastUsageCheckError: null,
-      ...((overrides.usage as Record<string, unknown>) ?? {}),
-    },
-    ...overrides,
-  };
-}
-
-test("card() shows live in-flight count separately from pinned sessions", () => {
-  const html = loadCard()(baseAccount({ inFlight: 3, activeSessions: 7 }));
-  expect(html).toMatch(/In-flight<\/span><span class="v" data-routing-value="inFlight"[^>]*>3/);
-  expect(html).toContain('7 active');
-});
-
-test("card() falls back to est. bars for every window kind when no live snapshot exists", () => {
-  const card = loadCard();
-  const html = card(baseAccount());
-  expect(html).toContain("Requests (est.)");
-  expect(html).toContain("Tokens (est.)");
-});
-
-test("card() shows only the real 5h bar plus an est. tokens fallback when 7d data is still missing", () => {
-  const card = loadCard();
-  const html = card(
-    baseAccount({
-      usage: {
-        rateLimitStatus: {
-          unifiedStatus: "allowed",
-          windows: [{ key: "5h", model: null, status: "allowed", utilization: 0.2, reset: Date.now() + 3600_000 }],
-        },
-      },
-    }),
-  );
-  expect(html).toContain("5h window");
-  expect(html).not.toContain("Requests (est.)");
-  // 7d is still unknown, so its local estimate must still be shown.
-  expect(html).toContain("Tokens (est.)");
-});
-
-test("card() shows both real bars and no estimates once 5h and 7d are both known", () => {
-  const card = loadCard();
-  const html = card(
-    baseAccount({
-      usage: {
-        rateLimitStatus: {
-          unifiedStatus: "allowed",
-          windows: [
-            { key: "5h", model: null, status: "allowed", utilization: 0.2, reset: Date.now() + 3600_000 },
-            { key: "7d", model: null, status: "allowed", utilization: 0.3, reset: Date.now() + 86_400_000 },
-          ],
-        },
-      },
-    }),
-  );
-  expect(html).toContain("5h window");
-  expect(html).toContain("7d window");
-  expect(html).not.toContain("(est.)");
-});
-
-test("card() assumes the reset for a rolled-over window instead of freezing a stale number", () => {
-  const card = loadCard();
-  const now = Date.now();
-  const html = card(
-    baseAccount({
-      usage: {
-        rateLimitStatus: {
-          unifiedStatus: "allowed",
-          updatedAt: now,
-          windows: [{ key: "5h", model: null, status: "allowed", utilization: 0.97, reset: now - 60 * 60_000 }],
-        },
-      },
-    }),
-  );
-  // Reset was an hour ago on a 5h window: assume rollover — 0% used, next
-  // reset projected 4h out — not the stale 97% "awaiting refresh".
-  expect(html).not.toContain("awaiting refresh");
-  expect(html).not.toContain("97%");
-  expect(html).toContain("0% · resets 4h 0m");
-});
-
-test("card() shows a usage-check error note even when there is no serving error", () => {
-  const card = loadCard();
-  const html = card(
-    baseAccount({
-      usage: { lastUsageCheckAt: Date.now(), lastUsageCheckError: "usage 429" },
-    }),
-  );
-  expect(html).toContain("usage 429");
-});
-
-test("card() shows the last usage-check time when present, and omits the row when absent", () => {
-  const card = loadCard();
-  const withCheck = card(baseAccount({ usage: { lastUsageCheckAt: Date.now() } }));
-  expect(withCheck).toContain("Usage checked");
-
-  const withoutCheck = card(baseAccount());
-  expect(withoutCheck).not.toContain("Usage checked");
-});
-
-function loadFns(): {
-  card: (a: unknown, candidate?: unknown, isNext?: boolean, nextReason?: unknown, busy?: unknown) => string;
-  tierLabel: (p: number) => string;
-  summaryTableHtml: (accounts: unknown[], routing: unknown) => string;
-  routingCandidatesByAccount: (routing: unknown) => Map<string, unknown>;
-  routingReasonHtml: (reason: unknown, busy?: unknown) => string;
-  updateCardRouting: (grid: unknown, routing: unknown) => void;
-  groupAccountsByPriority: (accounts: any[], eligibleProviders?: Set<string>) => { priority: number; accounts: any[]; available: number }[];
-} {
-  const html = dashboardHtml();
-  const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
-  if (!script) throw new Error("dashboard <script> block not found");
-  const stubbed = script
-    .replace(/^refresh\(\);$/m, "")
-    .replace(/^setInterval\(refresh, 4000\);$/m, "");
-  const factory = new Function(
-    "document",
-    "localStorage",
-    "matchMedia",
-    `${stubbed}\nreturn { card, tierLabel, summaryTableHtml, routingCandidatesByAccount, routingReasonHtml, updateCardRouting, groupAccountsByPriority };`,
-  );
-  const noopEl = { addEventListener() {}, setAttribute() {}, getAttribute() { return null; }, textContent: "", style: {} };
-  const doc = {
-    getElementById: () => noopEl,
-    querySelectorAll: () => [],
-    documentElement: noopEl,
-  };
-  return factory(doc, { getItem: () => null, setItem() {} }, () => ({ matches: false })) as any;
-}
-
-test("tierLabel names the first two bands and numbers the rest", () => {
-  const { tierLabel } = loadFns();
-  expect(tierLabel(1)).toBe("Priority 1 — Primary");
-  expect(tierLabel(2)).toBe("Priority 2 — Fallback");
-  expect(tierLabel(3)).toBe("Priority 3");
-});
-
-test("mixed providers are grouped in numeric priority order", () => {
-  const { groupAccountsByPriority } = loadFns();
-  const groups = groupAccountsByPriority([
-    baseAccount({ name: "claude-reserve", provider: "anthropic", priority: 110 }),
-    baseAccount({ name: "codex-primary", provider: "openai", priority: 100 }),
-  ]);
-
-  expect(groups.map((group) => ({
-    priority: group.priority,
-    accounts: group.accounts.map((account) => account.name),
-    available: group.available,
-  }))).toEqual([
-    { priority: 100, accounts: ["codex-primary"], available: 1 },
-    { priority: 110, accounts: ["claude-reserve"], available: 1 },
-  ]);
-});
-
-test("priority availability counts only providers eligible for the selected model/backend", () => {
-  const { groupAccountsByPriority } = loadFns();
-  const groups = groupAccountsByPriority([
-    baseAccount({ name: "claude", provider: "anthropic", priority: 100 }),
-    baseAccount({ name: "codex", provider: "openai", priority: 100 }),
-  ], new Set(["anthropic"]));
-  expect(groups[0]?.available).toBe(1);
-});
-
-test("card() marks the next-pick account and shows its priority", () => {
-  const { card } = loadFns();
-  const html = card({ ...baseAccount(), priority: 1 }, undefined, true);
-  expect(html).toContain("next");
-  expect(html.toLowerCase()).toContain("priority");
-});
-
-test("outer #grid container is not itself a CSS grid (tier sections span full width)", () => {
-  const html = dashboardHtml();
-  // The tiling bug: `.grid` as display:grid squeezes each <section class="tier">
-  // into one ~330px column. The outer container must be a plain block.
-  const gridRule = html.match(/\.grid \{[^}]*\}/)?.[0] ?? "";
-  expect(gridRule).not.toContain("display: grid");
-  // Card tiling is owned by .tier-grid.
-  expect(html).toMatch(/\.tier-grid \{ display: grid; grid-template-columns: repeat\(auto-fill, minmax\(3\d0px, 1fr\)\)/);
-});
-
-test("card() gives the next pick an accent class and every card a scroll-target id", () => {
-  const { card } = loadFns();
-  const next = card({ ...baseAccount(), name: "pick-me" }, undefined, true);
-  expect(next).toContain('id="card-pick-me"');
-  expect(next).toMatch(/class="card[^"]*\bnext\b/);
-  const other = card(baseAccount(), undefined, false);
-  expect(other).not.toMatch(/class="card[^"]*\bnext\b/);
-});
-
-test("card() merges request count and recency into one row", () => {
-  const { card } = loadFns();
-  const html = card(baseAccount(), undefined, false);
-  expect(html).toContain("Requests</span>");
-  expect(html).toContain("10 · ");           // totalRequests · ago(lastUsedAt)
-  expect(html).not.toContain("Total requests");
-  expect(html).not.toContain("Last used");
-});
-
-test("summaryTableHtml renders one row per account with dot, next tag, windows, priority", () => {
-  const { summaryTableHtml } = loadFns();
-  const a = baseAccount({
-    name: "alpha",
-    priority: 100,
-    usage: {
-      rateLimitStatus: {
-        unifiedStatus: "allowed",
-        windows: [
-          { key: "5h", model: null, status: "allowed", utilization: 0.12, reset: Date.now() + 3600_000 },
-          { key: "7d", model: null, status: "allowed", utilization: 0.07, reset: Date.now() + 86_400_000 },
-          { key: "7d-fable", model: "fable", status: "allowed", utilization: 0.5, reset: Date.now() + 86_400_000 },
-        ],
-      },
-    },
-  });
-  const b = baseAccount({ name: "beta", priority: 50, usage: { lastUsedAt: null } });
-  const routing = {
-    nextPick: { account: "alpha", reason: { summary: "score 10.00", factors: [] } },
-    candidates: [],
-  };
-  const html = summaryTableHtml([a, b], routing);
-  expect(html).toContain("alpha");
-  expect(html).toContain("beta");
-  expect((html.match(/<tr class="acct"/g) || []).length).toBe(2);
-  expect(html).toContain("12%");           // alpha 5h
-  expect(html).toContain("7%");            // alpha 7d (account-wide only)
-  expect(html).not.toContain("50%");       // model-scoped fable window excluded
-  expect(html).toMatch(/data-scroll="alpha"/);
-  // Only the routed account carries the next tag.
-  const alphaRow = html.slice(html.indexOf("alpha"), html.indexOf("beta"));
-  expect(alphaRow).toContain("next");
-  // beta has no live windows -> en-dash placeholders, and "never" for last used.
-  expect(html).toContain("never");
-});
-
-test("summaryTableHtml merges routing factors for both providers", () => {
-  const { summaryTableHtml } = loadFns();
-  const accounts = [
-    baseAccount({ name: "claude", provider: "anthropic" }),
-    baseAccount({ name: "codex", provider: "openai", weight: 2 }),
-  ];
-  const routing = {
-    nextPick: { account: "codex", reason: { summary: "tier 100 · score 10.00", factors: [] } },
-    candidates: [
-      { account: "claude", weight: 0.2, expiryShare: 5, activeSessions: 0, inFlight: 0, headroom: 1, fiveHourFactor: 1, viable: true, score: 1 },
-      { account: "codex", weight: 2, expiryShare: 5, activeSessions: 0, inFlight: 0, headroom: 1, fiveHourFactor: 1, viable: true, score: 10 },
-    ],
-  };
-
-  const html = summaryTableHtml(accounts, routing);
-  expect(html).toContain("Manual weight");
-  expect(html).toContain("Expiry share");
-  expect(html).toContain("Pinned sessions");
-  expect(html).toContain("5h headroom");
-  expect(html).toContain("5h factor");
-  expect(html).toContain("Viability");
-  expect(html).toContain("Weighted score");
-  expect(html).toContain("10.00");
-  const codexRow = html.slice(html.indexOf("codex"));
-  expect(codexRow).toContain("next");
-});
-
-test("summaryTableHtml uses dashes for accounts outside the preview candidate set", () => {
-  const { summaryTableHtml } = loadFns();
-  const html = summaryTableHtml(
-    [baseAccount({ name: "reserve" })],
-    { nextPick: null, candidates: [] },
-  );
-  expect(html).toContain("reserve");
-  expect(html).toContain("–");
-});
-
-test("card() renders server-computed routing factors and the winning summary", () => {
-  const { card } = loadFns();
-  const candidate = {
-    account: "acct",
-    weight: 2,
-    expiryShare: 5,
-    activeSessions: 2,
-    inFlight: 1,
-    headroom: 0.75,
-    fiveHourFactor: 1,
-    viable: true,
-    score: 10,
-  };
-  const html = card(
-    baseAccount({ weight: 2, activeSessions: 2, inFlight: 1 }),
-    candidate,
-    true,
-    {
-      summary: "tier 100 · score 10.00",
-      factors: [
-        { label: "5h gate", detail: "75% headroom", decisive: false },
-        { label: "Tie-break", detail: "fewer requests than runner-up", decisive: true },
-      ],
-    },
-  );
-  for (const text of ["Manual weight", "Expiry share", "5h headroom", "5h factor", "Viability", "Weighted score", "10.00"]) {
-    expect(html).toContain(text);
-  }
-  expect(html).toContain("Next new session");
-  expect(html).toContain("tier 100 · score 10.00");
-  expect(html).toContain("5h gate");
-  expect(html).toContain("Tie-break");
-  expect(html).toContain("fewer requests than runner-up");
-  expect(html).toContain('aria-label="decisive">◀');
-});
-
-test("busy next pick shows its soft limit and queueing behavior", () => {
-  const { card, summaryTableHtml } = loadFns();
-  const account = baseAccount({ name: "busy", inFlight: 4 });
-  const candidate = {
-    account: "busy", weight: 1, expiryShare: 5, activeSessions: 0, inFlight: 4,
-    headroom: 1, fiveHourFactor: 1, viable: true, score: 5,
-  };
-  const routing = {
-    nextPick: { account: "busy", reason: { summary: "best effort", factors: [] } },
-    candidates: [candidate],
-    busy: [{ account: "busy", inFlight: 4, limit: 4 }],
-  };
-
-  const detail = card(account, candidate, true, routing.nextPick.reason, routing.busy[0]);
-  expect(detail).toContain("4 / 4 soft limit");
-  expect(detail).toContain("requests wait for a slot");
-  expect(summaryTableHtml([account], routing)).toContain("4 / 4");
-});
-
-test("routing-only card updates restore account values when an account leaves the candidate set", () => {
-  const { updateCardRouting } = loadFns();
-  const value = (key: string, fallback: string, textContent: string) => ({
-    textContent,
-    getAttribute(name: string) {
-      if (name === "data-routing-value") return key;
-      if (name === "data-account-value") return fallback;
-      return null;
-    },
-  });
-  const sessions = value("activeSessions", "3 active", "8 active");
-  const inFlight = value("inFlight", "2", "4 / 4 soft limit");
-  const cardEl = {
-    getAttribute: (name: string) => name === "data-account-card" ? "acct" : null,
-    classList: { toggle() {} },
-    querySelector: () => null,
-    querySelectorAll: () => [sessions, inFlight],
-  };
-  const grid = {
-    querySelectorAll: () => [cardEl],
-  };
-
-  updateCardRouting(grid, { nextPick: null, candidates: [], busy: [] });
-
-  expect(sessions.textContent).toBe("3 active");
-  expect(inFlight.textContent).toBe("2");
-});
-
-test("summaryTableHtml rows are keyboard-focusable buttons (a11y)", () => {
-  const { summaryTableHtml } = loadFns();
-  const html = summaryTableHtml([baseAccount({ name: "alpha" })], { nextPick: null, candidates: [] });
-  expect(html).toContain('role="button"');
-  expect(html).toContain('tabindex="0"');
-});
-
-test("summaryTableHtml is empty for an empty pool", () => {
-  const { summaryTableHtml } = loadFns();
-  expect(summaryTableHtml([], { nextPick: null, candidates: [] })).toBe("");
-});
-
-test("card() shows active sessions and the manual weight", () => {
-  const { card } = loadFns();
-  const html = card({ ...baseAccount(), priority: 100, weight: 2.5, activeSessions: 3 }, undefined, false);
-  expect(html).toContain("Sessions</span>");
-  expect(html).toContain("3 active");
-  expect(html).toContain('data-set-weight="acct"');
-  expect(html).toContain('value="2.5"');
-});
-
-test("card() weight editor defaults to 1 when weight is missing (older /api/status)", () => {
-  const { card } = loadFns();
-  const html = card({ ...baseAccount(), priority: 100 }, undefined, false);
-  expect(html).toContain('data-set-weight="acct"');
-  expect(html).toContain('value="1"');
-});
-
-function loadMappingCard(): (mapping: unknown) => string {
-  const html = dashboardHtml();
-  const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
-  if (!script) throw new Error("dashboard <script> block not found");
-  const stubbed = script
-    .replace(/^refresh\(\);$/m, "")
-    .replace(/^setInterval\(refresh, 4000\);$/m, "");
-  const noopEl = { addEventListener() {}, setAttribute() {}, getAttribute() { return null; }, textContent: "", style: {} };
-  const doc = { getElementById: () => noopEl, querySelectorAll: () => [], documentElement: noopEl };
-  const factory = new Function("document", "localStorage", "matchMedia", `${stubbed}\nreturn mappingCardHtml;`);
-  return factory(doc, { getItem: () => null, setItem() {} }, () => ({ matches: false }));
 }
 
 for (const strategy of ["headroom", "expiring"] as const) {
@@ -551,19 +107,12 @@ for (const strategy of ["headroom", "expiring"] as const) {
         expect.objectContaining({ account: "codex", headroom: 1, activeSessions: 0, inFlight: 0, viable: true, score: 5 }),
       ]);
 
-      const { card, summaryTableHtml } = loadFns();
-      const table = summaryTableHtml(status.accounts, status.routingCombined);
-      for (const account of ["claude", "codex"]) {
-        const row = table.match(new RegExp(`data-scroll="${account}"[\\s\\S]*?</tr>`))?.[0] ?? "";
-        expect(row).toContain(">1.00</td>");
-        expect(row).toContain(">100%</td>");
-        expect(row).toContain(">Viable</td>");
-        expect(row).toContain(">5.00</td>");
-        const accountData = status.accounts.find((candidate: any) => candidate.name === account);
-        const factors = status.routingCombined.candidates.find((candidate: any) => candidate.account === account);
-        const detail = card(accountData, factors, status.routingCombined.nextPick?.account === account, status.routingCombined.nextPick?.reason);
-        expect(detail).toContain("Weighted score");
-        expect(detail).toContain(">5.00</span>");
+      const presentation = createDashboardPresentation(windowDurationMs, sortRateLimitWindows);
+      const model = presentation.routingModel(status);
+      expect(model.candidates.map(row => row.account.name)).toEqual(["claude", "codex"]);
+      for (const row of model.candidates) {
+        expect(row.candidate).toMatchObject({ headroom: 1, viable: true, score: 5 });
+        expect(presentation.accountDetailModel(status, row.account, Date.now()).account.name).toBe(row.account.name);
       }
     } finally {
       clearTimeout(timer);
@@ -598,21 +147,19 @@ test("CLI backend status does not advertise an unusable Codex account", async ()
   }
 }, 10000);
 
-// Each family (fable/opus/sonnet/haiku) renders as its own <div class="map-row"
-// ... <div class="efforts">...</div></div> block with no other nested divs, so
-// a non-greedy match up to the first "</div></div>" isolates one row's markup.
-function mapRow(html: string, family: string): string {
-  const re = new RegExp(`<div class="map-row" data-map-row="${family}">[\\s\\S]*?</div></div>`);
-  return html.match(re)?.[0] ?? "";
-}
-
-describe("model mapping card", () => {
   test("live status preserves object targets and capabilities for already-open dashboards", async () => {
     const dir = mkdtempSync(join(process.env.CLAUDE_JOB_DIR ? join(process.env.CLAUDE_JOB_DIR, "tmp") : tmpdir(), "mapping-status-"));
     writeFileSync(join(dir, "models.json"), JSON.stringify({
-      models: [{ id: "custom-frontier", provider: "openai", upstreamModel: "custom-upstream", supportedEfforts: ["high", "max"] }],
+      models: [
+        { id: "custom-frontier", provider: "openai", upstreamModel: "custom-upstream", supportedEfforts: ["high", "max"] },
+        { id: "custom-claude-route", provider: "anthropic", upstreamModel: "claude-sonnet-4-6" },
+      ],
       mappingEnabled: true,
-      mappings: [{ from: "fable", to: "gpt-6-astra", effort: { max: "max" } }],
+      mappings: [
+        { from: "fable", to: "gpt-6-astra", effort: { max: "max" } },
+        { from: "sonnet", to: "custom-claude-route" },
+        { from: "opus", to: "claude-opus-4-8" },
+      ],
     }));
     const proc = Bun.spawn([process.execPath, "-e", `
       import { loadConfig } from "../config.ts";
@@ -679,7 +226,7 @@ describe("model mapping card", () => {
         providers: ["openai"],
       });
       const { mapping } = accountWide as {
-        mapping: { targets: { id: string; supportedEfforts: string[] }[] };
+        mapping: { targets: { id: string; supportedEfforts: string[] }[]; anthropicTargets: string[] };
       };
       // The shipped dashboard reads target.id before deciding if a saved
       // mapping is active. Strings silently turn those routes into Claude-only.
@@ -691,14 +238,25 @@ describe("model mapping card", () => {
         id: "custom-frontier", supportedEfforts: ["high", "max"],
       });
       expect(mapping.targets.some((target) => target.id === "fable")).toBe(false);
+      expect(mapping.targets.some((target) => target.id === "custom-claude-route")).toBe(false);
+      expect(mapping.anthropicTargets).toContain("custom-claude-route");
+      expect(mapping.anthropicTargets).not.toContain("custom-frontier");
 
-      const rendered = loadMappingCard()(mapping);
-      expect(rendered).not.toContain("[object Object]");
-      expect(rendered).toContain('<option value="custom-frontier">custom-frontier</option>');
-      const fableRow = mapRow(rendered, "fable");
-      expect(fableRow).toContain('<option value="gpt-6-astra" selected>gpt-6-astra</option>');
-      expect(fableRow).toContain('<option value="max" selected>Max</option>');
-      expect(fableRow).not.toContain('<option value="none">');
+      const forms = createDashboardForms(buildDashboardDescriptors());
+      const draft = forms.readServerForm("mapping", accountWide) as MappingForm;
+      expect(draft.mappings.find(row => row.from === "fable")).toEqual({ from: "fable", to: "gpt-6-astra", effort: { max: "max" } });
+      expect(forms.prepareSave("mapping", draft, draft, accountWide).ok).toBe(true);
+      const disable = forms.prepareSave("mapping", { ...draft, enabled: false }, draft, accountWide);
+      expect(disable.ok).toBe(true);
+      if (!disable.ok) throw new Error("Valid Claude-only mappings blocked disable");
+      const saved = await fetch(origin + disable.url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(disable.payload) });
+      expect(saved.status).toBe(200);
+      expect(await saved.json()).toMatchObject({ ok: true, mappingEnabled: false, mappings: expect.arrayContaining([
+        { from: "sonnet", to: "custom-claude-route" }, { from: "opus", to: "claude-opus-4-8" },
+      ]) });
+      const invalid = structuredClone(draft);
+      invalid.mappings.find(row => row.from === "fable")!.effort = { high: "none" };
+      expect(forms.prepareSave("mapping", invalid, draft, accountWide).ok).toBe(false);
     } finally {
       clearTimeout(timer);
       proc.kill();
@@ -707,399 +265,28 @@ describe("model mapping card", () => {
     }
   }, 10000);
 
-  test("historical string targets retain labels and the active mapping without capability metadata", () => {
-    const rendered = loadMappingCard()({
-      enabled: true,
-      targets: ["gpt-5.5"],
-      mappings: [{ from: "fable", to: "gpt-5.5" }],
-    });
-    const fableRow = mapRow(rendered, "fable");
-    expect(fableRow).toContain('<option value="gpt-5.5" selected>gpt-5.5</option>');
-    expect(fableRow).not.toContain('<option value="fable" selected>');
-    expect(fableRow).not.toContain("display:none");
-    expect(fableRow).toContain('<option value="">pass-through</option>');
-    expect(rendered).not.toContain("undefined");
-    expect(rendered).not.toContain("[object Object]");
-  });
-
-  test("dashboard ships the mapping panel and save wiring", () => {
-    const html = dashboardHtml();
-    expect(html).toContain('id="mapping-panel"');
-    expect(html).toContain('id="mapping-enabled"');
-    expect(html).toContain('id="mapping-save"');
-    expect(html).toContain("/api/mappings");
-    expect(html).toContain("mappingCardHtml");
-  });
-
-  test("mappingCardHtml marks fable→fable and an off-target mapping as inert (Claude only, efforts hidden)", () => {
-    const mappingCardHtml = loadMappingCard();
-    const html = mappingCardHtml({
-      enabled: true,
-      targets: [
-        { id: "gpt-5.6-sol", supportedEfforts: [] },
-        { id: "gpt-5.5", supportedEfforts: [] },
-      ],
-      // opus is mapped to a target that isn't in `targets` anymore (e.g. a
-      // model that was removed from the pool) — must fall back to inert too.
-      mappings: [{ from: "opus", to: "gpt-9.9-ghost" }],
-    });
-
-    const fableRow = mapRow(html, "fable");
-    expect(fableRow).toContain('<option value="fable" selected>Claude only</option>');
-    expect(fableRow).toContain('<div class="efforts" style="display:none">');
-
-    const opusRow = mapRow(html, "opus");
-    expect(opusRow).toContain('<option value="opus" selected>Claude only</option>');
-    expect(opusRow).toContain('<div class="efforts" style="display:none">');
-  });
-
-  test("mappingCardHtml selects an active target, shows its efforts, and reflects an effort override", () => {
-    const mappingCardHtml = loadMappingCard();
-    const html = mappingCardHtml({
-      enabled: true,
-      targets: [
-        { id: "gpt-5.6-sol", supportedEfforts: ["low", "medium", "high", "xhigh", "max"] },
-        { id: "gpt-5.5", supportedEfforts: ["none", "low", "medium", "high", "xhigh"] },
-      ],
-      mappings: [{ from: "fable", to: "gpt-5.6-sol", effort: { max: "xhigh" } }],
-    });
-
-    const fableRow = mapRow(html, "fable");
-    expect(fableRow).toContain('<option value="gpt-5.6-sol" selected>gpt-5.6-sol</option>');
-    expect(fableRow).not.toContain("display:none");
-
-    const maxSelect = fableRow.match(
-      /<select data-effort-family="fable" data-effort-tier="max">[\s\S]*?<\/select>/,
-    )?.[0] ?? "";
-    expect(maxSelect).toContain('<option value="xhigh" selected>Extra High</option>');
-  });
-
-  test("polled route capabilities, not model-name prefixes, control the max effort option", () => {
-    const mappingCardHtml = loadMappingCard();
-    const html = mappingCardHtml({
-      enabled: true,
-      targets: [
-        { id: "gpt-6-astra", supportedEfforts: ["low", "medium", "high", "xhigh", "max"] },
-        { id: "gpt-5.6-sol", supportedEfforts: ["none", "low", "medium", "high", "xhigh"] },
-        { id: "custom-frontier", supportedEfforts: ["high", "max"] },
-      ],
-      mappings: [
-        { from: "fable", to: "gpt-6-astra" },
-        { from: "opus", to: "gpt-5.6-sol" },
-        { from: "sonnet", to: "custom-frontier" },
-      ],
-    });
-
-    const fableRow = mapRow(html, "fable");
-    const opusRow = mapRow(html, "opus");
-    const sonnetRow = mapRow(html, "sonnet");
-    expect(fableRow).toContain('<option value="max">Max</option>');
-    expect(fableRow).not.toContain('<option value="none">None</option>');
-    expect(opusRow).toContain('<option value="none">None</option>');
-    expect(opusRow).not.toContain('<option value="max">Max</option>');
-    expect(sonnetRow).toContain('<option value="max">Max</option>');
-    expect(sonnetRow).not.toContain('<option value="none">None</option>');
-  });
-
-  test("mappingCardHtml refreshes capabilities from each polled status payload", () => {
-    const mappingCardHtml = loadMappingCard();
-    const first = mappingCardHtml({
-      enabled: true,
-      targets: [{ id: "changing", supportedEfforts: ["max"] }],
-      mappings: [{ from: "fable", to: "changing" }],
-    });
-    expect(mapRow(first, "fable")).toContain('<option value="max">Max</option>');
-
-    const second = mappingCardHtml({
-      enabled: true,
-      targets: [{ id: "changing", supportedEfforts: ["none"] }],
-      mappings: [{ from: "fable", to: "changing" }],
-    });
-    expect(mapRow(second, "fable")).not.toContain('<option value="max">Max</option>');
-    expect(mapRow(second, "fable")).toContain('<option value="none">None</option>');
-  });
-
-  test("mappingCardHtml HTML-escapes target ids from mapping.targets", () => {
-    const mappingCardHtml = loadMappingCard();
-    const html = mappingCardHtml({
-      enabled: true,
-      targets: [{ id: "<script>alert(1)</script>", supportedEfforts: [] }],
-      mappings: [],
-    });
-    expect(html).not.toContain("<script>alert(1)</script>");
-    expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
-  });
-
-  test('mappingCardHtml never renders the word "ultra"', () => {
-    const mappingCardHtml = loadMappingCard();
-    const html = mappingCardHtml({
-      enabled: true,
-      targets: [
-        { id: "gpt-5.6-sol", supportedEfforts: [] },
-        { id: "gpt-5.5", supportedEfforts: [] },
-        { id: "gpt-5.6-terra", supportedEfforts: [] },
-      ],
-      mappings: [
-        { from: "fable", to: "gpt-5.6-sol", effort: { max: "xhigh", high: "high" } },
-        { from: "opus", to: "gpt-5.5" },
-      ],
-    });
-    expect(html.toLowerCase()).not.toContain("ultra");
-  });
-
-  test("mappingCardHtml renders a collapsible summary header (works inside a <details>)", () => {
-    const mappingCardHtml = loadMappingCard();
-    const html = mappingCardHtml({ enabled: false, targets: [], mappings: [] });
-    // A <details> child needs a <summary>; the old <h3> heading would not toggle.
-    expect(html).toContain("<summary>");
-    expect(html).toContain("Model mapping");
-    expect(html).toContain('class="caret"');
-    expect(html).not.toContain("<h3>");
-    // Body content stays intact (enable toggle + save button live in the body).
-    expect(html).toContain('id="mapping-enabled"');
-    expect(html).toContain('id="mapping-save"');
-  });
-});
-
-describe("collapsible settings group", () => {
-  test("mapping + tuning are wrapped in one collapsible Settings group", () => {
-    const html = dashboardHtml();
-    // A single outer <details> holds the config panels.
-    expect(html).toMatch(/<details class="settings-group" id="settings-group">/);
-    expect(html).toContain('class="settings-body"');
-    // Both config panels are themselves nested <details> (independently collapsible).
-    expect(html).toMatch(/<details class="mapping-panel" id="mapping-panel">/);
-    expect(html).toMatch(/<details class="tuning-panel" id="tuning-panel">/);
-    expect(html).not.toContain('id="routing-panel"');
-  });
-
-  test("open state persists in localStorage and edits are guarded from poll clobber", () => {
-    const html = dashboardHtml();
-    // Collapse state persisted per panel under the cmp-open- key namespace.
-    expect(html).toContain("cmp-open-");
-    // The 4s poll must not overwrite a panel the user is mid-editing.
-    expect(html).toContain("settingsDirty");
-    // Poll interval is unchanged (still on its own line for the test harness).
-    expect(html).toContain("setInterval(refresh, 4000)");
-  });
-});
-
-/**
- * Behavioural checks for the client runtime itself: the collapse-persistence
- * init IIFE and the renderSettings anti-clobber guard. There's no browser here,
- * so we evaluate the real dashboard <script> against a controllable fake DOM
- * (per-id elements with open/style/innerHTML + an event registry, a Map-backed
- * localStorage) and exercise the actual code paths — not a reimplementation.
- */
-describe("settings runtime: collapse persistence + anti-clobber", () => {
-  function loadRuntime(
-    presetStore?: Record<string, string>,
-    fetchImpl: unknown = async () => new Response("{}"),
-  ) {
-    const html = dashboardHtml();
-    const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
-    if (!script) throw new Error("dashboard <script> block not found");
-    const stubbed = script
-      .replace(/^refresh\(\);$/m, "")
-      .replace(/^setInterval\(refresh, 4000\);$/m, "");
-    const els: Record<string, any> = {};
-    const makeEl = (id: string) => {
-      const listeners: Record<string, Array<(e: unknown) => void>> = {};
-      return {
-        id, open: false, innerHTML: "", style: {} as Record<string, string>,
-        addEventListener(type: string, fn: (e: unknown) => void) { (listeners[type] ||= []).push(fn); },
-        setAttribute() {}, getAttribute() { return null; }, textContent: "",
-        contains(node: any) { return !!node && node.__ownerId === id; },
-        fire(type: string) { (listeners[type] || []).forEach((fn) => fn({})); },
-      };
-    };
-    const document = {
-      getElementById: (id: string) => (els[id] ||= makeEl(id)),
-      querySelectorAll: () => [] as unknown[],
-      documentElement: makeEl("html"),
-      activeElement: null as any,
-    };
-    const store = new Map<string, string>(Object.entries(presetStore || {}));
-    const localStorage = {
-      getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
-      setItem: (k: string, v: string) => { store.set(k, String(v)); },
-    };
-    const factory = new Function(
-      "document", "localStorage", "matchMedia", "fetch",
-      `${stubbed}\nreturn {
-        refresh,
-        wireTuning,
-        tuningPanelHtml,
-        renderSettings,
-        finishSettingsSave: typeof finishSettingsSave === "undefined" ? undefined : finishSettingsSave,
-        getDirty: () => settingsDirty,
-      };`,
-    );
-    const api = factory(document, localStorage, () => ({ matches: false }), fetchImpl);
-    return { api, els, store, document };
-  }
-
-  test("taper input rejects zero locally without rejecting positive custom values", () => {
-    let requests = 0;
-    const { api, els, document } = loadRuntime({}, async () => {
-      requests++;
-      return Response.json({ ok: true });
-    });
-    const rendered = api.tuningPanelHtml({ headroomTaperStart: 0.2 });
-    const inputTag = rendered.match(/<input[^>]*data-tuning="headroomTaperStart"[^>]*>/)![0];
-    const min = inputTag.match(/min="([^"]+)"/)![1];
-    const max = inputTag.match(/max="([^"]+)"/)![1];
-    const input = {
-      value: "0",
-      getAttribute: (key: string) => ({ min, max, "data-tuning": "headroomTaperStart" })[key as "min" | "max" | "data-tuning"] ?? null,
-    };
-    document.querySelectorAll = () => [input];
-    api.wireTuning();
-    els["tuning-apply"].fire("click");
-    expect(requests).toBe(0);
-    expect(els["tuning-status"].textContent).toBe("out of range");
-    expect(Number(min)).toBeGreaterThan(0);
-    expect(Number(min)).toBeLessThanOrEqual(0.001);
-  });
-
-  test("restores each panel's open state from localStorage (collapsed by default)", () => {
-    const { els } = loadRuntime({ "cmp-open-settings-group": "1" });
-    expect(els["settings-group"].open).toBe(true);   // restored from storage
-    expect(els["mapping-panel"].open).toBe(false);    // default: collapsed
-    expect(els["tuning-panel"].open).toBe(false);
-  });
-
-  test("persists a panel's open state on toggle", () => {
-    const { els, store } = loadRuntime();
-    els["mapping-panel"].open = true;
-    els["mapping-panel"].fire("toggle");
-    expect(store.get("cmp-open-mapping-panel")).toBe("1");
-    els["mapping-panel"].open = false;
-    els["mapping-panel"].fire("toggle");
-    expect(store.get("cmp-open-mapping-panel")).toBe("0");
-  });
-
-  test("renderSettings hides an empty panel and shows/wires one with content", () => {
-    const { api, els } = loadRuntime();
-    expect(api.renderSettings("mapping-panel", "", {}, () => {})).toBe(false);
-    expect(els["mapping-panel"].style.display).toBe("none");
-    let wired = 0;
-    expect(api.renderSettings("mapping-panel", "<summary>M</summary>", { v: 1 }, () => wired++)).toBe(true);
-    expect(els["mapping-panel"].style.display).toBe("block");
-    expect(els["mapping-panel"].innerHTML).toContain("<summary>M</summary>");
-    expect(wired).toBe(1);
-  });
-
-  test("a dirty panel is never re-rendered by a poll — in-progress edits survive", () => {
-    const { api, els } = loadRuntime();
-    api.renderSettings("mapping-panel", "<summary>original</summary>", { v: 1 }, () => {});
-    // User edits: a change event bubbles to the panel and flips its dirty flag.
-    els["mapping-panel"].fire("change");
-    expect(api.getDirty()["mapping-panel"]).toBe(true);
-    // A later poll brings NEW server data — the guard must leave the DOM alone.
-    let wired = 0;
-    api.renderSettings("mapping-panel", "<summary>server</summary>", { v: 2 }, () => wired++);
-    expect(els["mapping-panel"].innerHTML).toContain("original");
-    expect(els["mapping-panel"].innerHTML).not.toContain("server");
-    expect(wired).toBe(0);
-  });
-
-  test("a focused panel is not re-rendered (protects an open native <select>)", () => {
-    const { api, els, document } = loadRuntime();
-    api.renderSettings("tuning-panel", "<summary>a</summary>", { v: 1 }, () => {});
-    document.activeElement = { __ownerId: "tuning-panel" };
-    api.renderSettings("tuning-panel", "<summary>b</summary>", { v: 2 }, () => {});
-    expect(els["tuning-panel"].innerHTML).toContain("a");
-    expect(els["tuning-panel"].innerHTML).not.toContain("b");
-  });
-
-  test("unchanged data is a no-op re-render (no 4s flicker or re-wire)", () => {
-    const { api } = loadRuntime();
-    let wired = 0;
-    const data = { v: 1 };
-    api.renderSettings("mapping-panel", "<summary>x</summary>", data, () => wired++);
-    api.renderSettings("mapping-panel", "<summary>x</summary>", data, () => wired++);
-    expect(wired).toBe(1);
-  });
-
-  test("a rejected settings update keeps the form dirty and reports rejection", () => {
-    const { api, els, document } = loadRuntime();
-    api.renderSettings("mapping-panel", "<summary>draft</summary>", { v: 1 }, () => {});
-    els["mapping-panel"].fire("change");
-    const status = document.getElementById("mapping-status");
-
-    expect(api.finishSettingsSave).toBeTypeOf("function");
-    expect(api.finishSettingsSave("mapping-panel", { ok: false }, status)).toBe(false);
-    expect(api.getDirty()["mapping-panel"]).toBe(true);
-    expect(status.textContent).toBe("rejected");
-  });
-
-  test("global priority headings do not label an Anthropic-only tier as universally active", async () => {
-    const status = {
-      accounts: [
-        baseAccount({ name: "claude-reserve", provider: "anthropic", priority: 110 }),
-        baseAccount({ name: "codex-primary", provider: "openai", priority: 100 }),
-      ],
-      routing: { tiers: [], nextPick: { account: "claude-reserve" }, activeTier: 110, candidates: [], busy: [] },
-      tuning: { fiveHourExp: 1, loadSlope: 1, urgencyDecay: 0.5, minHeadroom: 0.1 },
-      mapping: { enabled: false, targets: [], mappings: [] },
-      usageWindowMs: 18_000_000,
-    };
-    const fetchImpl = async () => ({ json: async () => status });
-    const { api, document } = loadRuntime(undefined, fetchImpl);
-
-    await api.refresh();
-
-    const html = document.getElementById("grid").innerHTML;
-    expect(html.indexOf("Priority 100")).toBeLessThan(html.indexOf("Priority 110"));
-    expect(html).not.toContain(" · active");
-  });
-
-  test("an account priority edit survives a status poll until it is explicitly saved", async () => {
-    const status = {
-      accounts: [baseAccount()],
-      routing: { tiers: [], nextPick: null, activeTier: null, candidates: [], busy: [] },
-      tuning: { fiveHourExp: 1, loadSlope: 1, urgencyDecay: 0.5, minHeadroom: 0.1 },
-      mapping: { enabled: false, targets: [], mappings: [] },
-      usageWindowMs: 18_000_000,
-    };
-    const fetchImpl = async () => ({ json: async () => status });
-    const { api, document } = loadRuntime(undefined, fetchImpl);
-    const grid = document.getElementById("grid");
-    grid.innerHTML = "priority draft";
-    grid.fire("input");
-
-    await api.refresh();
-
-    expect(grid.innerHTML).toBe("priority draft");
-    expect(document.getElementById("p-available").innerHTML).toBe("available <b>1</b>");
-  });
-test("a stale status response cannot overwrite a newer preview context", async () => {
-  let release!: (value: any) => void;
-  let calls = 0;
-  const fetchImpl = async () => {
-    if (++calls === 1) return await new Promise<any>((resolve) => { release = resolve; });
-    return { json: async () => ({ accounts: [baseAccount({ name: "new-context" })] }) };
-  };
-  const { api, document } = loadRuntime(undefined, fetchImpl);
-  const older = api.refresh();
-  await api.refresh();
-  release({ json: async () => ({ accounts: [baseAccount({ name: "old-context" })] }) });
-  await older;
-  expect(document.getElementById("grid").innerHTML).toContain("new-context");
-  expect(document.getElementById("grid").innerHTML).not.toContain("old-context");
-});
-
-});
-
-test("dashboard exposes one model-family preview and no provider-separated routing panel", () => {
+test("assembled document contains one executable, self-contained script", () => {
   const html = dashboardHtml();
-  expect(html).toContain('id="routing-model"');
-  expect(html).not.toContain('id="routing-provider"');
-  expect(html).not.toContain('id="routing-panel"');
-  expect(html).not.toContain("Preview provider");
-  expect(html).toContain("Account-wide");
-  expect(html).toContain('data-tuning');
-  expect(html).toContain("headroomTaperStart");
-  expect(html).not.toContain("urgencyDecay");
+  const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)];
+  expect(scripts).toHaveLength(1);
+  expect(() => new Function(scripts[0]![1]!)).not.toThrow();
+  expect(html).not.toMatch(/<script[^>]+src=/);
+  expect(html).not.toMatch(/<link[^>]+stylesheet/);
+});
+
+test("emitted factories execute independent of the TypeScript module scope", () => {
+  let runtime: any;
+  const script = dashboardClientScript().replace(
+    "initializeDashboard(shared, presentation, forms, createController);",
+    "capture(shared, presentation, forms, createController);",
+  );
+  new Function("capture", script)((shared: unknown, presentation: unknown, forms: unknown, createController: unknown) => {
+    runtime = { shared, presentation, forms, createController };
+  });
+  const usage = { lastUsageCheckAt: null, lastUsageCheckError: null };
+  const value = runtime.presentation.projectWindow({ key: "7d-fable", model: "fable", utilization: 0.9, reset: 1 }, usage, 2);
+  expect(value).toMatchObject({ percent: 0, resetAt: 604800001, provenance: "assumed-reset" });
+  const controller = runtime.createController({ now: () => 2, render() {} }, runtime.forms, runtime.shared);
+  expect(controller.getState().view).toBe("overview");
+  expect(controller.getState().snapshot).toBeNull();
 });

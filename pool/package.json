@@ -29,6 +29,7 @@
   "license": "MIT",
   "devDependencies": {
     "@types/bun": "latest",
+    "playwright": "^1.63.0",
     "typescript": "^5.6.0"
   }
 }

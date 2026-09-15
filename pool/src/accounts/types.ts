@@ -82,7 +82,7 @@ export interface RateLimitSnapshot {
 }
 
 /** Duration-shaped key tokens ("5h", "7d", "30d", …) as opposed to model scopes. */
-const DURATION_TOKEN = /^\d+(?:h|hr|hrs|d|day|days|w|wk|mo|min|m)$/i;
+export const DURATION_TOKEN = /^\d+(?:h|hr|hrs|d|day|days|w|wk|mo|min|m)$/i;
 
 /**
  * Model family a unified-window key is scoped to, or null for account-wide

@@ -31,6 +31,7 @@ import type { Account } from "../accounts/types.ts";
 import { modelFamilyOf, MODEL_FAMILIES } from "../accounts/types.ts";
 import { runWithFailover, type FailoverHooks } from "./failover.ts";
 import { dashboardHtml } from "./dashboard.ts";
+import type { DashboardStatus } from "./dashboard-types.ts";
 import { proxyAnthropicMessages, extractSessionKey, UPSTREAM_REJECTED_HEADER } from "../upstream/anthropic.ts";
 import { sweepUsageRefresh } from "../upstream/usage.ts";
 import { anyAnthropicAccessToken } from "../upstream/oauth-token.ts";
@@ -65,6 +66,7 @@ export function startServer(config: Config): void {
   const mappingTargets = modelTable
     .filter((route) => route.provider === "openai")
     .map((route) => ({ id: route.id, supportedEfforts: supportedEffortsFor(route) }));
+  const anthropicTargets = modelTable.filter(route => route.provider === "anthropic").map(route => route.id);
   const dashboard = dashboardHtml();
 
   // Sweep idle session pins so load counts decay even when traffic stops.
@@ -130,10 +132,12 @@ export function startServer(config: Config): void {
             enabled: mappingState.config.mappingEnabled,
             mappings: mappingState.config.mappings,
             targets: mappingTargets,
+            // Additive metadata: preserve the existing OpenAI-only targets list.
+            anthropicTargets,
           },
           usageWindowMs: config.usageWindowMs,
           now,
-        });
+        } satisfies DashboardStatus);
       }
       if (path === "/api/routing") {
         if (req.method !== "POST") return json({ error: "method not allowed" }, 405);
