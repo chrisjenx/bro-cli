@@ -267,6 +267,62 @@ describe("stripCodexThinking", () => {
     expect(out.messages.map((m) => m.role)).toEqual(["user", "user"]);
   });
 
+  test("does not strand a mid-conversation system message before a user turn", () => {
+    // A session that ran on Codex replays assistant turns whose only content is
+    // a stashed thinking block. Dropping one must not leave a preceding
+    // role:"system" message followed by a user turn, which Anthropic rejects
+    // with "role 'system' must precede an 'assistant' message or end the array".
+    const out = stripCodexThinking({
+      messages: [
+        { role: "user", content: "go" },
+        { role: "system", content: "session title reminder" },
+        { role: "assistant", content: [{ type: "thinking", thinking: "", signature: stash }] },
+        { role: "user", content: "next" },
+      ],
+    }) as { messages: Array<Record<string, unknown>> };
+    expect(out.messages.map((m) => m.role)).toEqual(["user", "user"]);
+  });
+
+  test("keeps a system message that still precedes an assistant turn", () => {
+    const out = stripCodexThinking({
+      messages: [
+        { role: "user", content: "go" },
+        { role: "assistant", content: [{ type: "thinking", thinking: "", signature: stash }] },
+        { role: "system", content: "operator instruction" },
+        { role: "assistant", content: [{ type: "text", text: "hi" }] },
+      ],
+    }) as { messages: Array<Record<string, unknown>> };
+    expect(out.messages.map((m) => m.role)).toEqual(["user", "system", "assistant"]);
+  });
+
+  test("keeps a system message that ends the array", () => {
+    const out = stripCodexThinking({
+      messages: [
+        { role: "user", content: "go" },
+        { role: "assistant", content: [{ type: "thinking", thinking: "", signature: stash }] },
+        { role: "user", content: "next" },
+        { role: "system", content: "trailing directive" },
+      ],
+    }) as { messages: Array<Record<string, unknown>> };
+    expect(out.messages.map((m) => m.role)).toEqual(["user", "user", "system"]);
+  });
+
+  test("keeps an effort-only system message sitting in front of a user turn", () => {
+    // A mid-conversation system message with empty content carries an
+    // output_config effort change and is exempt from the placement rule, so the
+    // strand repair must not delete it.
+    const out = stripCodexThinking({
+      messages: [
+        { role: "user", content: "go" },
+        { role: "assistant", content: [{ type: "thinking", thinking: "", signature: stash }] },
+        { role: "system", content: [], output_config: { effort: "low" } },
+        { role: "user", content: "next" },
+      ],
+    }) as { messages: Array<Record<string, unknown>> };
+    expect(out.messages.map((m) => m.role)).toEqual(["user", "system", "user"]);
+    expect(out.messages[1]!.output_config).toEqual({ effort: "low" });
+  });
+
   test("returns non-object and thinking-free bodies unchanged", () => {
     expect(stripCodexThinking(null)).toBeNull();
     const clean = { messages: [{ role: "user", content: "hi" }], stream: true };

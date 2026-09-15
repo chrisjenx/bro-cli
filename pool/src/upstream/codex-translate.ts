@@ -232,8 +232,10 @@ function foldToolResultContent(content: unknown): string {
  * this, a session that ran on a Codex model and then switches to a claude-*
  * model replays fake-signed thinking blocks that Anthropic rejects with a
  * retry-stable 400 during thinking-enabled tool-use continuations. Assistant
- * messages emptied by the strip are dropped. Non-object bodies and bodies with
- * nothing to strip are returned unchanged; the input is never mutated.
+ * messages emptied by the strip are dropped, along with any mid-conversation
+ * system message the drop would strand in front of a user turn. Non-object
+ * bodies and bodies with nothing to strip are returned unchanged; the input is
+ * never mutated.
  */
 export function stripCodexThinking(body: unknown): unknown {
   if (body == null || typeof body !== "object" || Array.isArray(body)) return body;
@@ -251,14 +253,35 @@ export function stripCodexThinking(body: unknown): unknown {
   );
   if (!needsStrip) return body;
 
+  // Only messages *we* empty are dropped. A content array that arrived empty is
+  // the caller's own shape — notably the effort-only mid-conversation system
+  // message — and is forwarded untouched.
   const stripped = messages.flatMap((m) => {
     const msg = m as Record<string, unknown>;
-    if (!Array.isArray(msg?.content)) return [m];
+    if (!Array.isArray(msg?.content) || msg.content.length === 0) return [m];
     const content = (msg.content as Array<Record<string, unknown>>).filter((b) => !isOurs(b));
     if (content.length === 0) return [];
     return [{ ...msg, content }];
   });
-  return { ...(body as Record<string, unknown>), messages: stripped };
+
+  // A mid-conversation role:"system" message must precede an assistant turn or
+  // end the array. Dropping an emptied assistant turn above can strand one in
+  // front of a user turn, which Anthropic rejects with a retry-stable 400.
+  // Effort-only system messages (empty content) are exempt from that placement
+  // rule, so they stay wherever the caller put them. Building the result back to
+  // front collapses a run of stranded system messages in one pass.
+  const repaired: unknown[] = [];
+  for (let i = stripped.length - 1; i >= 0; i--) {
+    const msg = stripped[i] as Record<string, unknown> | undefined;
+    const exempt = Array.isArray(msg?.content) && msg.content.length === 0;
+    const next = repaired[repaired.length - 1] as Record<string, unknown> | undefined;
+    // `repaired` empty means this message ends the array, which is allowed.
+    const stranded = repaired.length > 0 && next?.role !== "assistant";
+    if (msg?.role === "system" && !exempt && stranded) continue;
+    repaired.push(stripped[i]);
+  }
+  repaired.reverse();
+  return { ...(body as Record<string, unknown>), messages: repaired };
 }
 
 /** Parses a thinking-block signature back into the Codex reasoning stash we
