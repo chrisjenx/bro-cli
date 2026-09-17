@@ -114,6 +114,9 @@ export function dashboardShell(css: string, script: string): string {
 <th>
 <button data-sort="sevenDay">7d used</button>
 </th>
+<th class="overview-seven-reset">
+<button data-sort="sevenDayReset">7d resets</button>
+</th>
 <th class="overview-reset">
 <button data-sort="nextReset">Next reset</button>
 </th>

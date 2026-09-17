@@ -42,3 +42,11 @@ test("the account drawer offers a recheck control posting to /api/recheck", () =
 test("the status filter can isolate billing-blocked accounts", () => {
   expect(dashboard.dashboardHtml()).toContain('<option value="billing">');
 });
+
+test("the overview table carries a sortable 7d reset column", () => {
+  expect(dashboard.dashboardHtml()).toContain('data-sort="sevenDayReset"');
+  expect(dashboard.dashboardHtml()).toContain("7d resets");
+  // The row template needs a matching cell or the header sorts a column that
+  // never renders a value.
+  expect(dashboard.dashboardClientScript()).toContain("overview-seven-reset");
+});

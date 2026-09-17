@@ -877,7 +877,7 @@ dialog::backdrop {
     grid-template-columns:repeat(2,minmax(0,1fr));
     gap:10px;
   }
-  .overview-reset,.overview-sessions,.overview-inflight {
+  .overview-seven-reset,.overview-reset,.overview-sessions,.overview-inflight {
     display:none;
   }
   .toolbar {

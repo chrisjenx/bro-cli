@@ -70,6 +70,7 @@ export function createDashboardPresentation(durationMs: (key: string) => number 
         case "status": return row.statusLabel;
         case "fiveHour": return row.fiveHour.percent;
         case "sevenDay": return row.sevenDay.percent;
+        case "sevenDayReset": return row.sevenDay.resetAt;
         case "nextReset": return row.nextReset?.at ?? null;
         default: return row.account[sort.key] ?? null;
       }

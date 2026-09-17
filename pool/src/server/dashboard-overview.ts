@@ -15,7 +15,7 @@ function createOverviewView(root, controller, presentation) {
     controller.setSort({ key: button.dataset.sort, direction: current.key === button.dataset.sort && current.direction === 'asc' ? 'desc' : 'asc' });
   }));
   function createRow(name) {
-    const row = element('<tr><td><button type="button" class="account-name" data-open-account></button><span class="account-meta"></span><span class="account-meta account-tweaks" data-row-tweaks></span><span class="quota-note" data-row-warning></span></td><td><span class="status-label"><span class="status-icon" aria-hidden="true"></span><span data-status-text></span></span></td><td data-five></td><td data-seven></td><td class="overview-reset"></td><td class="overview-sessions"></td><td class="overview-inflight"></td></tr>');
+    const row = element('<tr><td><button type="button" class="account-name" data-open-account></button><span class="account-meta"></span><span class="account-meta account-tweaks" data-row-tweaks></span><span class="quota-note" data-row-warning></span></td><td><span class="status-label"><span class="status-icon" aria-hidden="true"></span><span data-status-text></span></span></td><td data-five></td><td data-seven></td><td class="overview-seven-reset"></td><td class="overview-reset"></td><td class="overview-sessions"></td><td class="overview-inflight"></td></tr>');
     row.dataset.account = name;
     row.querySelector('[data-five]').append(meterElement()); row.querySelector('[data-seven]').append(meterElement());
     bindAccountRow(row, row.querySelector('[data-open-account]'), controller, name); return row;
@@ -24,7 +24,8 @@ function createOverviewView(root, controller, presentation) {
     patchInput(search, state.filters.search); patchInput(provider, state.filters.provider); patchInput(status, state.filters.status);
     root.querySelector('[data-loading]').hidden = !!state.snapshot;
     if (!state.snapshot) return;
-    const model = presentation.overviewModel(state.snapshot, state.filters, state.sort, Date.now());
+    const now = Date.now();
+    const model = presentation.overviewModel(state.snapshot, state.filters, state.sort, now);
     const m = model.metrics;
     setText(root.querySelector('[data-metric="available"]'), m.available + ' / ' + m.total);
     setText(root.querySelector('[data-metric="sessions"]'), presentation.number(m.activeSessions));
@@ -56,7 +57,8 @@ function createOverviewView(root, controller, presentation) {
       patchStatus(row.querySelector('.status-label'), data.statusKey, data.statusLabel);
       patchMeter(row.querySelector('[data-five] .quota'), data.fiveHour, presentation);
       patchMeter(row.querySelector('[data-seven] .quota'), data.sevenDay, presentation);
-      setText(row.querySelector('.overview-reset'), data.nextReset ? data.nextReset.key + ' · ' + presentation.relative(data.nextReset.at, Date.now(), true) : '—');
+      setText(row.querySelector('.overview-seven-reset'), presentation.relative(data.sevenDay.resetAt, now, true));
+      setText(row.querySelector('.overview-reset'), data.nextReset ? data.nextReset.key + ' · ' + presentation.relative(data.nextReset.at, now, true) : '—');
       setText(row.querySelector('.overview-sessions'), presentation.number(a.activeSessions));
       setText(row.querySelector('.overview-inflight'), presentation.number(a.inFlight));
       ordered.push(row);

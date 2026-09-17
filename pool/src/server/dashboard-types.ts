@@ -33,7 +33,7 @@ export interface OverviewFilters {
   status: "all" | StatusKey | "unavailable" | "usage-warning";
 }
 export interface OverviewSort {
-  key: "name" | "status" | "fiveHour" | "sevenDay" | "nextReset" | "activeSessions" | "inFlight";
+  key: "name" | "status" | "fiveHour" | "sevenDay" | "sevenDayReset" | "nextReset" | "activeSessions" | "inFlight";
   direction: "asc" | "desc";
 }
 export interface WindowView {

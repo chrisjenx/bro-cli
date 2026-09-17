@@ -102,3 +102,27 @@ test("a non-default priority alone is surfaced without a weight chip", () => {
   const row = p().overviewModel(statusFixture([a]), filters, sort, now).rows[0]!;
   expect(row.routingTweaks).toEqual(["P5"]);
 });
+
+test("the 7d reset sorts on its own window, not the soonest one", () => {
+  // Chosen so nextReset and the 7d reset disagree: "a-soon" resets its 5h
+  // first but its 7d last, so a shared sort key would collapse the two.
+  const win = (key: string, reset: number) => window({ key, utilization: 0.5, reset });
+  const soon = accountFixture("a-soon", {}, { rateLimitStatus: { updatedAt: now, unifiedStatus: "allowed",
+    windows: [win("5h", now + 1_000), win("7d", now + 900_000_000)] } });
+  const late = accountFixture("z-late", {}, { rateLimitStatus: { updatedAt: now, unifiedStatus: "allowed",
+    windows: [win("5h", now + 2_000), win("7d", now + 100_000_000)] } });
+  const s = statusFixture([soon, late]);
+  expect(p().overviewModel(s, filters, { key: "nextReset", direction: "asc" }, now).rows.map(r => r.account.name))
+    .toEqual(["a-soon", "z-late"]);
+  expect(p().overviewModel(s, filters, { key: "sevenDayReset", direction: "asc" }, now).rows.map(r => r.account.name))
+    .toEqual(["z-late", "a-soon"]);
+});
+
+test("an unreported 7d reset sorts last rather than ahead of real timestamps", () => {
+  const dated = accountFixture("a-dated", {}, { rateLimitStatus: { updatedAt: now, unifiedStatus: "allowed",
+    windows: [window({ key: "7d", utilization: 0.5, reset: now + 100_000 })] } });
+  const bare = accountFixture("b-bare");
+  const m = p().overviewModel(statusFixture([bare, dated]), filters, { key: "sevenDayReset", direction: "asc" }, now);
+  expect(m.rows.map(r => r.account.name)).toEqual(["a-dated", "b-bare"]);
+  expect(m.rows[1]!.sevenDay.resetAt).toBeNull();
+});
