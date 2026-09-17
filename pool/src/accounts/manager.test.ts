@@ -2578,3 +2578,100 @@ for (const routingStrategy of ["weighted", "expiring", "headroom"] as const) tes
     }
   } finally { rmSync(poolDir, { recursive: true, force: true }); }
 });
+
+describe("billing blocks", () => {
+  test("markBillingBlocked sidelines the account with a billing reason", () => {
+    const { mgr } = tempPool(["a"]);
+    mgr.markBillingBlocked("a", "OAuth authentication is currently not allowed for this organization.");
+    const a = mgr.getAccount("a");
+    expect(a.available).toBe(false);
+    expect(a.billingBlocked).toBe(true);
+    expect(a.unavailableReason).toContain("Subscription or organization access rejected");
+  });
+
+  test("a billing block re-probes on the normal access-denied cooldown", () => {
+    const { mgr } = tempPool(["a"], undefined, { accessDeniedCooldownMs: 60 * 60 * 1000 });
+    mgr.markBillingBlocked("a", "nope");
+    const usage = mgr.getAccount("a").usage;
+    const mins = Math.round((usage.accessDeniedUntil! - Date.now()) / 60000);
+    expect(mins).toBe(60);
+  });
+
+  test("a fresh usage snapshot clears the billing block", () => {
+    const { mgr } = tempPool(["a"]);
+    mgr.markBillingBlocked("a", "nope");
+    mgr.recordUsageSnapshot("a", { unifiedStatus: "allowed", windows: [], updatedAt: Date.now() });
+    const a = mgr.getAccount("a");
+    expect(a.billingBlocked).toBe(false);
+    expect(a.available).toBe(true);
+  });
+
+  test("a usage probe that started before the block cannot clear it", () => {
+    // The serve path fires a usage refresh just before the request, so a 200
+    // landing after the request's 403 must not un-sideline the account.
+    const { mgr } = tempPool(["a"]);
+    const probeStartedAt = Date.now() - 1000;
+    mgr.markBillingBlocked("a", "nope");
+    mgr.recordUsageSnapshot("a", { unifiedStatus: "allowed", windows: [], updatedAt: Date.now() }, probeStartedAt);
+    const a = mgr.getAccount("a");
+    expect(a.billingBlocked).toBe(true);
+    expect(a.available).toBe(false);
+  });
+
+  test("a later generic 403 stops the account being blamed on billing", () => {
+    const { mgr } = tempPool(["a"]);
+    mgr.markBillingBlocked("a", "nope");
+    mgr.markAccessDenied("a", "Request blocked by safety filter.");
+    const a = mgr.getAccount("a");
+    expect(a.billingBlocked).toBe(false);
+    expect(a.unavailableReason).toContain("refused by Anthropic");
+  });
+
+  test("clearBillingBlock leaves an unrelated access-denial cooldown alone", () => {
+    const { mgr } = tempPool(["a"]);
+    mgr.markAccessDenied("a", "Request blocked by safety filter.");
+    mgr.clearBillingBlock("a");
+    const a = mgr.getAccount("a");
+    expect(a.available).toBe(false);
+    expect(a.usage.accessDeniedUntil).not.toBeNull();
+  });
+
+  test("a served request clears the billing block without a usage check", () => {
+    const { mgr } = tempPool(["a"]);
+    mgr.markBillingBlocked("a", "nope");
+    mgr.recordSuccess("a", { input_tokens: 1, output_tokens: 1 } as any, 0);
+    const a = mgr.getAccount("a");
+    expect(a.billingBlocked).toBe(false);
+    expect(a.available).toBe(true);
+  });
+
+  test("clearBillingBlock re-enables the account immediately", () => {
+    const { mgr } = tempPool(["a"]);
+    mgr.markBillingBlocked("a", "nope");
+    mgr.clearBillingBlock("a");
+    const a = mgr.getAccount("a");
+    expect(a.billingBlocked).toBe(false);
+    expect(a.available).toBe(true);
+    expect(a.usage.accessDeniedUntil).toBeNull();
+  });
+});
+
+test("a billing flag whose cooldown has lapsed is no longer reported as blocked", () => {
+  const { mgr } = tempPool(["a"], undefined, { accessDeniedCooldownMs: 1 });
+  mgr.markBillingBlocked("a", "nope");
+  // The flag itself is sticky, but the cooldown it describes has passed, so the
+  // projection must not keep claiming the account is billing-blocked.
+  const later = Date.now() + 1000;
+  expect(mgr.getAccount("a", false, later).billingBlocked).toBe(false);
+});
+
+test("re-marking a live billing block does not rewrite persisted state", () => {
+  const { poolDir, mgr } = tempPool(["a"]);
+  mgr.markBillingBlocked("a", "nope");
+  const usageFile = join(poolDir, "usage.json");
+  const first = readFileSync(usageFile, "utf8");
+  utimesSync(usageFile, new Date(0), new Date(0));
+  mgr.markBillingBlocked("a", "nope again");
+  // Idempotent: the sweep re-probes every couple of minutes and must not churn the file.
+  expect(readFileSync(usageFile, "utf8")).toBe(first);
+});

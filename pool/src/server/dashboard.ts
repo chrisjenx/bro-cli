@@ -41,7 +41,7 @@ export function dashboardClientScript(): string {
     '"use strict";\n(() => {',
     `const shared = ${safeJson(buildDashboardDescriptors())};`,
     `const durationMs = ${dashboardDurationSource()};`,
-    `const presentation = (${createDashboardPresentation.toString()})(durationMs, (${sortRateLimitWindows.toString()}));`,
+    `const presentation = (${createDashboardPresentation.toString()})(durationMs, (${sortRateLimitWindows.toString()}), { priority: shared.defaultPriority, weight: shared.defaultWeight });`,
     `const MODEL_FAMILIES = shared.families;`,
     `const forms = (${createDashboardForms.toString()})(shared, (${modelFamilyOf.toString()}));`,
     `const createController = (${createDashboardController.toString()});`,

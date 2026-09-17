@@ -107,7 +107,7 @@ for (const strategy of ["headroom", "expiring"] as const) {
         expect.objectContaining({ account: "codex", headroom: 1, activeSessions: 0, inFlight: 0, viable: true, score: 5 }),
       ]);
 
-      const presentation = createDashboardPresentation(windowDurationMs, sortRateLimitWindows);
+      const presentation = createDashboardPresentation(windowDurationMs, sortRateLimitWindows, { priority: 100, weight: 1 });
       const model = presentation.routingModel(status);
       expect(model.candidates.map(row => row.account.name)).toEqual(["claude", "codex"]);
       for (const row of model.candidates) {

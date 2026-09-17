@@ -90,6 +90,7 @@ export function dashboardShell(css: string, script: string): string {
 <option value="cooldown">Cooldown</option>
 <option value="logged-out">Logged out</option>
 <option value="sidelined">Sidelined</option>
+<option value="billing">Billing</option>
 <option value="unavailable">Unavailable</option>
 <option value="usage-warning">Usage warnings</option>
 </select>
@@ -294,6 +295,7 @@ export function dashboardShell(css: string, script: string): string {
 <p data-account-removed class="notice error" hidden>Account removed. These are its last known details; saving is disabled.</p>
 <p data-account-reason class="notice" hidden>
 </p>
+<p data-recheck-row class="recheck-row" hidden><button type="button" data-recheck>Recheck now</button><span data-recheck-status class="muted small"></span></p>
 <h3>Reported usage</h3>
 <div data-detail-windows>
 </div>
@@ -325,7 +327,7 @@ export function dashboardShell(css: string, script: string): string {
 <fieldset data-account-fields class="account-fields">
 <label>Priority<input type="number" name="priority" aria-label="Priority" min="0" step="1">
 </label>
-<label>Weight<input type="number" name="weight" aria-label="Weight" step="any">
+<label>Weight<input type="number" name="weight" aria-label="Weight" step="0.1">
 </label>
 </fieldset>
 <div class="form-actions">

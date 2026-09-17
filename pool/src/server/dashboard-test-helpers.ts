@@ -9,7 +9,7 @@ export function accountFixture(name: string, patch: Partial<Account> = {}, usage
     subscriptionType: "max", rateLimitTier: null, scopes: [], priority: 100, weight: 1,
     activeSessions: 0, inFlight: 0, tokenExpiresAt: FIXTURE_NOW + 3_600_000,
     tokenExpired: false, usage: { ...emptyUsage(FIXTURE_NOW), ...usage },
-    available: true, unavailableReason: null, ...patch,
+    available: true, unavailableReason: null, billingBlocked: false, ...patch,
   };
 }
 export function candidateFixture(account: string, patch: Partial<NonNullable<RoutingSnapshot["candidates"]>[number]> = {}) {

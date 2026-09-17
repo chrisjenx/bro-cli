@@ -139,7 +139,16 @@ export function startServer(config: Config): void {
           now,
         } satisfies DashboardStatus);
       }
-      if (path === "/api/routing") {
+      const POST_HANDLERS: Record<string, ((body: unknown) => Response) | undefined> = {
+        "/api/routing": (body) => handleRoutingUpdate(mgr, body),
+        "/api/recheck": (body) => handleRecheck(mgr, body),
+        "/api/tuning": (body) => handleTuningUpdate(mgr, body),
+        "/api/mappings": (body) => handleMappingsUpdate(mappingState, config.modelsFile, body),
+      };
+      // All four dashboard mutations share one method check and one body parse;
+      // each handler only sees an already-decoded body.
+      const postHandler = POST_HANDLERS[path];
+      if (postHandler) {
         if (req.method !== "POST") return json({ error: "method not allowed" }, 405);
         let body: unknown;
         try {
@@ -147,27 +156,7 @@ export function startServer(config: Config): void {
         } catch {
           return json({ error: { message: "Invalid JSON body" } }, 400);
         }
-        return handleRoutingUpdate(mgr, body);
-      }
-      if (path === "/api/tuning") {
-        if (req.method !== "POST") return json({ error: "method not allowed" }, 405);
-        let body: unknown;
-        try {
-          body = await req.json();
-        } catch {
-          return json({ error: { message: "Invalid JSON body" } }, 400);
-        }
-        return handleTuningUpdate(mgr, body);
-      }
-      if (path === "/api/mappings") {
-        if (req.method !== "POST") return json({ error: "method not allowed" }, 405);
-        let body: unknown;
-        try {
-          body = await req.json();
-        } catch {
-          return json({ error: { message: "Invalid JSON body" } }, 400);
-        }
-        return handleMappingsUpdate(mappingState, config.modelsFile, body);
+        return postHandler(body);
       }
       if (req.method === "GET" && (path === "/v1/models" || path === "/models")) {
         // Claude entries come from Anthropic's own catalog (via any available
@@ -664,13 +653,26 @@ function validateMapping(raw: unknown, table: ModelRoute[]): string | null {
  * account exists and each provided field independently, then persists them.
  * Unauthenticated by design, matching the rest of the dashboard/status routes.
  */
-export function handleRoutingUpdate(mgr: AccountManager, body: unknown): Response {
-  const b = (body ?? {}) as { account?: unknown; priority?: unknown; weight?: unknown };
-  const account = typeof b.account === "string" ? b.account : "";
-  const { priority, weight } = b;
+/**
+ * Resolve the `account` field of a dashboard POST body, or the 400 to return.
+ * Shared so every handler rejects an unknown account with identical wording.
+ */
+function resolveAccount(mgr: AccountManager, body: unknown): { account: string } | Response {
+  const account = typeof (body as { account?: unknown } | null)?.account === "string"
+    ? (body as { account: string }).account
+    : "";
   if (!account || !mgr.listNames().includes(account)) {
     return json({ error: { message: `Unknown account: ${account || "(missing)"}` } }, 400);
   }
+  return { account };
+}
+
+export function handleRoutingUpdate(mgr: AccountManager, body: unknown): Response {
+  const b = (body ?? {}) as { account?: unknown; priority?: unknown; weight?: unknown };
+  const { priority, weight } = b;
+  const resolved = resolveAccount(mgr, body);
+  if (resolved instanceof Response) return resolved;
+  const { account } = resolved;
   if (priority === undefined && weight === undefined) {
     return json({ error: { message: "provide priority and/or weight" } }, 400);
   }
@@ -683,6 +685,19 @@ export function handleRoutingUpdate(mgr: AccountManager, body: unknown): Respons
   if (priority !== undefined) mgr.setPriority(account, priority);
   if (weight !== undefined) mgr.setWeight(account, weight);
   return json({ ok: true, account, priority: mgr.priorityFor(account), weight: mgr.weightFor(account) });
+}
+
+/**
+ * Clear an account's billing block and its cooldown on demand, so a
+ * reactivated subscription goes back into rotation without restarting the
+ * pool. The next usage check re-probes immediately; if the account is still
+ * not entitled, the block simply comes back.
+ */
+export function handleRecheck(mgr: AccountManager, body: unknown): Response {
+  const resolved = resolveAccount(mgr, body);
+  if (resolved instanceof Response) return resolved;
+  mgr.clearBillingBlock(resolved.account);
+  return json({ ok: true, account: resolved.account });
 }
 
 /**

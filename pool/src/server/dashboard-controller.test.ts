@@ -208,3 +208,21 @@ test("two-form save-and-leave keeps the view if the second save fails", async ()
   expect(h.controller.getState().snapshot!.mapping.enabled).toBe(true);
   expect(h.controller.getState().forms.get("tuning")!.phase).toBe("error"); h.controller.stop();
 });
+
+test("recheckAccount posts the account and refreshes the snapshot", async () => {
+  const h = harness();
+  await h.boot(statusFixture([accountFixture("blocked", { available: false, billingBlocked: true })]));
+  const before = h.requests.length;
+
+  const done = h.controller.recheckAccount("blocked");
+  const posted = h.requests[before]!;
+  expect(posted.url).toBe("/api/recheck");
+  expect(posted.init!.method).toBe("POST");
+  expect(JSON.parse(String(posted.init!.body))).toEqual({ account: "blocked" });
+
+  h.respond(before, { ok: true, account: "blocked", available: true, billingBlocked: false });
+  await done;
+  // A recheck is only meaningful if the view reloads to show the new state.
+  expect(h.requests.length).toBeGreaterThan(before + 1);
+  expect(h.requests[before + 1]!.url).toContain("/api/status");
+});

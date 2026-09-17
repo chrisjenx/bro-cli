@@ -12,6 +12,18 @@ function createDrawerView(root, controller, presentation, shared) {
   root.querySelector('[data-cancel-account]').addEventListener('click', () => controller.cancelForm('account:' + accountName));
   root.querySelector('[aria-label="Close account details"]').addEventListener('click', () => controller.requestTransition({ kind: 'close-drawer' }));
   root.querySelector('[data-view-routing]').addEventListener('click', () => controller.requestTransition({ kind: 'view', view: 'routing' }));
+  const recheck = root.querySelector('[data-recheck]'), recheckStatus = root.querySelector('[data-recheck-status]');
+  recheck.addEventListener('click', async () => {
+    if (!accountName) return;
+    const name = accountName;
+    recheck.disabled = true; setText(recheckStatus, 'Rechecking...');
+    const ok = await controller.recheckAccount(name);
+    // Re-enable unconditionally: the drawer may have closed or switched account
+    // mid-flight, and a button left disabled never comes back on its own.
+    recheck.disabled = false;
+    if (accountName !== name) return;
+    setText(recheckStatus, ok ? '' : 'Recheck failed; see pool logs.');
+  });
   root.addEventListener('cancel', event => { event.preventDefault(); controller.requestTransition({ kind: 'close-drawer' }); });
   root.addEventListener('click', event => {
     if (event.target !== root) return;
@@ -33,11 +45,19 @@ function createDrawerView(root, controller, presentation, shared) {
     }
     const detail = presentation.accountDetailModel(state.snapshot, state.drawer.lastKnownAccount, Date.now());
     const a = detail.account, u = a.usage;
-    if (accountName !== a.name) { accountName = a.name; root.scrollTop = 0; }
+    // The click handler always re-enables the button, so only the status text
+    // needs clearing here — a switch between two blocked accounts leaves the
+    // row visible, so the hidden-transition below would not fire.
+    if (accountName !== a.name) { accountName = a.name; root.scrollTop = 0; setText(recheckStatus, ''); }
     setText(root.querySelector('#account-title'), a.name);
     setText(root.querySelector('[data-account-meta]'), (a.provider === 'openai' ? 'OpenAI' : 'Anthropic') + ' · ' + (a.subscriptionType || 'Unknown plan') + ' · ' + detail.status.label);
     root.querySelector('[data-account-removed]').hidden = !detail.removed;
     const reason = root.querySelector('[data-account-reason]'); reason.hidden = !a.unavailableReason; setText(reason, a.unavailableReason || '');
+    // Only a live billing block is clearable by hand; every other sideline has
+    // its own reset. Gated on the same condition as the Billing status, so the
+    // row disappears once the block's cooldown has lapsed.
+    const recheckRow = root.querySelector('[data-recheck-row]'), blocked = detail.status.key === 'billing';
+    if (recheckRow.hidden !== !blocked) { recheckRow.hidden = !blocked; setText(recheckStatus, ''); }
     const parent = root.querySelector('[data-detail-windows]');
     const keys = new Set(detail.windows.map(w => w.key + '/' + (w.model || '')));
     for (const [key, node] of windows) if (!keys.has(key)) { node.remove(); windows.delete(key); }

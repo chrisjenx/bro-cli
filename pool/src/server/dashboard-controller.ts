@@ -210,7 +210,23 @@ export function createDashboardController(port: BrowserPort, forms: DashboardFor
       return applyTransition(next);
     } finally { resolving = false; render(); }
   }
-  return { start, stop, refresh, setContext, editForm, cancelForm, saveForm, requestTransition, resolveTransition,
+  /**
+   * Clear an account's billing block on demand and reload, so a reactivated
+   * subscription can be put back in rotation without restarting the pool.
+   */
+  async function recheckAccount(account: string): Promise<boolean> {
+    if (stopped) return false;
+    try {
+      await request("/api/recheck", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ account }) }, new AbortController());
+      // Fire-and-forget like saveForm: the caller only waits on the POST, so a
+      // slow status poll never holds the button in its disabled state.
+      void refresh("save");
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return { start, stop, refresh, setContext, editForm, cancelForm, saveForm, requestTransition, resolveTransition, recheckAccount,
     getState: (): Readonly<DashboardState> => state,
     setFilters(filters: OverviewFilters) { state.filters = { ...filters }; render(); },
     setSort(sort: OverviewSort) { state.sort = { ...sort }; render(); },

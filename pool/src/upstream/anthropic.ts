@@ -24,6 +24,7 @@ import {
   stringProp,
   numberProp,
   isRateLimit as isRateLimitShared,
+  isEntitlementRefusal,
   retryAfterMs,
   overloadBackoffMs,
   sleepWithAbort,
@@ -238,7 +239,10 @@ async function attemptOnce(
       return { kind: "retry", reason };
     }
     if (reason.accessDenied) {
-      mgr.markAccessDenied(account.name, reason.message);
+      // An entitlement refusal gets its own marker so the dashboard can name the
+      // cause; the cooldown is identical either way, so it still self-heals.
+      if (isEntitlementRefusal(reason.message)) mgr.markBillingBlocked(account.name, reason.message);
+      else mgr.markAccessDenied(account.name, reason.message);
       return { kind: "retry", reason };
     }
     mgr.recordError(account.name, reason.message);

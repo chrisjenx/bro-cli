@@ -3,7 +3,7 @@ import { windowDurationMs, sortRateLimitWindows, type RateLimitWindow } from "..
 import { accountFixture, candidateFixture, FIXTURE_NOW as now, statusFixture } from "./dashboard-test-helpers.ts";
 const { createDashboardPresentation } = await import("./dashboard-presentation.ts").catch(() => ({ createDashboardPresentation: undefined }));
 
-const p = () => { expect(typeof createDashboardPresentation).toBe("function"); return createDashboardPresentation!(windowDurationMs, sortRateLimitWindows); };
+const p = () => { expect(typeof createDashboardPresentation).toBe("function"); return createDashboardPresentation!(windowDurationMs, sortRateLimitWindows, { priority: 100, weight: 1 }); };
 const window = (patch: Partial<RateLimitWindow> = {}): RateLimitWindow => ({ key: "5h", model: null, status: "allowed", utilization: 0, reset: now + 1000, ...patch });
 const filters = { search: "", provider: "all", status: "all" } as const;
 const sort = { key: "name", direction: "asc" } as const;
@@ -72,10 +72,33 @@ test("removed detail keeps identity instead of substituting another account", ()
 test("serialized factory executes independently and orders detail windows without mutating status", () => {
   expect(typeof createDashboardPresentation).toBe("function");
   const factory = new Function(`return (${createDashboardPresentation!.toString()})`)();
-  const m = factory(windowDurationMs, sortRateLimitWindows);
+  const m = factory(windowDurationMs, sortRateLimitWindows, { priority: 100, weight: 1 });
   const windows = [window({ key: "7d-sonnet", model: "sonnet" }), window({ key: "7d" }), window(), window({ key: "7d-fable", model: "fable" })];
   const a = accountFixture("primary", {}, { rateLimitStatus: { updatedAt: now, unifiedStatus: "allowed", windows } });
   expect(m.accountDetailModel(statusFixture([a]), a, now).windows.map((w: RateLimitWindow) => w.key)).toEqual(["5h", "7d", "7d-fable", "7d-sonnet"]);
   expect(windows.map(w => w.key)).toEqual(["7d-sonnet", "7d", "5h", "7d-fable"]);
   expect(m.overviewModel(statusFixture(), filters, sort, now).metrics.total).toBe(1);
+});
+
+test("a billing-blocked account reads as Billing, not a generic sideline", () => {
+  const a = accountFixture("a", { available: false, billingBlocked: true,
+    unavailableReason: "Subscription or organization access rejected — rechecking in ~60 min" },
+    { accessDeniedUntil: now + 3_600_000 });
+  const row = p().overviewModel(statusFixture([a]), filters, sort, now).rows[0]!;
+  expect(row.statusKey).toBe("billing");
+  expect(row.statusLabel).toBe("Billing");
+});
+
+test("rows surface priority and weight only when they differ from the defaults", () => {
+  const tuned = accountFixture("tuned", { priority: 101, weight: 2.5 });
+  const plain = accountFixture("plain");
+  const rows = p().overviewModel(statusFixture([plain, tuned]), filters, sort, now).rows;
+  expect(rows.find(r => r.account.name === "plain")!.routingTweaks).toEqual([]);
+  expect(rows.find(r => r.account.name === "tuned")!.routingTweaks).toEqual(["P101", "\u00d72.5"]);
+});
+
+test("a non-default priority alone is surfaced without a weight chip", () => {
+  const a = accountFixture("a", { priority: 5 });
+  const row = p().overviewModel(statusFixture([a]), filters, sort, now).rows[0]!;
+  expect(row.routingTweaks).toEqual(["P5"]);
 });

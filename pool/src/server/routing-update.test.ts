@@ -4,7 +4,7 @@ import { join } from "path";
 import { tmpdir } from "os";
 import { loadConfig } from "../config.ts";
 import { AccountManager } from "../accounts/manager.ts";
-import { handleRoutingUpdate, handleTuningUpdate } from "./server.ts";
+import { handleRoutingUpdate, handleTuningUpdate, handleRecheck } from "./server.ts";
 
 function tempMgr(names: string[]): { poolDir: string; accountsDir: string; mgr: AccountManager } {
   const poolDir = mkdtempSync(join(process.env.CLAUDE_JOB_DIR ? join(process.env.CLAUDE_JOB_DIR, "tmp") : tmpdir(), "cmp-routing-"));
@@ -85,4 +85,31 @@ test("tuning rejects mixed current and retired or unknown keys atomically", () =
       expect(mgr.getTuning().fiveHourExp).toBe(1);
     }
   } finally { rmSync(poolDir, { recursive: true, force: true }); }
+});
+
+test("handleRecheck clears a billing block so the account serves again", () => {
+  const { poolDir, mgr } = tempMgr(["work"]);
+  try {
+    mgr.markBillingBlocked("work", "OAuth authentication is currently not allowed for this organization.");
+    expect(mgr.getAccount("work").available).toBe(false);
+
+    const res = handleRecheck(mgr, { account: "work" });
+
+    expect(res.status).toBe(200);
+    const after = mgr.getAccount("work");
+    expect(after.billingBlocked).toBe(false);
+    expect(after.available).toBe(true);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("handleRecheck rejects an unknown account", () => {
+  const { poolDir, mgr } = tempMgr(["work"]);
+  try {
+    expect(handleRecheck(mgr, { account: "nope" }).status).toBe(400);
+    expect(handleRecheck(mgr, {}).status).toBe(400);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
 });

@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { mapUsageResponse, fetchUsageSnapshot, maybeRefreshUsage, sweepUsageRefresh } from "./usage.ts";
+import { mapUsageResponse, fetchUsageResult, maybeRefreshUsage, sweepUsageRefresh } from "./usage.ts";
 import { loadConfig } from "../config.ts";
 import type { RateLimitSnapshot } from "../accounts/types.ts";
 
@@ -94,7 +94,7 @@ test("synthesizes a duration-bounded reset for a spent window missing resets_at"
   expect(w.reset).toBe(now + 7 * 24 * 60 * 60 * 1000); // now + windowDurationMs("7d")
 });
 
-test("fetchUsageSnapshot sends required headers and maps a 200", async () => {
+test("fetchUsageResult sends required headers and maps a 200", async () => {
   const calls: Request[] = [];
   const orig = globalThis.fetch;
   globalThis.fetch = (async (url: any, init: any) => {
@@ -103,7 +103,8 @@ test("fetchUsageSnapshot sends required headers and maps a 200", async () => {
   }) as any;
   try {
     const cfg = loadConfig();
-    const snap = await fetchUsageSnapshot(acct, fakeMgr(), cfg);
+    const result = await fetchUsageResult(acct, fakeMgr(), cfg);
+    const snap = result.kind === "ok" ? result.snapshot : null;
     expect(snap!.windows.find((w) => w.key === "5h")!.utilization).toBeCloseTo(0.2, 5);
     const req = calls[0]!;
     expect(req.url).toBe("https://api.anthropic.com/api/oauth/usage");
@@ -115,27 +116,27 @@ test("fetchUsageSnapshot sends required headers and maps a 200", async () => {
   }
 });
 
-test("fetchUsageSnapshot returns null on 429", async () => {
+test("fetchUsageResult reports a failure on 429", async () => {
   const orig = globalThis.fetch;
   globalThis.fetch = (async () => new Response("rate_limit", { status: 429 })) as any;
   try {
-    expect(await fetchUsageSnapshot(acct, fakeMgr(), loadConfig())).toBeNull();
+    expect((await fetchUsageResult(acct, fakeMgr(), loadConfig())).kind).toBe("failed");
   } finally {
     globalThis.fetch = orig;
   }
 });
 
-test("fetchUsageSnapshot returns null on non-JSON body", async () => {
+test("fetchUsageResult reports a failure on non-JSON body", async () => {
   const orig = globalThis.fetch;
   globalThis.fetch = (async () => new Response("<html>nope", { status: 200 })) as any;
   try {
-    expect(await fetchUsageSnapshot(acct, fakeMgr(), loadConfig())).toBeNull();
+    expect((await fetchUsageResult(acct, fakeMgr(), loadConfig())).kind).toBe("failed");
   } finally {
     globalThis.fetch = orig;
   }
 });
 
-test("fetchUsageSnapshot returns null when res.text() rejects", async () => {
+test("fetchUsageResult reports a failure when res.text() rejects", async () => {
   const orig = globalThis.fetch;
   globalThis.fetch = (async () => ({
     ok: true,
@@ -145,13 +146,13 @@ test("fetchUsageSnapshot returns null when res.text() rejects", async () => {
     },
   })) as any;
   try {
-    expect(await fetchUsageSnapshot(acct, fakeMgr(), loadConfig())).toBeNull();
+    expect((await fetchUsageResult(acct, fakeMgr(), loadConfig())).kind).toBe("failed");
   } finally {
     globalThis.fetch = orig;
   }
 });
 
-test("fetchUsageSnapshot returns null when signal combination throws", async () => {
+test("fetchUsageResult reports a failure when signal combination throws", async () => {
   // Simulates a runtime lacking AbortSignal.any: the throw must be caught, not
   // propagated out of the fail-closed fetch.
   const origFetch = globalThis.fetch;
@@ -161,7 +162,8 @@ test("fetchUsageSnapshot returns null when signal combination throws", async () 
     throw new Error("no AbortSignal.any");
   };
   try {
-    const snap = await fetchUsageSnapshot(acct, fakeMgr(), loadConfig(), new AbortController().signal);
+    const result = await fetchUsageResult(acct, fakeMgr(), loadConfig(), new AbortController().signal);
+    const snap = result.kind === "ok" ? result.snapshot : null;
     expect(snap).toBeNull();
   } finally {
     globalThis.fetch = origFetch;
@@ -324,4 +326,68 @@ test("sweepUsageRefresh polls openai accounts via the Codex path", async () => {
   };
   await sweepUsageRefresh(mgr, config);
   expect(calls).toContain("openai:codex");
+});
+
+const ORG_403 = JSON.stringify({
+  error: { type: "permission_error", message: "OAuth authentication is currently not allowed for this organization." },
+});
+
+test("maybeRefreshUsage flags a 403 as a billing block, not a generic failure", async () => {
+  const orig = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(ORG_403, { status: 403 })) as any;
+  try {
+    const blocked: string[] = [];
+    const mgr = mgrSpy({ markBillingBlocked: (_n: string, m: string) => blocked.push(m) });
+    await maybeRefreshUsage({ name: "billing", usage: { rateLimitStatus: null } } as any, mgr, loadConfig());
+    expect(blocked).toHaveLength(1);
+    expect(blocked[0]).toContain("not allowed for this organization");
+    expect(mgr.errors).toEqual([]);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test("maybeRefreshUsage still records a generic error on a transient 500", async () => {
+  const orig = globalThis.fetch;
+  globalThis.fetch = (async () => new Response("nope", { status: 500 })) as any;
+  try {
+    const blocked: string[] = [];
+    const mgr = mgrSpy({ markBillingBlocked: (_n: string, m: string) => blocked.push(m) });
+    await maybeRefreshUsage({ name: "transient", usage: { rateLimitStatus: null } } as any, mgr, loadConfig());
+    expect(blocked).toEqual([]);
+    expect(mgr.errors).toHaveLength(1);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test("a 403 that is not about entitlement stays a usage-check failure", async () => {
+  // Only this endpoint refusing us proves nothing about /v1/messages, and a
+  // block here cannot self-heal: the healer is this same endpoint answering.
+  const orig = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({ error: { type: "permission_error", message: "Forbidden" } }), { status: 403 })) as any;
+  try {
+    const blocked: string[] = [];
+    const mgr = mgrSpy({ markBillingBlocked: (_n: string, m: string) => blocked.push(m) });
+    await maybeRefreshUsage({ name: "scoped", usage: { rateLimitStatus: null } } as any, mgr, loadConfig());
+    expect(blocked).toEqual([]);
+    expect(mgr.errors).toHaveLength(1);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test("a 403 with no parseable message never blocks the account", async () => {
+  const orig = globalThis.fetch;
+  globalThis.fetch = (async () => new Response("<html>Forbidden</html>", { status: 403 })) as any;
+  try {
+    const blocked: string[] = [];
+    const mgr = mgrSpy({ markBillingBlocked: (_n: string, m: string) => blocked.push(m) });
+    await maybeRefreshUsage({ name: "html", usage: { rateLimitStatus: null } } as any, mgr, loadConfig());
+    expect(blocked).toEqual([]);
+    expect(mgr.errors).toHaveLength(1);
+  } finally {
+    globalThis.fetch = orig;
+  }
 });

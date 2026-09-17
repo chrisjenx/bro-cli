@@ -874,8 +874,11 @@ test("a 403 (e.g. billing disabled / OAuth not allowed) sidelines the account an
     expect(failovers).toEqual(["a->b"]);
     const a = mgr.getAccount("a");
     expect(a.available).toBe(false);
-    expect(a.unavailableReason).toContain("not allowed for this organization");
+    // The reason now names the cause; Anthropic's raw wording moves to lastError,
+    // which is what the dashboard drawer shows as the serving error.
+    expect(a.unavailableReason).toContain("Subscription or organization access rejected");
     expect(a.unavailableReason).not.toContain("rate limited");
+    expect(a.usage.lastError).toContain("not allowed for this organization");
     // Subsequent picks must skip the refused account entirely.
     expect(mgr.pick(undefined, undefined, "anthropic", null)?.name).toBe("b");
   } finally {
@@ -1267,6 +1270,47 @@ test("a streaming body that fails before commit fails over instead of returning 
     expect(await response.text()).toContain("message_stop");
     expect(calls.map((c) => c.headers.get("authorization"))).toEqual(["Bearer tok-a", "Bearer tok-b"]);
     expect(failovers).toEqual(["a->b"]);
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("an entitlement 403 is classified as a billing block, keeping the raw message", async () => {
+  const { poolDir, mgr, config } = tempPool(["a"]);
+  try {
+    mockFetch(() =>
+      jsonResponse(
+        { type: "error", error: { type: "permission_error", message: "OAuth authentication is currently not allowed for this organization." } },
+        403,
+      ),
+    );
+    await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", max_tokens: 8, messages: [{ role: "user", content: "hi" }] },
+      new Headers(), mgr, config, new AbortController().signal,
+    );
+    const a = mgr.getAccount("a");
+    expect(a.billingBlocked).toBe(true);
+    expect(a.unavailableReason).toContain("Subscription or organization access rejected");
+    // The raw upstream message stays available for the drawer's serving-error line.
+    expect(a.usage.lastError).toContain("not allowed for this organization");
+  } finally {
+    rmSync(poolDir, { recursive: true, force: true });
+  }
+});
+
+test("a 403 unrelated to entitlement stays a generic access denial", async () => {
+  const { poolDir, mgr, config } = tempPool(["a"]);
+  try {
+    mockFetch(() =>
+      jsonResponse({ type: "error", error: { type: "permission_error", message: "Request blocked by safety filter." } }, 403),
+    );
+    await proxyAnthropicMessages(
+      { model: "claude-sonnet-5", max_tokens: 8, messages: [{ role: "user", content: "hi" }] },
+      new Headers(), mgr, config, new AbortController().signal,
+    );
+    const a = mgr.getAccount("a");
+    expect(a.billingBlocked).toBe(false);
+    expect(a.unavailableReason).toContain("refused by Anthropic");
   } finally {
     rmSync(poolDir, { recursive: true, force: true });
   }

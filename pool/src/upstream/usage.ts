@@ -6,7 +6,7 @@
 
 import type { RateLimitSnapshot, RateLimitWindow } from "../accounts/types.ts";
 import { MODEL_FAMILIES, modelFamilyOf, sortRateLimitWindows, windowDurationMs } from "../accounts/types.ts";
-import { asObject, objectProp, stringProp, numberProp, parseJson, oauthHeaders } from "./shared.ts";
+import { asObject, objectProp, stringProp, numberProp, parseJson, oauthHeaders, isEntitlementRefusal } from "./shared.ts";
 import type { Config } from "../config.ts";
 import { AccountManager } from "../accounts/manager.ts";
 import type { Account } from "../accounts/types.ts";
@@ -121,20 +121,37 @@ function usageUrl(config: Config): string {
 }
 
 /**
- * GET the account's live usage. Returns null on any failure (timeout, non-200,
- * unparseable body) — callers treat a null as "no fresh data, keep routing".
+ * Anthropic answers 403 when the account's subscription or its organization
+ * policy forbids OAuth traffic. That is an entitlement problem, not a blip:
+ * it needs its own signal so routing can sideline the account and the
+ * dashboard can say why, instead of reporting a generic refresh failure.
  */
-export async function fetchUsageSnapshot(
+export type UsageFetchResult =
+  | { kind: "ok"; snapshot: RateLimitSnapshot }
+  | { kind: "blocked"; message: string }
+  | { kind: "failed" };
+
+/** Anthropic's error message from a 403 body, or null when the body carries none. */
+function blockedMessage(text: string): string | null {
+  const error = objectProp(parseJson(text), "error");
+  return stringProp(error, "message") ?? null;
+}
+
+/**
+ * GET the account's live usage, distinguishing an entitlement 403 from any
+ * other failure (timeout, 5xx, unparseable body).
+ */
+export async function fetchUsageResult(
   account: Account,
   mgr: AccountManager,
   config: Config,
   signal?: AbortSignal,
-): Promise<RateLimitSnapshot | null> {
+): Promise<UsageFetchResult> {
   let token: string;
   try {
     token = await accessTokenFor(account, mgr, config, false);
   } catch {
-    return null;
+    return { kind: "failed" };
   }
 
   let res: Response;
@@ -147,17 +164,29 @@ export async function fetchUsageSnapshot(
       signal: combined,
     });
   } catch {
-    return null;
+    return { kind: "failed" };
   }
 
-  if (!res.ok) return null;
   let text: string;
   try {
     text = await res.text();
   } catch {
-    return null;
+    return { kind: "failed" };
   }
-  return mapUsageResponse(parseJson(text), Date.now());
+  // Only an entitlement 403 sidelines the account. Any other 403 here (a
+  // scope/beta-header change on this endpoint, a proxy refusing it) says
+  // nothing about /v1/messages, and treating it as a block would bench every
+  // account with no way back: the only healer is this same endpoint answering.
+  if (res.status === 403) {
+    const message = blockedMessage(text);
+    if (message && isEntitlementRefusal(message)) return { kind: "blocked", message };
+    return { kind: "failed" };
+  }
+  if (!res.ok) return { kind: "failed" };
+  const snapshot = mapUsageResponse(parseJson(text), Date.now());
+  // An unparseable body is a failed check, not an empty snapshot: folding it in
+  // here keeps "ok" meaning "we have data" for every caller.
+  return snapshot ? { kind: "ok", snapshot } : { kind: "failed" };
 }
 
 /** Per-account in-flight refreshes, so racing new sessions share one fetch. */
@@ -189,9 +218,13 @@ export async function maybeRefreshUsage(
   if (existing) return existing;
 
   const run = (async () => {
+    // Stamped before the fetch so a snapshot that raced a serve-path 403 cannot
+    // clear the billing block that 403 set while this probe was in flight.
+    const probeStartedAt = Date.now();
     try {
-      const snap = await fetchUsageSnapshot(account, mgr, config);
-      if (snap) mgr.recordUsageSnapshot(account.name, snap);
+      const result = await fetchUsageResult(account, mgr, config);
+      if (result.kind === "blocked") mgr.markBillingBlocked(account.name, result.message);
+      else if (result.kind === "ok") mgr.recordUsageSnapshot(account.name, result.snapshot, probeStartedAt);
       else mgr.recordUsageCheckError(account.name, "usage refresh failed (see logs)");
     } catch (err) {
       mgr.recordUsageCheckError(account.name, (err as Error).message);

@@ -241,6 +241,14 @@ export interface AccountUsage {
    * fixed billing, and re-sideline if the refusal persists.
    */
   accessDeniedUntil: number | null;
+
+  /**
+   * When set, the last refusal was an entitlement 403 (lapsed subscription or
+   * an org that forbids OAuth) rather than an unspecified one. Recorded so the
+   * dashboard can name the cause; cleared by any successful usage check, so a
+   * reactivated subscription heals the account without a re-login.
+   */
+  billingBlockedAt: number | null;
 }
 
 /** Fully-resolved view of an account for status/routing. */
@@ -267,6 +275,8 @@ export interface Account {
   available: boolean;
   /** Human-readable reason when not available. */
   unavailableReason: string | null;
+  /** Sidelined by an entitlement 403 (subscription/organization), not a generic refusal. */
+  billingBlocked: boolean;
 }
 
 export function emptyUsage(now: number): AccountUsage {
@@ -288,5 +298,6 @@ export function emptyUsage(now: number): AccountUsage {
     lastUsageCheckError: null,
     deadRefreshToken: null,
     accessDeniedUntil: null,
+    billingBlockedAt: null,
   };
 }

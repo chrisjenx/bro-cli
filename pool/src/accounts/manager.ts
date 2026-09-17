@@ -163,6 +163,10 @@ const RATE_LIMITED_LAST_ERROR = "rate limited by Anthropic";
 
 const DEAD_REFRESH_LAST_ERROR = "refresh token expired — re-login required";
 
+/** Shown when an entitlement 403 sidelines an account; deliberately neutral, since
+ * Anthropic's message cannot distinguish a lapsed subscription from org policy. */
+const BILLING_BLOCKED_REASON = "Subscription or organization access rejected";
+
 /** Stable, non-reversible id for a refresh token, safe to persist in usage.json. */
 function refreshTokenFingerprint(token: string): string {
   return createHash("sha256").update(token).digest("hex").slice(0, 16);
@@ -290,6 +294,7 @@ export class AccountManager {
         u.lastUsageCheckError ??= null;
         u.deadRefreshToken ??= null;
         u.accessDeniedUntil ??= null;
+        u.billingBlockedAt ??= null;
       }
     } catch {
       this.usage = {};
@@ -694,7 +699,9 @@ export class AccountManager {
     } else if (denied) {
       available = false;
       const mins = Math.ceil((usage.accessDeniedUntil! - now) / 60000);
-      reason = `refused by Anthropic: ${usage.lastError ?? "access denied"} — retry in ~${mins} min`;
+      reason = usage.billingBlockedAt != null
+        ? `${BILLING_BLOCKED_REASON} — rechecking in ~${mins} min`
+        : `refused by Anthropic: ${usage.lastError ?? "access denied"} — retry in ~${mins} min`;
     } else if (cooling) {
       available = false;
       const mins = Math.ceil((usage.rateLimitedUntil! - now) / 60000);
@@ -724,6 +731,9 @@ export class AccountManager {
       usage,
       available,
       unavailableReason: reason,
+      // Gated here so consumers never re-derive "is this block still live": the
+      // flag outlives its cooldown, and every reader wants the live answer.
+      billingBlocked: denied && usage.billingBlockedAt != null,
     };
   }
 
@@ -1271,6 +1281,9 @@ export class AccountManager {
     u.lastUsedAt = now;
     u.lastError = null;
     u.accessDeniedUntil = null;
+    // Serving at all proves the account is entitled, so the billing flag clears
+    // here too — otherwise it sticks forever when usage refresh is disabled.
+    u.billingBlockedAt = null;
     this.saveState();
   }
 
@@ -1293,11 +1306,51 @@ export class AccountManager {
   }
 
   /**
+   * Sideline an account Anthropic refused for entitlement reasons (403 from a
+   * lapsed subscription or an org that forbids OAuth). Uses the same cooldown
+   * as any other 403 — it is a probe interval, not a penalty — but records the
+   * cause so the dashboard can name it and a manual recheck can clear it.
+   */
+  markBillingBlocked(name: string, message: string): void {
+    const u = this.usageFor(name);
+    const now = Date.now();
+    // Idempotent, for the same reason as markRefreshTokenDead: the usage sweep
+    // re-probes a blocked account every couple of minutes, and re-marking it
+    // must not re-evict pins and rewrite usage.json each time.
+    const alreadyBlocked = u.billingBlockedAt != null && (u.accessDeniedUntil ?? 0) > now;
+    u.billingBlockedAt ??= now;
+    u.accessDeniedUntil = now + this.config.accessDeniedCooldownMs;
+    u.lastError = message.slice(0, 500);
+    u.lastUsageCheckAt = now;
+    u.lastUsageCheckError = null;
+    if (alreadyBlocked) return;
+    this.sessions.evictAccount(name);
+    this.saveState();
+  }
+
+  /** Drop a billing block and its cooldown so the account is probed on the next sweep. */
+  clearBillingBlock(name: string): void {
+    const u = this.usageFor(name);
+    // Only a billing block is clearable by hand: without this guard the recheck
+    // button would also wipe a generic access-denial cooldown set since.
+    if (u.billingBlockedAt == null) return;
+
+    u.billingBlockedAt = null;
+    u.accessDeniedUntil = null;
+    u.lastUsageCheckAt = null;
+    this.saveState();
+  }
+
+  /**
    * Sideline an account Anthropic refused outright (403). Not a rate limit:
    * there is no reset to wait for, so the cooldown just spaces out re-probes.
    */
   markAccessDenied(name: string, message: string): void {
     const u = this.usageFor(name);
+    // This refusal is not an entitlement one, so a stale billing flag must not
+    // keep relabelling it — the dashboard would blame billing and offer a
+    // recheck that only clears this new, unrelated cooldown.
+    u.billingBlockedAt = null;
     u.accessDeniedUntil = Date.now() + this.config.accessDeniedCooldownMs;
     u.lastError = message.slice(0, 500);
     u.lastUsedAt = Date.now();
@@ -1330,11 +1383,20 @@ export class AccountManager {
    * window the endpoint no longer reports (e.g. a reset 7d-opus) is dropped.
    * Non-duration windows (e.g. "overage") the endpoint doesn't cover are kept.
    */
-  recordUsageSnapshot(name: string, snapshot: RateLimitSnapshot): void {
+  recordUsageSnapshot(name: string, snapshot: RateLimitSnapshot, probeStartedAt?: number): void {
     const u = this.usageFor(name);
     u.rateLimitStatus = replaceRateLimitSnapshot(u.rateLimitStatus, snapshot);
     u.lastUsageCheckAt = snapshot.updatedAt;
     u.lastUsageCheckError = null;
+    // A usage check that answers at all proves the account is entitled again,
+    // so a reactivated subscription heals on the next probe without a re-login.
+    // Only a probe that STARTED after the block counts: the serve path kicks off
+    // a refresh just before the request, so an in-flight 200 would otherwise
+    // un-sideline the account the same 403 had just blocked, every single time.
+    if (u.billingBlockedAt != null && (probeStartedAt == null || u.billingBlockedAt <= probeStartedAt)) {
+      u.billingBlockedAt = null;
+      u.accessDeniedUntil = null;
+    }
     // Ground truth can reveal a spent binding window before a 429 does; hard-
     // sideline the account until that window resets. Extend-only — never clears
     // an existing cooldown, since a real 429 may reset later than the window.

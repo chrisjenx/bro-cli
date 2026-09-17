@@ -19,3 +19,26 @@ test("emitted duration helper executes with its runtime dependency", () => {
   expect(duration("7d-fable")).toBe(604_800_000);
   expect(duration("overage")).toBeNull();
 });
+
+test("the weight input steps by 0.1 rather than whole units", () => {
+  const html = dashboard.dashboardHtml();
+  const input = html.match(/<input[^>]*name="weight"[^>]*>/)![0];
+  expect(input).toContain('step="0.1"');
+  // min/max are assigned at init from shared.minWeight/maxWeight, so the markup
+  // deliberately does not carry a second copy of the bounds.
+  expect(input).not.toContain("min=");
+  expect(input).not.toContain("max=");
+});
+
+test("account rows carry a slot for non-default routing knobs", () => {
+  expect(dashboard.dashboardClientScript()).toContain("data-row-tweaks");
+});
+
+test("the account drawer offers a recheck control posting to /api/recheck", () => {
+  expect(dashboard.dashboardHtml()).toContain("data-recheck");
+  expect(dashboard.dashboardClientScript()).toContain("/api/recheck");
+});
+
+test("the status filter can isolate billing-blocked accounts", () => {
+  expect(dashboard.dashboardHtml()).toContain('<option value="billing">');
+});

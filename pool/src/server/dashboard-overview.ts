@@ -15,7 +15,7 @@ function createOverviewView(root, controller, presentation) {
     controller.setSort({ key: button.dataset.sort, direction: current.key === button.dataset.sort && current.direction === 'asc' ? 'desc' : 'asc' });
   }));
   function createRow(name) {
-    const row = element('<tr><td><button type="button" class="account-name" data-open-account></button><span class="account-meta"></span><span class="quota-note" data-row-warning></span></td><td><span class="status-label"><span class="status-icon" aria-hidden="true"></span><span data-status-text></span></span></td><td data-five></td><td data-seven></td><td class="overview-reset"></td><td class="overview-sessions"></td><td class="overview-inflight"></td></tr>');
+    const row = element('<tr><td><button type="button" class="account-name" data-open-account></button><span class="account-meta"></span><span class="account-meta account-tweaks" data-row-tweaks></span><span class="quota-note" data-row-warning></span></td><td><span class="status-label"><span class="status-icon" aria-hidden="true"></span><span data-status-text></span></span></td><td data-five></td><td data-seven></td><td class="overview-reset"></td><td class="overview-sessions"></td><td class="overview-inflight"></td></tr>');
     row.dataset.account = name;
     row.querySelector('[data-five]').append(meterElement()); row.querySelector('[data-seven]').append(meterElement());
     bindAccountRow(row, row.querySelector('[data-open-account]'), controller, name); return row;
@@ -51,6 +51,7 @@ function createOverviewView(root, controller, presentation) {
       let row = rowNodes.get(a.name); if (!row) { row = createRow(a.name); rowNodes.set(a.name, row); }
       setText(row.querySelector('[data-open-account]'), a.name);
       setText(row.querySelector('.account-meta'), (a.provider === 'openai' ? 'OpenAI' : 'Anthropic') + ' · ' + (a.subscriptionType || 'Unknown plan'));
+      setText(row.querySelector('[data-row-tweaks]'), data.routingTweaks.join(' · '));
       setText(row.querySelector('[data-row-warning]'), data.usageWarning ? 'Usage check failed' : '');
       patchStatus(row.querySelector('.status-label'), data.statusKey, data.statusLabel);
       patchMeter(row.querySelector('[data-five] .quota'), data.fiveHour, presentation);

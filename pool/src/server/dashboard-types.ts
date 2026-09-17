@@ -27,7 +27,7 @@ export interface SharedDescriptors {
   tuningFields: Array<{ key: keyof RoutingTuning; label: string; min: number; max: number }>;
 }
 export type View = "overview" | "routing" | "settings";
-export type StatusKey = "ready" | "cooldown" | "logged-out" | "sidelined";
+export type StatusKey = "ready" | "cooldown" | "logged-out" | "sidelined" | "billing";
 export interface OverviewFilters {
   search: string; provider: "all" | Provider;
   status: "all" | StatusKey | "unavailable" | "usage-warning";

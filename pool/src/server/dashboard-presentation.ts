@@ -2,7 +2,7 @@ import type { Account, AccountUsage, RateLimitWindow } from "../accounts/types.t
 import type { DashboardStatus, OverviewFilters, OverviewSort, StatusKey, WindowView } from "./dashboard-types.ts";
 
 /** Serialized into the page: runtime dependencies must be arguments or local helpers. */
-export function createDashboardPresentation(durationMs: (key: string) => number | null, sortWindows: (windows: RateLimitWindow[]) => RateLimitWindow[]) {
+export function createDashboardPresentation(durationMs: (key: string) => number | null, sortWindows: (windows: RateLimitWindow[]) => RateLimitWindow[], defaults: { priority: number; weight: number }) {
   function relative(timestamp: number | null | undefined, now = Date.now(), future = false): string {
     if (timestamp == null) return "—";
     const delta = future ? timestamp - now : now - timestamp;
@@ -31,6 +31,9 @@ export function createDashboardPresentation(durationMs: (key: string) => number 
   function statusOf(account: Account, now: number): { key: StatusKey; label: string } {
     if (account.available) return { key: "ready", label: "Ready" };
     if (!account.authenticated) return { key: "logged-out", label: "Logged out" };
+    // Entitlement blocks outrank a plain cooldown: the cooldown is only the
+    // recheck interval, and "Billing" is the actionable word for the operator.
+    if (account.billingBlocked) return { key: "billing", label: "Billing" };
     if ((account.usage.rateLimitedUntil ?? 0) > now) return { key: "cooldown", label: "Cooldown" };
     return { key: "sidelined", label: "Sidelined" };
   }
@@ -40,7 +43,13 @@ export function createDashboardPresentation(durationMs: (key: string) => number 
     const fiveHour = slot("5h"), sevenDay = slot("7d");
     const resets = [fiveHour, sevenDay].filter(w => w.resetAt != null).sort((a, b) => a.resetAt! - b.resetAt!);
     const status = statusOf(account, now);
-    return { account, statusKey: status.key, statusLabel: status.label,
+    // Only non-default routing knobs earn a chip, so a row on defaults stays quiet.
+    const routingTweaks: string[] = [];
+    // Injected, not imported: this factory is serialized into the browser, so
+    // the defaults arrive as an argument the same way durationMs does.
+    if (account.priority !== defaults.priority) routingTweaks.push(`P${account.priority}`);
+    if (account.weight !== defaults.weight) routingTweaks.push(`\u00d7${account.weight}`);
+    return { account, statusKey: status.key, statusLabel: status.label, routingTweaks,
       usageWarning: !!account.usage.lastUsageCheckError, fiveHour, sevenDay,
       nextReset: resets[0] ? { key: resets[0].key, at: resets[0].resetAt! } : null };
   }

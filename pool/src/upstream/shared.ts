@@ -282,6 +282,17 @@ export function isRateLimit(text: string): boolean {
 }
 
 /**
+ * Does a 403 say the account is not entitled, rather than that this particular
+ * request was refused? Anthropic returns the same permission_error type for
+ * both, so the message is the only signal. Deliberately narrow: anything
+ * unmatched stays a generic access denial.
+ */
+export function isEntitlementRefusal(message: string): boolean {
+  const m = message.toLowerCase();
+  return m.includes("organization") || m.includes("subscription") || m.includes("billing") || m.includes("credit balance");
+}
+
+/**
  * Parses the standard `retry-after` header: an integer number of seconds, or
  * (per HTTP spec) an HTTP-date. Returns an absolute epoch-ms reset time.
  */

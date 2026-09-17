@@ -368,8 +368,20 @@ tbody tr:hover {
 .status-label[data-status="cooldown"] .status-icon,.status-label[data-status="sidelined"] .status-icon {
   color:var(--warn);
 }
-.status-label[data-status="logged-out"] .status-icon {
+.status-label[data-status="logged-out"] .status-icon,.status-label[data-status="billing"] .status-icon {
   color:var(--bad);
+}
+.account-tweaks {
+  font-variant-numeric:tabular-nums;
+}
+.account-tweaks:empty {
+  display:none;
+}
+.recheck-row {
+  display:flex;
+  align-items:center;
+  gap:10px;
+  margin:10px 0 18px;
 }
 .quota {
   min-width:100px;
