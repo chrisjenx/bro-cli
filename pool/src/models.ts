@@ -21,6 +21,8 @@ const FRONTIER_CODEX_SUPPORTED_EFFORTS: readonly CodexEffort[] = [
 ];
 const FRONTIER_CODEX_UPSTREAMS = new Set([
   "gpt-6-astra",
+  "gpt-6-sol",
+  "gpt-6-luna",
   "gpt-5.6-sol",
   "gpt-5.6-terra",
   "gpt-5.6-luna",
@@ -89,9 +91,12 @@ export const DEFAULT_MODEL_TABLE: ModelRoute[] = [
   claude("claude-opus-5"), claude("claude-opus-4-8"),
   claude("claude-sonnet-5"), claude("claude-haiku-4-5"),
   claude("claude-fable-5"), claude("claude-fable-5-1"),
-  // Authenticated Codex catalog values checked 2026-09-04. Astra and GPT-5.6's
+  // Authenticated Codex catalog values checked 2026-09-22. GPT-6 and GPT-5.6's
   // 872K maximums are their input/history side of the opt-in 1M total budget.
+  // GPT-6 ships Astra/Sol/Luna only — there is no GPT-6 Terra.
   frontierOpenAI("gpt-6-astra"),
+  frontierOpenAI("gpt-6-sol"),
+  frontierOpenAI("gpt-6-luna"),
   frontierOpenAI("gpt-5.6-sol"),
   frontierOpenAI("gpt-5.6-terra"),
   frontierOpenAI("gpt-5.6-luna"),
@@ -259,11 +264,14 @@ export interface ModelConfig {
   mappings: ModelMapping[];
 }
 
+/** GPT-6 has no Terra tier, so Sonnet shares Sol (OpenAI's complex-coding and
+ * agentic tier) with Opus rather than dropping to Luna (focused, high-volume
+ * tasks — Haiku's role). */
 export const DEFAULT_MAPPINGS: ModelMapping[] = [
   { from: "fable", to: "gpt-6-astra" },
-  { from: "opus", to: "gpt-5.6-sol" },
-  { from: "sonnet", to: "gpt-5.6-terra" },
-  { from: "haiku", to: "gpt-5.6-luna" },
+  { from: "opus", to: "gpt-6-sol" },
+  { from: "sonnet", to: "gpt-6-sol" },
+  { from: "haiku", to: "gpt-6-luna" },
 ];
 
 /** Overlays `rows` onto `base`: a row replaces the `base` row for the same

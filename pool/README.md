@@ -104,6 +104,8 @@ bro models list
 # claude-opus-4-8      → anthropic:claude-opus-4-8
 # claude-fable-5-1     → anthropic:claude-fable-5-1
 # gpt-6-astra          → openai:gpt-6-astra
+# gpt-6-sol            → openai:gpt-6-sol
+# gpt-6-luna           → openai:gpt-6-luna
 # gpt-5.6-sol          → openai:gpt-5.6-sol
 # gpt-5.6-terra        → openai:gpt-5.6-terra
 # gpt-5.6-luna         → openai:gpt-5.6-luna
@@ -114,9 +116,9 @@ bro models list
 ```
 
 - **Left column = the `"model"` string you put in your request.** Send `gpt-6-astra` (or any id in the table) to route to a Codex account; send `sonnet`/`opus`/`fable`/etc. for Claude.
-- Built-in Codex ids ship in the default table: **`gpt-6-astra`**, **`gpt-5.6-sol`**, **`gpt-5.6-terra`**, **`gpt-5.6-luna`**, the **`gpt-5.6` → Sol** alias, **`gpt-5.5`**, **`gpt-5.4`**, and **`gpt-5.4-mini`**. Claude ids include the aliases `opus`/`sonnet`/`haiku`/`fable` and their bundled full ids.
-- **Extended context:** Astra, GPT-5.6, and other verified extended routes appear once in Claude Code's model picker with a trailing `[1m]`. Claude Code sends the bare id in the request; the pool also strips the selector defensively. Astra and GPT-5.6 use Codex's 272K normal and 872K extended input/history ceilings.
-- **Cross-provider defaults:** when **Pool Claude + Codex capacity** is enabled on the dashboard, Fable maps to Astra, Opus to Sol, Sonnet to Terra, and Haiku to Luna. Mapping is off by default. Saved rows are always treated as user choices; the current defaults fill only families missing from the file. Astra and GPT-5.6 expose `low` through `max` (not `none`), including custom aliases whose `upstreamModel` names one of those models. Other routes without explicit capability metadata default to `none` through `xhigh`; incompatible persisted overrides are dropped with a warning rather than sent upstream.
+- Built-in Codex ids ship in the default table: **`gpt-6-astra`**, **`gpt-6-sol`**, **`gpt-6-luna`**, **`gpt-5.6-sol`**, **`gpt-5.6-terra`**, **`gpt-5.6-luna`**, the **`gpt-5.6` → Sol** alias, **`gpt-5.5`**, **`gpt-5.4`**, and **`gpt-5.4-mini`**. Claude ids include the aliases `opus`/`sonnet`/`haiku`/`fable` and their bundled full ids.
+- **Extended context:** GPT-6, GPT-5.6, and other verified extended routes appear once in Claude Code's model picker with a trailing `[1m]`. Claude Code sends the bare id in the request; the pool also strips the selector defensively. GPT-6 and GPT-5.6 use Codex's 272K normal and 872K extended input/history ceilings.
+- **Cross-provider defaults:** when **Pool Claude + Codex capacity** is enabled on the dashboard, Fable maps to GPT-6 Astra, Opus and Sonnet to GPT-6 Sol, and Haiku to GPT-6 Luna. GPT-6 has no Terra tier, so Sonnet shares Sol (OpenAI's complex-coding/agentic tier) rather than dropping to Luna (its focused, high-volume tier); `gpt-5.6-terra` stays routable as an explicit choice. Mapping is off by default. Saved rows are always treated as user choices; the current defaults fill only families missing from the file. GPT-6 and GPT-5.6 expose `low` through `max` (not `none`), including custom aliases whose `upstreamModel` names one of those models. Other routes without explicit capability metadata default to `none` through `xhigh`; incompatible persisted overrides are dropped with a warning rather than sent upstream.
 - **Fable has its own scoped usage window** — routing sidelines an account for Fable requests only once *its* Fable-specific window is spent, even if the account has plenty of headroom left on everything else (see [Routing & usage](#routing--usage) below). This is matched by family (any model id containing `fable`, `opus`, `sonnet`, or `haiku`), not by the table entry, so it applies even to a custom `claude-fable-*` id you add yourself.
 - An unknown model id falls back to routing verbatim to Anthropic, so a Codex model **must** be present in the table (as an `openai` entry) to reach a Codex account. Codex model ids are not discovered automatically; add new ones to `models.json` once you know the exact accepted id.
 

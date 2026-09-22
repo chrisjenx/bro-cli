@@ -52,6 +52,20 @@ describe("model table", () => {
     expect(supportedEffortsFor(resolveModel(table, "astra-alias"))).not.toContain("none");
   });
 
+  test("GPT-6 Sol and Luna route directly to their Codex models with frontier efforts", () => {
+    for (const id of ["gpt-6-sol", "gpt-6-luna"]) {
+      const route = resolveModel(DEFAULT_MODEL_TABLE, id);
+      expect(route).toMatchObject({
+        id,
+        provider: "openai",
+        upstreamModel: id,
+        contextWindow: 272_000,
+        maxContextWindow: 872_000,
+      });
+      expect(supportedEffortsFor(route)).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    }
+  });
+
   test("GPT-6 Astra routes directly to the matching Codex model", () => {
     const route = resolveModel(DEFAULT_MODEL_TABLE, "gpt-6-astra");
     expect(route).toMatchObject({
@@ -113,6 +127,8 @@ describe("model table", () => {
   test("bundled Codex routes carry their verified default and maximum contexts", () => {
     const expected = new Map([
       ["gpt-6-astra", [272_000, 872_000]],
+      ["gpt-6-sol", [272_000, 872_000]],
+      ["gpt-6-luna", [272_000, 872_000]],
       ["gpt-5.6-sol", [272_000, 872_000]],
       ["gpt-5.6-terra", [272_000, 872_000]],
       ["gpt-5.6-luna", [272_000, 872_000]],
@@ -231,8 +247,8 @@ describe("loadModelConfig", () => {
     expect(cfg.mappingEnabled).toBe(true);
     expect(cfg.mappings.find((m) => m.from === "fable")?.to).toBe("gpt-5.6-sol");
     expect(cfg.mappings.find((m) => m.from === "sonnet")?.to).toBe("gpt-5.5");
-    expect(cfg.mappings.find((m) => m.from === "opus")?.to).toBe("gpt-5.6-sol");
-    expect(cfg.mappings.find((m) => m.from === "haiku")?.to).toBe("gpt-5.6-luna");
+    expect(cfg.mappings.find((m) => m.from === "opus")?.to).toBe("gpt-6-sol");
+    expect(cfg.mappings.find((m) => m.from === "haiku")?.to).toBe("gpt-6-luna");
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -251,18 +267,18 @@ describe("loadModelConfig", () => {
     expect(cfg.mappingEnabled).toBe(true);
     // Shadowed families take the user row; the rest keep defaults.
     expect(cfg.mappings.find((m) => m.from === "fable")!.to).toBe("fable");
-    expect(cfg.mappings.find((m) => m.from === "opus")!.to).toBe("gpt-5.6-sol");
+    expect(cfg.mappings.find((m) => m.from === "opus")!.to).toBe("gpt-6-sol");
     expect(cfg.mappings.find((m) => m.from === "haiku")!.effort).toEqual({ low: "medium" });
     rmSync(dir, { recursive: true, force: true });
   });
 
-  test("default mappings target the requested Codex generation by Claude family", () => {
+  test("default mappings target GPT-6 tiers by Claude family (no GPT-6 Terra, so Sonnet shares Sol)", () => {
     const cfg = cfgWith(DEFAULT_MAPPINGS);
     const expected = {
       fable: "gpt-6-astra",
-      opus: "gpt-5.6-sol",
-      sonnet: "gpt-5.6-terra",
-      haiku: "gpt-5.6-luna",
+      opus: "gpt-6-sol",
+      sonnet: "gpt-6-sol",
+      haiku: "gpt-6-luna",
     };
     for (const [family, upstreamModel] of Object.entries(expected)) {
       expect(mappingFor(cfg, family)?.upstreamModel).toBe(upstreamModel);

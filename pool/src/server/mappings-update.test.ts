@@ -34,7 +34,7 @@ describe("handleMappingsUpdate", () => {
     expect(good.status).toBe(200);
     expect(state.config.mappings.find((m) => m.from === "fable")!.to).toBe("gpt-5.6-terra");
     // Unlisted families fall back to defaults on the next load.
-    expect(loadModelConfig(file).mappings.find((m) => m.from === "opus")!.to).toBe("gpt-5.6-sol");
+    expect(loadModelConfig(file).mappings.find((m) => m.from === "opus")!.to).toBe("gpt-6-sol");
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -90,9 +90,9 @@ describe("handleMappingsUpdate", () => {
     // The posted family wins; families left unlisted in the POST keep the value
     // they already had (here still the defaults) immediately in memory.
     expect(state.config.mappings.find((m) => m.from === "fable")!.to).toBe("gpt-5.6-luna");
-    expect(state.config.mappings.find((m) => m.from === "opus")!.to).toBe("gpt-5.6-sol");
-    expect(state.config.mappings.find((m) => m.from === "sonnet")!.to).toBe("gpt-5.6-terra");
-    expect(state.config.mappings.find((m) => m.from === "haiku")!.to).toBe("gpt-5.6-luna");
+    expect(state.config.mappings.find((m) => m.from === "opus")!.to).toBe("gpt-6-sol");
+    expect(state.config.mappings.find((m) => m.from === "sonnet")!.to).toBe("gpt-6-sol");
+    expect(state.config.mappings.find((m) => m.from === "haiku")!.to).toBe("gpt-6-luna");
     expect(state.config.mappings.map((m) => m.from).sort()).toEqual(["fable", "haiku", "opus", "sonnet"]);
 
     // Memory and disk must agree: reloading from the persisted file yields the
