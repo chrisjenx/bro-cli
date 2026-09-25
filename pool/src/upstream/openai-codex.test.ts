@@ -1255,6 +1255,40 @@ describe("proxyCodexMessages review fixes", () => {
     }
   });
 
+  test("a 401 that survives a token refresh sidelines the account, drops its pins, and fails over", async () => {
+    const { poolDir, mgr } = tempOpenAIPool(["gpt1", "gpt2"]);
+    try {
+      const config = codexConfig(poolDir);
+      // Another session pinned to the broken account must be released too, or
+      // its next turn routes straight back to it.
+      mgr.setAffinity("sess-other", "gpt1", "openai");
+      mgr.setAffinity("sess-live", "gpt1", "openai");
+      const rejected = JSON.stringify({ error: { message: "Incorrect API key provided: sk-svcac***", code: "invalid_api_key" } });
+      const fakeFetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        if (String(input).includes("/oauth/token")) {
+          return new Response(JSON.stringify({ access_token: "tok-refreshed", expires_in: 3600 }), { status: 200 });
+        }
+        const auth = new Headers(init?.headers).get("chatgpt-account-id");
+        return auth === "acct-gpt1"
+          ? new Response(rejected, { status: 401 })
+          : new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }) as typeof fetch;
+      const body = { model: CODEX_ROUTE.id, messages, metadata: { user_id: "sess-live" } };
+      const res = await proxyCodexMessages(body, mgr, config, new AbortController().signal, CODEX_ROUTE, {}, fakeFetch);
+      expect(res.status).toBe(200);
+
+      const broken = mgr.listAccounts().find((a) => a.name === "gpt1")!;
+      expect(broken.available).toBe(false);
+      expect(broken.usage.lastError).toContain("Incorrect API key provided");
+      expect(broken.unavailableReason).toContain("refused by OpenAI");
+      const pins = JSON.parse(readFileSync(config.sessionsFile, "utf8")).sessions as Record<string, { account: string }>;
+      expect(pins["openai:sess-other"]).toBeUndefined();
+      expect(pins["openai:sess-live"]?.account).toBe("gpt2");
+    } finally {
+      rmSync(poolDir, { recursive: true, force: true });
+    }
+  });
+
   test("sessionAffinity: false serves without creating a session pin", async () => {
     const { poolDir, mgr } = tempOpenAIPool(["gpt1"]);
     try {

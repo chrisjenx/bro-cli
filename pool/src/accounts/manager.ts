@@ -701,7 +701,7 @@ export class AccountManager {
       const mins = Math.ceil((usage.accessDeniedUntil! - now) / 60000);
       reason = usage.billingBlockedAt != null
         ? `${BILLING_BLOCKED_REASON} — rechecking in ~${mins} min`
-        : `refused by Anthropic: ${usage.lastError ?? "access denied"} — retry in ~${mins} min`;
+        : `refused by ${provider === "openai" ? "OpenAI" : "Anthropic"}: ${usage.lastError ?? "access denied"} — retry in ~${mins} min`;
     } else if (cooling) {
       available = false;
       const mins = Math.ceil((usage.rateLimitedUntil! - now) / 60000);
@@ -1342,8 +1342,9 @@ export class AccountManager {
   }
 
   /**
-   * Sideline an account Anthropic refused outright (403). Not a rate limit:
-   * there is no reset to wait for, so the cooldown just spaces out re-probes.
+   * Sideline an account its provider refused outright (an Anthropic 403, or a
+   * Codex 401/403 that survived a token refresh). Not a rate limit: there is no
+   * reset to wait for, so the cooldown just spaces out re-probes.
    */
   markAccessDenied(name: string, message: string): void {
     const u = this.usageFor(name);

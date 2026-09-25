@@ -226,9 +226,15 @@ async function tryCodexAccount(
       return { kind: "retry", reason: { status: 502, type: "api_error", message, rateLimited: false, transport: true } };
     }
     if (res.status === 401 || res.status === 403) {
+      const text = await res.text().catch(() => "");
       abortCleanup();
-      const message = `Account "${account.name}" is not authorized against the Codex backend`;
-      mgr.recordError(account.name, message);
+      if (signal.aborted) return { kind: "terminal", response: clientAbortedResponse() };
+      // A fresh token still refused means this account cannot serve anyone's
+      // next turn either. Sideline it and drop its pins, as the Anthropic path
+      // does for a 403 — recordError alone left it usable, so a pinned session
+      // kept routing back here instead of moving to another account/provider.
+      const message = describeCodexError(res.status, text, account.name);
+      mgr.markAccessDenied(account.name, message);
       return { kind: "retry", reason: authReason(message, res.status) };
     }
   }
