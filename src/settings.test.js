@@ -437,3 +437,14 @@ test('a future derived Sonnet pin is recognised as bro\'s when no snapshot survi
   applyPoolEnv(POOL, p);
   assert.ok(!('ANTHROPIC_DEFAULT_SONNET_MODEL' in read(p.settings).env));
 });
+
+// Every bro launch re-applies the pool env; an unchanged block must not rewrite
+// settings.json under running Claude Code sessions.
+test('apply leaves settings.json byte-for-byte alone when nothing changed', () => {
+  const paths = tmpPaths();
+  applyPoolEnv(POOL, paths);
+  const compact = JSON.stringify(read(paths.settings));
+  fs.writeFileSync(paths.settings, compact);
+  applyPoolEnv(POOL, paths);
+  assert.equal(fs.readFileSync(paths.settings, 'utf8'), compact);
+});

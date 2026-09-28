@@ -122,16 +122,17 @@ export async function main(argv) {
   ensureDefaultConfig();
   const config = loadConfig();
 
-  // Safety net: if a previous pool session left the global override in place but
-  // the server is gone, strip it so Claude Code still works. Skip when we're about
-  // to intentionally bring the pool up via `-p pool`.
-  if (!(args.provider && args.provider.toLowerCase() === 'pool')) {
-    await selfHealPoolEnv();
-  }
-
   // `bro image` goes straight to the image-gen web UI (no claude involved).
   if (args.image) {
     return runImageGen({ config, apiId: args.provider, dryRun: args.dryRun });
+  }
+
+  // Safety net: if a previous pool session left the global override in place but
+  // the server is gone, strip it so Claude Code still works; if it's up, bring the
+  // catalog-derived model pins current. Skip when we're about to intentionally
+  // bring the pool up via `-p pool`.
+  if (!(args.provider && args.provider.toLowerCase() === 'pool')) {
+    await selfHealPoolEnv();
   }
 
   const data = await loadModels();

@@ -277,8 +277,20 @@ export function applyPoolEnv({ baseUrl, token, pins = {}, maxContextTokens = nul
   const nextEnv = { ...env };
   restoreKeys(nextEnv, prior, POOL_ENV_KEYS);
   Object.assign(nextEnv, poolEnvBlock({ baseUrl, token, pins, maxContextTokens }));
+  // Every bro launch re-applies; don't rewrite the file under running sessions
+  // when the block came out the same.
+  if (JSON.stringify(settings.env) === JSON.stringify(nextEnv)) return;
   settings.env = nextEnv;
   writeJson(paths.settings, settings);
+}
+
+// The base URL and token of the pool block applied to this profile, or null when
+// none is. A later refresh reuses them: the shell running a later `bro` may not
+// carry the PORT/PROXY_API_KEY the pool was brought up with.
+export function appliedPoolEnv(paths = defaultPaths()) {
+  if (!isPoolEnvActive(paths)) return null;
+  const { ANTHROPIC_BASE_URL: baseUrl, ANTHROPIC_AUTH_TOKEN: token } = readJson(paths.settings)?.env || {};
+  return baseUrl && token ? { baseUrl, token } : null;
 }
 
 // Undo applyPoolEnv: restore prior values (or delete keys that were absent).

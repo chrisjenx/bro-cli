@@ -19,7 +19,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { which, globalBinDirs, runInherit } from './proc.js';
 import { permissionArgs } from './launch.js';
-import { applyPoolEnv, clearPoolEnv, isPoolEnvActive, poolEnvBlock, scrubLegacyPins, scrubManagedContext, refreshCachedFableRowFile, sonnetPinFromCatalog, codexDefaultContextFromCatalog } from './settings.js';
+import { applyPoolEnv, clearPoolEnv, isPoolEnvActive, poolEnvBlock, appliedPoolEnv, scrubLegacyPins, scrubManagedContext, refreshCachedFableRowFile, sonnetPinFromCatalog, codexDefaultContextFromCatalog } from './settings.js';
 import { select, prompt, holdOrContinue } from './ui.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -112,9 +112,15 @@ export function runPoolAccounts(args = []) {
   return runPoolCli(findBun(), ['accounts', ...args]);
 }
 
-// Run a pool `models` sub-command (list/update) with inherited stdio.
-export function runPoolModels(args = []) {
-  return runPoolCli(findBun(), ['models', ...args]);
+// Run a pool `models` sub-command (list/update) with inherited stdio. `update`
+// is the "a new model is out" verb, so it also carries the live catalog through
+// to Claude Code's picker when the pool is this profile's backend.
+export async function runPoolModels(args = [], { run = (a) => runPoolCli(findBun(), a), paths } = {}) {
+  const code = await run(['models', ...args]);
+  if (code === 0 && args[0] === 'update' && (await refreshPoolEnv({ paths }))) {
+    console.log('Refreshed Claude Code\'s model pins from the pool catalog.');
+  }
+  return code;
 }
 
 // --- account setup flow ----------------------------------------------------
@@ -384,13 +390,11 @@ export function reapplyPoolEnv(port, paths, derived = {}) {
 }
 
 // The running pool's live catalog (Anthropic's GET /v1/models via the pool), or
-// null when the pool or its catalog can't be reached.
-async function liveCatalog(port) {
+// null when the pool or its catalog can't be reached. The timeout covers the
+// body as well as the headers.
+async function liveCatalog(baseUrl, timeoutMs = 8000) {
   try {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 8000);
-    const res = await fetch(`http://127.0.0.1:${port}/v1/models`, { signal: ctrl.signal, headers: { connection: 'close' } });
-    clearTimeout(t);
+    const res = await fetch(`${baseUrl}/v1/models`, { signal: AbortSignal.timeout(timeoutMs), headers: { connection: 'close' } });
     if (!res.ok) return null;
     const body = await res.json();
     return Array.isArray(body?.data) ? body.data : null;
@@ -404,13 +408,32 @@ async function liveCatalog(port) {
 // why the two families need different treatment). Best effort: with no catalog
 // nothing is pinned and the cached row is left as it is.
 export async function catalogSync(port) {
-  const models = await liveCatalog(port);
+  const models = await liveCatalog(poolEnvValues(port).baseUrl);
   if (!models) return { pins: {}, maxContextTokens: null };
+  return syncFromCatalog(models);
+}
+
+function syncFromCatalog(models) {
   refreshCachedFableRowFile(models);
   return {
     pins: sonnetPinFromCatalog(models),
     maxContextTokens: codexDefaultContextFromCatalog(models)
   };
+}
+
+// Re-derive a running pool's catalog pins into this profile's settings.json, so
+// a Claude model released while the pool stays up reaches the picker without a
+// `bro pool restart`. Reads the catalog from, and writes back, the URL and token
+// already applied (see appliedPoolEnv). Unlike up/restart, an unreachable
+// catalog changes nothing: dropping the Sonnet pin would bring the duplicate
+// 200K row back. Returns true when it re-applied.
+export async function refreshPoolEnv({ paths, timeoutMs } = {}) {
+  const applied = appliedPoolEnv(paths);
+  if (!applied) return false;
+  const models = await liveCatalog(applied.baseUrl, timeoutMs);
+  if (!models) return false;
+  applyPoolEnv({ ...applied, ...syncFromCatalog(models) }, paths);
+  return true;
 }
 
 export async function poolUp() {
@@ -508,12 +531,17 @@ export async function runPoolCommand(args = []) {
   return sub ? 1 : 0;
 }
 
-// If the pool is set as the backend but its server is gone, strip the override so
-// Claude Code isn't bricked (there is no automatic fallback to Anthropic).
-export async function selfHealPoolEnv() {
-  if (!isPoolEnvActive()) return;
-  if (await healthy(poolPort())) return;
-  clearPoolEnv();
+// Runs on every bro launch. If the pool is set as the backend but its server is
+// gone, strip the override so Claude Code isn't bricked (there is no automatic
+// fallback to Anthropic). If it's up, bring the catalog pins current — briefly
+// bounded so a slow catalog never holds up the launch.
+export async function selfHealPoolEnv({ paths } = {}) {
+  if (!isPoolEnvActive(paths)) return;
+  if (await healthy(poolPort())) {
+    await refreshPoolEnv({ paths, timeoutMs: 3000 });
+    return;
+  }
+  clearPoolEnv(paths);
   console.error(
     'bro: the account pool was set as your Claude backend but its server isn’t running —\n' +
       '     removed the override from settings.json so Claude works normally. (`bro pool up` to restart.)'
