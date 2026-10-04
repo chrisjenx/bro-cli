@@ -1,7 +1,6 @@
 /** Model-id → provider routing table, persisted at <poolDir>/models.json. */
 import { existsSync, readFileSync, writeFileSync } from "fs";
 import type { Provider } from "./accounts/types.ts";
-import type { AccountManager } from "./accounts/manager.ts";
 import { modelFamilyOf } from "./accounts/types.ts";
 
 export const SOURCE_EFFORT_TIERS = ["default", "low", "medium", "high", "xhigh", "max"] as const;
@@ -226,26 +225,6 @@ export function mappingFor(cfg: ModelConfig, modelId: string): ModelRoute | null
   const target = resolveModel(cfg.models, row.to);
   if (target.provider !== "openai") return null;
   return { ...target, id: modelId, effortMap: row.effort };
-}
-
-/**
- * Keeps configured OpenAI routes unchanged when `models update` runs. ChatGPT's
- * authenticated Codex service now has an internal model catalog, but it is not
- * a stable public API; wiring live synchronization is intentionally separate
- * from the CLI contract and bundled context metadata in this file.
- */
-export async function updateOpenAIModels(mgr: AccountManager, table: ModelRoute[]): Promise<ModelRoute[]> {
-  const names = mgr.listNames().filter((n) => mgr.providerFor(n) === "openai");
-  const account = names.find((n) => mgr.getOpenAICreds(n)?.accessToken);
-  if (!account) {
-    console.log("No authenticated OpenAI account found — skipping models update.");
-    return table;
-  }
-  console.log(
-    "Codex has no documented model-list endpoint; keeping existing openai entries. " +
-      "Edit models.json manually to add/remove OpenAI model ids.",
-  );
-  return table;
 }
 
 export interface ModelMapping {

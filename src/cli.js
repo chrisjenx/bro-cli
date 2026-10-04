@@ -23,7 +23,7 @@ Usage:
   bro accounts import <name>
                          Copy this machine's current Claude login into the pool
   bro models list        List pool model routing entries
-  bro models update      Refresh the pool's model list (Claude + OpenAI/gpt)
+  bro models update      Discover new Codex ids from pooled accounts
   bro image              Image generation — pick an API, then a self-hosted
                          web UI opens (images save to ./.bro/image-gen)
   bro image -p <api>     Skip the image API menu (e.g. bro image -p yunwu)

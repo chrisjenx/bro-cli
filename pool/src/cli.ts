@@ -17,7 +17,8 @@ import type { Config } from "./config.ts";
 import { AccountManager, isValidPriority } from "./accounts/manager.ts";
 import { loginOpenAI } from "./accounts/openai-login.ts";
 import { normalizeCodexAuthJson } from "./accounts/openai-oauth.ts";
-import { loadModelConfig, saveModelConfig, updateOpenAIModels } from "./models.ts";
+import { loadModelConfig, saveModelConfig } from "./models.ts";
+import { updateOpenAIModels } from "./upstream/codex-models.ts";
 
 function fmtWhen(ts: number | null): string {
   if (!ts) return "never";
@@ -244,10 +245,9 @@ function usageErr(usage: string): number {
  * `models` sub-commands.
  *
  *   models list      Show the current model-id → provider routing table.
- *   models update     Refresh the openai entries from an authenticated
- *                     ChatGPT-subscription account (best-effort; see models.ts).
+ *   models update    Add listed Codex routes from authenticated accounts.
  */
-export async function runModelsCommand(config: Config, args: string[]): Promise<number> {
+export async function runModelsCommand(config: Config, args: string[], fetchFn: typeof fetch = fetch): Promise<number> {
   const [sub] = args;
   const cfg = loadModelConfig(config.modelsFile);
   const table = cfg.models;
@@ -259,10 +259,18 @@ export async function runModelsCommand(config: Config, args: string[]): Promise<
 
   if (sub === "update") {
     const mgr = new AccountManager(config);
-    const updated = await updateOpenAIModels(mgr, table);
-    saveModelConfig(config.modelsFile, { ...cfg, models: updated });
-    console.log(`Saved ${updated.length} models to ${config.modelsFile}`);
-    return 0;
+    try {
+      const updated = await updateOpenAIModels(mgr, table, config, fetchFn);
+      if (updated !== table) {
+        saveModelConfig(config.modelsFile, { ...cfg, models: updated });
+        console.log(`Saved ${updated.length} models to ${config.modelsFile}`);
+        console.log("Restart a running pool with `bro pool restart` to activate new model routes.");
+      }
+      return 0;
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : "Codex model catalog update failed");
+      return 1;
+    }
   }
 
   console.error(`Unknown models sub-command: ${sub}`);

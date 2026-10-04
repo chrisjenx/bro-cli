@@ -118,7 +118,7 @@ export function runPoolAccounts(args = []) {
 export async function runPoolModels(args = [], { run = (a) => runPoolCli(findBun(), a), paths } = {}) {
   const code = await run(['models', ...args]);
   if (code === 0 && args[0] === 'update' && (await refreshPoolEnv({ paths }))) {
-    console.log('Refreshed Claude Code\'s model pins from the pool catalog.');
+    console.log('Refreshed model pins from the running pool (new Codex routes need a pool restart).');
   }
   return code;
 }

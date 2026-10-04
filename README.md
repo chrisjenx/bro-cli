@@ -88,10 +88,10 @@ Then requests for a Codex **model id** route to those accounts. See the routing 
 
 ```sh
 bro models list     # id → provider:model (e.g. gpt-6-astra → openai:gpt-6-astra)
-bro models update   # normalize and re-save the configured routing table
+bro models update   # add newly listed Codex models from authenticated accounts
 ```
 
-Built-in Codex ids include the `gpt-6` Astra/Sol/Luna family, the `gpt-5.6` Sol/Terra/Luna family, `gpt-5.5`, `gpt-5.4`, and `gpt-5.4-mini`. Extended-context models appear once in Claude Code's picker with a `[1m]` selector. When cross-provider mapping is enabled, the defaults are Fable → GPT-6 Astra, Opus and Sonnet → GPT-6 Sol (GPT-6 has no Terra), and Haiku → GPT-6 Luna; dashboard overrides still win. Add other Codex ids by editing the pool's `models.json`. Full details in [`pool/README.md`](./pool/README.md#openai--codex-chatgpt-subscription-accounts).
+Built-in Codex ids include the `gpt-6` Astra/Sol/Luna family, the `gpt-5.6` Sol/Terra/Luna family, `gpt-5.5`, `gpt-5.4`, and `gpt-5.4-mini`. Extended-context models appear once in Claude Code's picker with a `[1m]` selector. When cross-provider mapping is enabled, the defaults are Fable → GPT-6 Astra, Opus and Sonnet → GPT-6 Sol (GPT-6 has no Terra), and Haiku → GPT-6 Luna; dashboard overrides still win. Run `bro pool restart` after an update to load new routes into a running pool; edit the pool's `models.json` for custom aliases or overrides. Full details in [`pool/README.md`](./pool/README.md#openai--codex-chatgpt-subscription-accounts).
 
 **Failover:** when the serving account's usage/rate limit runs out before any output has streamed, the pool transparently sidelines it and retries the turn on the next account — you just keep going. Set `CLAUDE_POOL_BACKEND=cli` to use the older subprocess backend. Requires Bun (`bro` finds it automatically; install from [bun.sh](https://bun.sh)). See [`pool/README.md`](./pool/README.md) for the pool's own docs, endpoints, and configuration.
 
