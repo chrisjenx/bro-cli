@@ -156,6 +156,24 @@ test('refreshPoolEnv keeps the existing pin when the catalog is unreachable', as
   });
 });
 
+// Anthropic's catalog fetch failing inside the pool yields its alias-only table
+// listing, not an error: nothing derivable, so the existing pins must stay.
+test('refreshPoolEnv keeps the existing pin when the pool serves its alias-only fallback', async () => {
+  const fallback = ['opus', 'sonnet', 'haiku', 'fable'].map((id) => ({ id, object: 'model', created: 0, owned_by: 'anthropic-claude-max-pool' }));
+  await withStalePool({ catalog: fallback }, async (paths) => {
+    assert.equal(await refreshPoolEnv({ paths }), false);
+    assert.equal(appliedEnv(paths).ANTHROPIC_DEFAULT_SONNET_MODEL, 'claude-sonnet-5[1m]');
+  });
+});
+
+test('refreshPoolEnv pins the newest catalog Haiku', async () => {
+  const HAIKU_5_5 = { id: 'claude-haiku-5-5', display_name: 'Claude Haiku 5.5', created: 3, owned_by: 'anthropic-claude-max-pool' };
+  await withStalePool({ catalog: [SONNET_5_5, HAIKU_5_5] }, async (paths) => {
+    assert.equal(await refreshPoolEnv({ paths }), true);
+    assert.equal(appliedEnv(paths).ANTHROPIC_DEFAULT_HAIKU_MODEL, 'claude-haiku-5-5');
+  });
+});
+
 // The pool may have been brought up with PROXY_API_KEY/PORT that the shell
 // running a later `bro` doesn't have; the refresh must use and keep the URL and
 // token the override was applied with, or every session starts getting 401s.

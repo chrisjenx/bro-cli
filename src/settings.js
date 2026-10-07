@@ -18,8 +18,10 @@ const ACTIVE_KEYS = [
   MANAGED_CONTEXT_MARKER
 ];
 
-// Model-pin keys. Written only when derived from the live catalog at apply time
-// (sonnetPinFromCatalog — see there for why Sonnet is pinned and Fable is not);
+// Model-pin keys (the name predates the derived pins: Sonnet and Haiku are
+// live, Opus and Fable are only scrubbed). Written only when derived from the live catalog at apply time
+// (sonnetPinFromCatalog / haikuPinFromCatalog — see there for why Sonnet and
+// Haiku are pinned and Fable is not);
 // otherwise they revert to the user's pre-pool value, which also scrubs pins an
 // earlier bro hard-coded. `bro pool down` restores whatever the user had.
 export const RETIRED_POOL_ENV_KEYS = [
@@ -32,6 +34,9 @@ export const RETIRED_POOL_ENV_KEYS = [
   'ANTHROPIC_DEFAULT_FABLE_MODEL',
   'ANTHROPIC_DEFAULT_FABLE_MODEL_NAME',
   'ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION',
   'CLAUDE_CODE_AUTO_COMPACT_WINDOW'
 ];
 
@@ -112,6 +117,22 @@ export function sonnetPinFromCatalog(models) {
   };
 }
 
+// Haiku behind a gateway: Claude Code's built-in catalog resolves the `haiku`
+// alias to its per-provider `gateway` fallback (claude-haiku-4-5 as of 2.1.293),
+// not the first-party default, so pool sessions never reach the current Haiku.
+// A pin replaces the single built-in row. Derived from the live catalog (newest
+// claude-haiku-*), wording copied from Claude Code's own row. No `[1m]`: current
+// Haikus are native 1M in Claude Code's catalog. {} when the catalog has none.
+export function haikuPinFromCatalog(models) {
+  const haiku = newestOfFamily(models, 'haiku');
+  if (!haiku) return {};
+  return {
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: haiku.id,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME: 'Haiku',
+    ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION: `${haiku.name} · Fastest for quick answers`
+  };
+}
+
 // Rewrites the cached Fable row in `claudeJson` (parsed .claude.json) to `fable`
 // ({ id, name } from newestFable). Returns true when something changed. Only
 // touches an existing claude-fable-* entry: with no cached row there is nothing
@@ -157,8 +178,9 @@ export function refreshCachedFableRowFile(models, file = claudeJsonPath()) {
   return true;
 }
 
-// Every value an earlier bro ever wrote for a retired key. Closed, historical
-// list — bro writes no pins any more, so it never needs a new entry. Used where
+// Every literal value an earlier bro wrote for a pin key. Closed, historical
+// list: pins bro writes today are derived from the catalog and recognised by
+// shape in isBroPinValue instead, so new families go there, not here. Used where
 // there is no snapshot to consult (a wiped ~/.bro, or an exported shell env) to
 // tell bro's leftovers from a value the user chose.
 const LEGACY_PIN_VALUES = new Set([
@@ -171,24 +193,36 @@ const LEGACY_PIN_VALUES = new Set([
 
 // Deletes retired-key values that an earlier bro wrote; user values stay.
 export function scrubLegacyPins(env) {
-  for (const k of RETIRED_POOL_ENV_KEYS) if (isBroPinValue(k, env[k])) delete env[k];
+  const bros = RETIRED_POOL_ENV_KEYS.filter((k) => isBroPinValue(k, env[k], env));
+  for (const k of bros) delete env[k];
   return env;
 }
 
-// A value bro wrote for a retired key: one of the historical literals, or the
-// shape fablePinFromCatalog produces for any model version.
-function isBroPinValue(k, value) {
+// A value bro wrote for a pin key: one of the historical literals, or the shape
+// a *PinFromCatalog function produces for any model version. `env` is the block
+// the value sits in, for keys only recognisable by their siblings.
+function isBroPinValue(k, value, env) {
   if (LEGACY_PIN_VALUES.has(value)) return true;
   if (typeof value !== 'string') return false;
   if (k === 'ANTHROPIC_DEFAULT_FABLE_MODEL') return /^claude-fable-\d[\w.-]*\[1m\]$/.test(value);
   if (k === 'ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION') return value.endsWith(' · Most capable for your hardest and longest-running tasks');
   if (k === 'ANTHROPIC_DEFAULT_SONNET_MODEL') return /^claude-sonnet-\d[\w.-]*\[1m\]$/.test(value);
   if (k === 'ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION') return value.endsWith(' with 1M context · Efficient for routine tasks');
+  // The bare Haiku id and 'Haiku' name alone are indistinguishable from a user
+  // pinning e.g. claude-haiku-4-5 themselves; bro's description beside them isn't.
+  if (k === 'ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION') return isBroHaikuDescription(value);
+  if (k === 'ANTHROPIC_DEFAULT_HAIKU_MODEL' || k === 'ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME') {
+    return isBroHaikuDescription(env?.ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION);
+  }
   return false;
 }
 
+function isBroHaikuDescription(value) {
+  return typeof value === 'string' && /^Haiku [\d.]+ · Fastest for quick answers$/.test(value);
+}
+
 function snapshotValue(env, k) {
-  if (!(k in env) || isBroPinValue(k, env[k])) return null;
+  if (!(k in env) || isBroPinValue(k, env[k], env)) return null;
   return env[k];
 }
 

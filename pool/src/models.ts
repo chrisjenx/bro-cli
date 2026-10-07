@@ -88,7 +88,7 @@ const frontierOpenAI = (id: string, upstreamModel = id): ModelRoute =>
 export const DEFAULT_MODEL_TABLE: ModelRoute[] = [
   claude("opus"), claude("sonnet"), claude("haiku"), claude("fable"),
   claude("claude-opus-5"), claude("claude-opus-4-8"),
-  claude("claude-sonnet-5"), claude("claude-haiku-4-5"),
+  claude("claude-sonnet-5"), claude("claude-haiku-5-5"), claude("claude-haiku-4-5"),
   claude("claude-fable-5"), claude("claude-fable-5-1"),
   // Authenticated Codex catalog values checked 2026-09-22. GPT-6 and GPT-5.6's
   // 872K maximums are their input/history side of the opt-in 1M total budget.

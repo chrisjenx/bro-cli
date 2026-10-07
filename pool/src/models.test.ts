@@ -82,7 +82,7 @@ describe("model table", () => {
     const ids = modelsForListing(DEFAULT_MODEL_TABLE).map((m) => m.id);
     // one alias per Claude family, and no bundled full-id duplicates
     for (const alias of ["opus", "sonnet", "haiku", "fable"]) expect(ids).toContain(alias);
-    for (const full of ["claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5", "claude-fable-5", "claude-fable-5-1"]) {
+    for (const full of ["claude-opus-4-8", "claude-sonnet-5", "claude-haiku-5-5", "claude-haiku-4-5", "claude-fable-5", "claude-fable-5-1"]) {
       expect(ids).not.toContain(full);
     }
     // exactly one Sonnet in the listing

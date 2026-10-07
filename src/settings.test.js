@@ -11,11 +11,13 @@ import {
   poolEnvBlock,
   newestFable,
   sonnetPinFromCatalog,
+  haikuPinFromCatalog,
   refreshCachedFableRow,
   refreshCachedFableRowFile,
   RETIRED_POOL_ENV_KEYS,
   codexDefaultContextFromCatalog,
-  scrubManagedContext
+  scrubManagedContext,
+  scrubLegacyPins
 } from './settings.js';
 
 function tmpPaths() {
@@ -412,6 +414,55 @@ test('sonnetPinFromCatalog pins the newest Sonnet 1M with Claude Code\'s row wor
     ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION: 'Sonnet 5 with 1M context · Efficient for routine tasks'
   });
   assert.deepEqual(sonnetPinFromCatalog([{ id: 'claude-opus-5' }]), {});
+});
+
+// Behind a gateway Claude Code sends `haiku` to its older gateway fallback, so
+// the pool pins the newest Haiku from the live catalog (bare id: native 1M).
+test('haikuPinFromCatalog pins the newest Haiku with Claude Code\'s row wording', () => {
+  const pins = haikuPinFromCatalog([
+    { id: 'claude-haiku-4-5', display_name: 'Claude Haiku 4.5', created: 100 },
+    { id: 'claude-haiku-5-5', display_name: 'Claude Haiku 5.5', created: 200 },
+    { id: 'claude-sonnet-5-5', display_name: 'Claude Sonnet 5.5', created: 300 }
+  ]);
+  assert.deepEqual(pins, {
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-5-5',
+    ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME: 'Haiku',
+    ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION: 'Haiku 5.5 · Fastest for quick answers'
+  });
+  assert.deepEqual(haikuPinFromCatalog([{ id: 'claude-opus-5' }]), {});
+});
+
+test('apply writes the derived Haiku pin over a user pin; clear restores the user', () => {
+  const p = tmpPaths();
+  fs.writeFileSync(p.settings, JSON.stringify({ env: { ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-4-5' } }));
+  const pins = haikuPinFromCatalog([{ id: 'claude-haiku-5-5', display_name: 'Claude Haiku 5.5' }]);
+  applyPoolEnv({ ...POOL, pins }, p);
+  assert.equal(read(p.settings).env.ANTHROPIC_DEFAULT_HAIKU_MODEL, 'claude-haiku-5-5');
+  assert.equal(read(p.settings).env.ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME, 'Haiku');
+  clearPoolEnv(p);
+  assert.deepEqual(read(p.settings), { env: { ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-4-5' } });
+});
+
+// ~/.bro wiped while the Haiku pin is in settings.json: bro's own pin must not
+// become the user's baseline, or `pool down` would freeze it there forever.
+test('apply does not snapshot bro\'s Haiku pin when no state file survived', () => {
+  const p = tmpPaths();
+  fs.writeFileSync(p.settings, JSON.stringify({ env: haikuPinFromCatalog([{ id: 'claude-haiku-5-5', display_name: 'Claude Haiku 5.5' }]) }));
+  applyPoolEnv(POOL, p);
+  const { env } = read(p.settings);
+  for (const k of ['ANTHROPIC_DEFAULT_HAIKU_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME', 'ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION']) {
+    assert.ok(!(k in env), k);
+  }
+  clearPoolEnv(p);
+  assert.deepEqual(read(p.settings), {});
+});
+
+// An inherited launch env: bro's whole Haiku pin goes; a bare user pin stays.
+test('scrubLegacyPins drops bro\'s Haiku pin as a unit and keeps a user Haiku pin', () => {
+  const bros = scrubLegacyPins({ ...haikuPinFromCatalog([{ id: 'claude-haiku-5-5', display_name: 'Claude Haiku 5.5' }]) });
+  assert.deepEqual(bros, {});
+  const user = { ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-4-5', ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME: 'Haiku' };
+  assert.deepEqual(scrubLegacyPins({ ...user }), user);
 });
 
 test('apply writes the derived Sonnet pin; an apply without one removes it; clear restores the user', () => {

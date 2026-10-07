@@ -19,7 +19,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { which, globalBinDirs, runInherit } from './proc.js';
 import { permissionArgs } from './launch.js';
-import { applyPoolEnv, clearPoolEnv, isPoolEnvActive, poolEnvBlock, appliedPoolEnv, scrubLegacyPins, scrubManagedContext, refreshCachedFableRowFile, sonnetPinFromCatalog, codexDefaultContextFromCatalog } from './settings.js';
+import { applyPoolEnv, clearPoolEnv, isPoolEnvActive, poolEnvBlock, appliedPoolEnv, scrubLegacyPins, scrubManagedContext, refreshCachedFableRowFile, sonnetPinFromCatalog, haikuPinFromCatalog, codexDefaultContextFromCatalog } from './settings.js';
 import { select, prompt, holdOrContinue } from './ui.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -416,7 +416,7 @@ export async function catalogSync(port) {
 function syncFromCatalog(models) {
   refreshCachedFableRowFile(models);
   return {
-    pins: sonnetPinFromCatalog(models),
+    pins: { ...sonnetPinFromCatalog(models), ...haikuPinFromCatalog(models) },
     maxContextTokens: codexDefaultContextFromCatalog(models)
   };
 }
@@ -432,7 +432,11 @@ export async function refreshPoolEnv({ paths, timeoutMs } = {}) {
   if (!applied) return false;
   const models = await liveCatalog(applied.baseUrl, timeoutMs);
   if (!models) return false;
-  applyPoolEnv({ ...applied, ...syncFromCatalog(models) }, paths);
+  const derived = syncFromCatalog(models);
+  // The pool answers with its alias-only table when Anthropic's catalog fetch
+  // fails; no derivable pin means that fallback, so treat it as unreachable.
+  if (!Object.keys(derived.pins).length) return false;
+  applyPoolEnv({ ...applied, ...derived }, paths);
   return true;
 }
 
