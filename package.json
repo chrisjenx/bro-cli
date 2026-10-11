@@ -1,7 +1,7 @@
 {
   "name": "bro-claude",
   "version": "0.4.1",
-  "description": "Run Claude Code against any model provider — Claude native, or any OpenAI/Anthropic-compatible API via an auto-installed proxy. Pick a provider, pick a model, go.",
+  "description": "Pool many Claude Max/Team and ChatGPT (Codex) subscriptions behind one local endpoint and run Claude Code across them with automatic failover.",
   "type": "module",
   "bin": {
     "bro": "bin/bro.js"
@@ -10,7 +10,6 @@
     "bin",
     "src",
     "pool",
-    "models.json",
     "README.md",
     "LICENSE"
   ],
@@ -25,14 +24,12 @@
     "claude",
     "claude-code",
     "cli",
-    "llm",
-    "ai",
     "anthropic",
     "openai",
-    "openrouter",
-    "sakana",
-    "fugu",
+    "codex",
     "proxy",
+    "pool",
+    "failover",
     "justgains"
   ],
   "author": "JustGains (https://justgains.com)",

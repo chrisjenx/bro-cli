@@ -9,7 +9,7 @@ Root package (Node ESM CLI):
 ```sh
 npm start                 # run bro via node bin/bro.js
 node bin/bro.js --help    # inspect CLI commands and flags
-node bin/bro.js --dry-run # exercise provider/model selection without launching Claude
+node bin/bro.js --dry-run # preview the pool launch without starting anything
 node --test src/*.test.js # run root Node tests
 node --test src/settings.test.js # run one root test file
 ```
@@ -33,15 +33,13 @@ This repo ships the `bro` CLI (`bin/bro.js` -> `src/cli.js`) plus a nested Bun s
 
 ### Root CLI
 
-- `src/cli.js` is the top-level command dispatcher. It handles `bro accounts`, `bro models`, `bro pool`, `bro image`, `bro update`, interactive provider/model selection, config bootstrap, and finally delegates launching.
-- Provider/model data comes from bundled `models.json`, an optional cache at `~/.bro/models.cache.json`, and user customizations in `~/.bro/config.json`. `src/models.js` merges custom providers into the remote/bundled list; `src/config.js` strips `#`-prefixed example data from config before use.
-- `src/launch.js` is the launch seam:
-  - `native` providers run `claude` directly with the user's normal login.
-  - `anthropic` providers run `claude` directly with `ANTHROPIC_BASE_URL`/auth env vars.
-  - `openai` providers are routed through `claude-code-router`; `writeCcrConfig()` upserts provider config under `~/.claude-code-router/config.json`.
-- `src/pool.js` bridges root commands to the nested pool service: account/model management, starting/stopping the detached pool, health checks, and managing the global Claude Code backend override in `~/.claude/settings.json`.
-- `src/settings.js` owns applying/clearing the pool backend override while preserving pre-existing Claude settings. The root Node tests currently cover this module.
-- `src/imagegen.js` and `src/imagegen.html` implement the separate `bro image` local web UI; it does not launch Claude.
+The root CLI is a thin launcher/manager for the pool; it has no other providers.
+
+- `src/cli.js` is the top-level command dispatcher. It handles `bro accounts`, `bro models`, `bro pool`, and otherwise launches Claude Code through the pool (`--dry-run`, `--safe`, and passthrough claude args). `-p pool` is still accepted as a no-op alias.
+- `src/config.js` reads the optional `~/.bro/config.json` (only `permissionMode` / legacy `dangerouslySkipPermissions` are used) and maps the posture to claude flags.
+- `src/pool.js` bridges root commands to the nested pool service: account/model management, starting/stopping the detached pool, health checks, launching `claude` against it, and managing the global Claude Code backend override in `~/.claude/settings.json`.
+- `src/settings.js` owns applying/clearing the pool backend override while preserving pre-existing Claude settings, plus catalog-derived model pins.
+- `src/proc.js` (cross-platform `which`/spawn) and `src/ui.js` (arrow-key select, prompts) are shared helpers.
 
 ### Pool service
 

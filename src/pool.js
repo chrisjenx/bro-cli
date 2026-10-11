@@ -18,7 +18,7 @@ import { createHash } from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { which, globalBinDirs, runInherit } from './proc.js';
-import { permissionArgs } from './launch.js';
+import { permissionArgs } from './config.js';
 import { applyPoolEnv, clearPoolEnv, isPoolEnvActive, poolEnvBlock, appliedPoolEnv, scrubLegacyPins, scrubManagedContext, refreshCachedFableRowFile, sonnetPinFromCatalog, haikuPinFromCatalog, codexDefaultContextFromCatalog } from './settings.js';
 import { select, prompt, holdOrContinue } from './ui.js';
 
@@ -31,12 +31,6 @@ const POOL_DIR = process.env.CLAUDE_POOL_DIR || path.join(os.homedir(), '.claude
 const ACCOUNTS_DIR = path.join(POOL_DIR, 'accounts');
 const PROXY_LOG = path.join(os.homedir(), '.bro', 'pool-proxy.log');
 const PROXY_PID = path.join(os.homedir(), '.bro', 'pool-proxy.pid');
-
-export const POOL_PROVIDER = {
-  id: 'pool',
-  name: 'Multiple Claude Account Proxy',
-  mode: 'pool'
-};
 
 // --- account inspection (read the pool's on-disk state directly) -----------
 
@@ -533,23 +527,6 @@ export async function runPoolCommand(args = []) {
   if (run) return run();
   console.log('Usage: bro pool <up|start|down|stop|restart|status>');
   return sub ? 1 : 0;
-}
-
-// Runs on every bro launch. If the pool is set as the backend but its server is
-// gone, strip the override so Claude Code isn't bricked (there is no automatic
-// fallback to Anthropic). If it's up, bring the catalog pins current — briefly
-// bounded so a slow catalog never holds up the launch.
-export async function selfHealPoolEnv({ paths } = {}) {
-  if (!isPoolEnvActive(paths)) return;
-  if (await healthy(poolPort())) {
-    await refreshPoolEnv({ paths, timeoutMs: 3000 });
-    return;
-  }
-  clearPoolEnv(paths);
-  console.error(
-    'bro: the account pool was set as your Claude backend but its server isn’t running —\n' +
-      '     removed the override from settings.json so Claude works normally. (`bro pool up` to restart.)'
-  );
 }
 
 export async function runPool({ extraArgs = [], permissionMode = 'auto', dryRun = false } = {}) {

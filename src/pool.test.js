@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { applyPoolEnv } from './settings.js';
-import { waitForExit, reapplyPoolEnv, catalogSync, refreshPoolEnv, selfHealPoolEnv, runPoolModels, POOL_SUBCOMMANDS, runPoolCommand } from './pool.js';
+import { waitForExit, reapplyPoolEnv, catalogSync, refreshPoolEnv, runPoolModels, POOL_SUBCOMMANDS, runPoolCommand } from './pool.js';
 
 test('waitForExit resolves true once the process exits', async () => {
   const child = spawn('sleep', ['0.3']);
@@ -204,13 +204,6 @@ test('refreshPoolEnv gives up on a catalog body that stalls', { timeout: 3000 },
   } finally {
     clearInterval(socket);
   }
-});
-
-test('every bro launch refreshes the pins of a running pool', async () => {
-  await withStalePool({}, async (paths) => {
-    await selfHealPoolEnv({ paths });
-    assert.equal(appliedEnv(paths).ANTHROPIC_DEFAULT_SONNET_MODEL, 'claude-sonnet-5-5[1m]');
-  });
 });
 
 test('bro models update refreshes the pins after a successful update', async () => {

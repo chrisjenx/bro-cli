@@ -1,4 +1,4 @@
-import { spawn, spawnSync, execSync } from 'node:child_process';
+import { spawn, execSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -23,7 +23,7 @@ export function which(name, extraDirs = []) {
   return null;
 }
 
-// Where bun / npm drop globally-installed bin shims (so we can find `ccr`
+// Where bun / npm drop globally-installed bin shims (so we can find `bun`
 // even when that directory isn't on PATH — common on Windows).
 export function globalBinDirs() {
   const dirs = [path.join(os.homedir(), '.bun', 'bin')];
@@ -64,36 +64,4 @@ export function runInherit(file, args, env = process.env) {
       resolve(1);
     });
   });
-}
-
-// Make sure the Anthropic<->OpenAI proxy (claude-code-router / `ccr`) is present,
-// installing it with bun or npm if needed. Returns { ccr, dirs }.
-export function ensureProxy() {
-  let dirs = globalBinDirs();
-  let ccr = which('ccr', dirs);
-  if (ccr) return { ccr, dirs };
-
-  const pm = which('bun') ? 'bun' : which('npm') ? 'npm' : null;
-  if (!pm) throw new Error('Need bun or npm on PATH to install the proxy (claude-code-router).');
-
-  process.stdout.write(`\nInstalling the proxy (claude-code-router) with ${pm} — one time only…\n`);
-  const pmPath = which(pm);
-  const ext = path.extname(pmPath).toLowerCase();
-  const installArgs = ['install', '-g', '@musistudio/claude-code-router'];
-  let r;
-  if (isWin && (ext === '.cmd' || ext === '.bat')) {
-    const line = [pmPath, ...installArgs].map(winQuote).join(' ');
-    r = spawnSync(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', line], {
-      stdio: 'inherit',
-      windowsVerbatimArguments: true
-    });
-  } else {
-    r = spawnSync(pmPath, installArgs, { stdio: 'inherit' });
-  }
-  if (r.status !== 0) throw new Error('Proxy install failed.');
-
-  dirs = globalBinDirs();
-  ccr = which('ccr', dirs);
-  if (!ccr) throw new Error('Installed the proxy but could not locate the `ccr` binary. Add your global bin dir to PATH and retry.');
-  return { ccr, dirs };
 }

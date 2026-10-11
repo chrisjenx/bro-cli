@@ -1,8 +1,6 @@
 # bro
 
-Run [Claude Code](https://claude.com/claude-code) against **any** model — Claude natively, or any OpenAI/Anthropic-compatible API through a proxy that installs itself.
-
-Pick a provider, pick a model, go.
+Pool any number of Claude Max / Team and ChatGPT (Codex) subscriptions behind one local endpoint, and run [Claude Code](https://claude.com/claude-code) across all of them — with automatic failover when one runs out of usage.
 
 ## Install
 
@@ -11,7 +9,7 @@ npm install -g bro-claude
 # or: bun install -g bro-claude
 ```
 
-You also need the `claude` CLI installed (that's the thing `bro` launches).
+You also need the `claude` CLI installed (that's the thing `bro` launches) and [Bun](https://bun.sh) (the pool server runs on it).
 
 ## Use
 
@@ -19,31 +17,11 @@ You also need the `claude` CLI installed (that's the thing `bro` launches).
 bro
 ```
 
-1. Scroll to a **provider** and press enter.
-2. Scroll to a **model** and press enter. Press **Tab** to flip the **Skip permissions** toggle right there — it opts this launch into the dangerous `--dangerously-skip-permissions` bypass.
-3. First time on a paid provider it asks for an API key and saves it.
+## How it works
 
-Your last provider + model are remembered and pre-selected next time (per provider).
+`bro` pools any number of Claude Max / Team logins behind one local endpoint and launches Claude Code across all of them — so a single session draws from several plans and **fails over automatically** the moment one runs out of usage.
 
-### Permission mode
-
-By default `bro` starts Claude Code in **auto mode** (`--permission-mode auto`) —
-Claude's intelligent auto-mode approves safe actions and only prompts when it
-needs to. Set `permissionMode` in `~/.bro/config.json` to change the default:
-
-- `"auto"` — auto-mode (the default)
-- `"manual"` — prompt for everything (same as `bro --safe`)
-- `"bypass"` — skip every permission check (`--dangerously-skip-permissions`)
-
-The **Skip permissions** toggle in the menu opts a single launch into `bypass`.
-(The older `dangerouslySkipPermissions: true/false` config key still works when
-`permissionMode` is unset.)
-
-## Multiple Claude Account Proxy
-
-The **top** option in the menu (`bro -p pool`) pools any number of Claude Max / Team logins behind one local endpoint and launches Claude Code across all of them — so a single session draws from several plans and **fails over automatically** the moment one runs out of usage.
-
-Pick it and `bro` handles everything:
+Run `bro` and it handles everything:
 
 1. **Setup** — if you have no pooled accounts yet, it offers to log in a new one (opens Claude to sign in) or import the login already on this machine. Add as many as you like; each is stored in its own isolated config dir under `~/.claude-max-pool/`.
 2. **Start the proxy** — launches the pool server (in `pool/`, runs on [Bun](https://bun.sh)) in the background and waits for it to go healthy. A live dashboard shows each account's auth state, plan, rate tier, and rolling usage at `http://127.0.0.1:3456/`.
@@ -51,7 +29,7 @@ Pick it and `bro` handles everything:
 
 ### Pool as your Claude backend (agents included)
 
-Launching the pool (`bro -p pool`) makes it the backend for **every** Claude Code
+Launching through the pool (`bro`) makes it the backend for **every** Claude Code
 session on the machine — foreground windows *and* background agents started from
 the agents view — by writing `ANTHROPIC_BASE_URL` into your `~/.claude/settings.json`
 and leaving the pool server running (detached) after Claude exits.
@@ -62,10 +40,10 @@ bro pool status   # show server health + whether the override is active
 bro pool down     # stop the pool and restore your normal Claude login
 ```
 
-The override stays active until you run `bro pool down`. If the pool server ever
-stops while the override is still set, the next `bro` command strips it
-automatically — Claude Code has no fallback for an unreachable base URL, so this
-keeps `claude` working. Note: pointing Claude at a local proxy disables MCP tool
+The override stays active until you run `bro pool down`. Claude Code has no
+fallback for an unreachable base URL, so if the pool server stops while the
+override is set, run `bro` or `bro pool up` to restart it (or `bro pool down` to
+go back to your normal login). Note: pointing Claude at a local proxy disables MCP tool
 search and Remote Control for those sessions.
 
 Manage pool accounts directly through `bro`:
@@ -95,72 +73,34 @@ Built-in Codex ids include the `gpt-6` Astra/Sol/Luna family, the `gpt-5.6` Sol/
 
 **Failover:** when the serving account's usage/rate limit runs out before any output has streamed, the pool transparently sidelines it and retries the turn on the next account — you just keep going. Set `CLAUDE_POOL_BACKEND=cli` to use the older subprocess backend. Requires Bun (`bro` finds it automatically; install from [bun.sh](https://bun.sh)). See [`pool/README.md`](./pool/README.md) for the pool's own docs, endpoints, and configuration.
 
-## 🎨 Image Gen
+## Permission mode
 
-`bro image` (also the second option in the menu) doesn't launch Claude at all — it asks which image API to use (Yunwu with `gpt-image-2` first, plus OpenAI), then serves a local web UI and opens it in your browser.
+By default `bro` starts Claude Code in **auto mode** (`--permission-mode auto`) —
+Claude's intelligent auto-mode approves safe actions and only prompts when it
+needs to. Set `permissionMode` in `~/.bro/config.json` to change the default:
 
-- **Prompt fast** — type, press Enter, keep typing. Every generation is a card that shimmers while it works and fades the image in when it lands.
-- **Concurrent by design** — the batch stepper fires N generations at once, and you can keep firing more while others are still running.
-- **Switch models in the UI** — pick from the API's list (including chat-routed models like `gemini-3.1-flash-image`) or type any custom model id. Size and quality knobs included where the API supports them.
-- **Reference images** — paste, drag-drop, or attach images to the prompt as context. They're saved to `./.bro/context/` named by content hash (the same image is never stored twice) and appear in a library strip for one-click reuse. Image-API models route through `/images/edits`; chat-routed models get them as vision input.
-- **Files land in `./.bro/image-gen/`** of the directory you launched from, with a `history.jsonl` so the gallery survives reloads.
+- `"auto"` — auto-mode (the default)
+- `"manual"` — prompt for everything (same as `bro --safe`)
+- `"bypass"` — skip every permission check (`--dangerously-skip-permissions`)
 
-```sh
-bro image             # pick an image API, then the web UI opens
-bro image -p yunwu    # skip the API menu
-```
+(The older `dangerouslySkipPermissions: true/false` config key still works when
+`permissionMode` is unset.)
 
-Keys are shared with the chat provider of the same id, so a saved Yunwu key just works. Add your own APIs via `imageApis` in `~/.bro/config.json` (merged by `id`, same as providers).
-
-## Providers
-
-Claude is next in the list and runs **natively** (your normal Claude login — no proxy). Other Anthropic-compatible providers (OpenRouter, Z.ai) just point Claude at their endpoint. OpenAI-format providers (Sakana, OpenAI, DeepSeek, Groq, …) are routed through [`claude-code-router`](https://github.com/musistudio/claude-code-router), which `bro` installs for you the first time you need it.
-
-### Flags
+## Flags
 
 ```sh
-bro -p pool               # Multiple Claude Account Proxy (pool many plans)
+bro                       # start the pool if needed, launch Claude through it
 bro pool up               # make the pool the backend for all Claude sessions
 bro pool down             # stop the pool, restore your normal Claude login
 bro pool status           # pool server + backend-override status
-bro -p sakana -m fugu     # skip the menus
-bro --list                # list every provider + model
-bro update                # refresh the model list from GitHub, cache it locally
 bro --dry-run             # show what would run, launch nothing
 bro --safe                # start in manual mode (prompt for everything)
-bro --resume <session-id> # pick provider/model, then resume Claude there
-bro -p pool --resume <id> # resume through the Multiple Claude Account Proxy
+bro --resume <session-id> # resume a Claude session through the pool
 bro -- --help             # force a bro flag name through to claude
 ```
 
 Put `bro`'s own flags first. The first unrecognized argument, and everything
-after it, is passed verbatim to the Claude session after provider/model
-selection.
-
-## Config
-
-Keys and your own providers/models live in `~/.bro/config.json`:
-
-```jsonc
-{
-  "keys": {
-    "sakana": "fish_...",
-    "#openai": "sk-...   ← any key starting with # is ignored (notes / test data)"
-  },
-  "providers": [
-    {
-      "id": "mylocal",
-      "name": "My Local LLM",
-      "mode": "openai",
-      "baseUrl": "http://localhost:1234/v1/chat/completions",
-      "noKey": true,
-      "models": [{ "id": "my-model", "name": "My Model" }]
-    }
-  ]
-}
-```
-
-Custom providers merge with the built-in list (same `id` adds models; new `id` adds a provider). The built-in model list is pulled from [`models.json`](https://github.com/JustSuperHuman/bro-cli/blob/main/models.json) on GitHub and cached at `~/.bro/models.cache.json` — run `bro update` to refresh it (override the source with `BRO_MODELS_URL`).
+after it, is passed verbatim to the Claude session.
 
 ---
 

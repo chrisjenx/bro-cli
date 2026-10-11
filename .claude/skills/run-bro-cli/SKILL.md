@@ -1,19 +1,17 @@
 ---
 name: run-bro-cli
-description: Build, run, and drive the `bro` CLI (bin/bro.js) and its nested Bun `pool` server. Use when asked to run bro, test the provider/model picker, drive bro's interactive menu, start/stop the pool server, or screenshot/inspect its dashboard or API.
+description: Build, run, and drive the `bro` CLI (bin/bro.js) and its nested Bun `pool` server. Use when asked to run bro, preview a pool launch, start/stop the pool server, or screenshot/inspect its dashboard or API.
 ---
 
-`bro` is a Node ESM CLI (`bin/bro.js` → `src/cli.js`) with an interactive
-arrow-key menu (`src/ui.js`) for picking a provider/model, plus a nested Bun
-HTTP service in `pool/` that it can start/stop/query. Drive it via
-`.claude/skills/run-bro-cli/driver.sh` — it wraps the non-interactive flag
-paths, a tmux-based TUI driver for the arrow-key menu, and an isolated
-instance of the pool server you can hit with curl. All paths and commands
+`bro` is a Node ESM CLI (`bin/bro.js` → `src/cli.js`) that launches Claude
+Code through a nested Bun HTTP service in `pool/`, which it can also
+start/stop/query. Drive it via `.claude/skills/run-bro-cli/driver.sh` — it
+wraps the non-interactive flag paths and an isolated instance of the pool
+server you can hit with curl. All paths and commands
 below are relative to the repo root.
 
-**Never let the driver actually spawn `claude`** — every non-interactive
-path uses `--dry-run`, and every TUI session is cancelled with Escape before
-reaching the final launch. `bro` uses whatever OAuth/API-key state already
+**Never let the driver actually spawn `claude`** — a bare `bro` starts the
+real pool and launches Claude, so every launch path goes through `--dry-run`. `bro` uses whatever OAuth/API-key state already
 exists on the machine, so a real launch opens an actual interactive Claude
 Code session (or a real proxy/browser) — outside what this driver is for.
 
@@ -22,7 +20,6 @@ Code session (or a real proxy/browser) — outside what this driver is for.
 ```bash
 node --version   # v18+ required (engines.node in package.json); this repo tested on v22
 bun --version     # required for pool/ (Bun >=1.1)
-brew install tmux # only needed for the interactive-TUI path; not preinstalled on macOS
 ```
 
 No build step — both packages run directly from source (`node bin/bro.js`, `bun run src/index.ts`).
@@ -34,47 +31,20 @@ chmod +x .claude/skills/run-bro-cli/driver.sh   # already executable in git, but
 .claude/skills/run-bro-cli/driver.sh help
 ```
 
-### Non-interactive (direct invocation — covers most of `src/cli.js`)
+### Direct invocation (covers `src/cli.js`)
 
 ```bash
 .claude/skills/run-bro-cli/driver.sh bro-help                        # bro --help
-.claude/skills/run-bro-cli/driver.sh list                            # bro --list
-.claude/skills/run-bro-cli/driver.sh dry-run anthropic claude-sonnet-4-6  # bro --dry-run -p ... -m ...
+.claude/skills/run-bro-cli/driver.sh dry-run --resume <id>          # bro --dry-run --resume <id>
 .claude/skills/run-bro-cli/driver.sh pool-status                     # bro pool status
 .claude/skills/run-bro-cli/driver.sh models-list                     # bro models list
 ```
 
-`dry-run` prints the exact `{via, cmd, args, baseUrl}` bro would launch —
-this is the fast path for testing provider/model resolution, permission-mode
-flags, and the `claude-code-router` config write logic in `src/launch.js`
-without ever spawning a process.
-
-### Interactive TUI (tmux-driven — exercises `src/ui.js`'s `select()`)
-
-```bash
-.claude/skills/run-bro-cli/driver.sh tui-start                 # launches `bro`, waits for the provider menu
-.claude/skills/run-bro-cli/driver.sh tui-send Down Down Enter   # move to "Claude (Anthropic)", pick it
-.claude/skills/run-bro-cli/driver.sh tui-wait "Choose a model"  # poll until the model menu renders
-.claude/skills/run-bro-cli/driver.sh tui-send Tab               # flip the "Skip permissions" toggle
-.claude/skills/run-bro-cli/driver.sh tui-capture                # print the current pane
-.claude/skills/run-bro-cli/driver.sh tui-cancel                 # Escape — cancels, never launches claude
-.claude/skills/run-bro-cli/driver.sh tui-stop                   # kill the tmux session if still alive
-```
-
-`tui-send` forwards its args straight to `tmux send-keys` (key names like
-`Down`, `Up`, `Enter`, `Tab`, `Escape`, or literal characters). Cancelling
-(Escape) at any menu exits the `bro` process cleanly and the tmux session
-ends on its own — `tui-stop` is just a safety net for a session left
-mid-menu.
-
-`tui-start` runs bro under an isolated scratch HOME
-(`$TMPDIR/bro-driver-home`), so the provider menu always opens at index 0
-(bro otherwise seeds the cursor from `lastProvider()` in the operator's
-`~/.bro/state.json`, which would make fixed keystroke sequences like
-`Down Down Enter` land on the wrong provider) and the driver never writes
-selection state into the operator's real `~/.bro`. First `tui-start` on a
-machine fetches the remote models list (a few seconds); later runs hit the
-scratch HOME's cache.
+`dry-run` prints the pool launch plan (server command, pool dir, accounts,
+the settings.json env block, and the `claude` command/args) — the fast path
+for testing permission-mode flags and claude-arg passthrough without ever
+spawning a process. It does read the live pool's `/v1/models` if one is
+running, but never starts or mutates anything.
 
 ### Standalone pool server (isolated — never touches a live pool)
 
@@ -102,15 +72,15 @@ the user's real `~/.claude/settings.json` backend override.
 ## Run (human path)
 
 ```bash
-node bin/bro.js        # interactive: pick a provider, then a model, then launches claude
-node bin/bro.js -p pool --dry-run   # preview the account-pool flow without starting anything
+node bin/bro.js            # start the pool if needed, then launch claude through it
+node bin/bro.js --dry-run  # preview the account-pool flow without starting anything
 ```
 
 ## Test
 
 ```bash
-node --test src/settings.test.js   # root Node test suite (node:test) — 6 pass
-cd pool && bun test                # pool Bun test suite (bun:test) — 87 pass across 14 files
+node --test src/*.test.js          # root Node test suite (node:test)
+cd pool && bun test                # pool Bun test suite (bun:test)
 ```
 
 ## Gotchas
@@ -124,27 +94,14 @@ cd pool && bun test                # pool Bun test suite (bun:test) — 87 pass 
   `( cd dir && exec cmd >log 2>&1 ) & echo $!` — see `driver.sh`'s
   `cmd_pool_serve_start`. Verified by checking `ps -p "$(cat pidfile)"`
   actually shows the `bun` process, not a `bash driver.sh …` process.
-- **macOS has no `timeout`.** GNU `timeout`/`gtimeout` isn't installed by
-  default; `driver.sh`'s `wait_for()` polls in a bounded loop instead
-  (`sleep 0.2` × N) rather than relying on it.
 - **A live pool server may already be running on :3456** with the
   operator's real Claude/Codex accounts (`bro pool status` shows it).
   `driver.sh`'s pool-serve commands default to an alternate port and an
   isolated `CLAUDE_POOL_DIR` specifically to avoid colliding with it —
   don't change them to port 3456 or the default pool dir.
-- **`bro image` opens a real OS browser window** (`open`/`xdg-open` in
-  `src/imagegen.js`) — it is not covered by this driver and shouldn't be
-  invoked from automation; it would pop a browser on the operator's
-  live desktop.
-- **The interactive select menu requires a real TTY** (`src/ui.js`'s
-  `isInteractive` check) — driving it needs tmux (or another pty), a
-  plain piped/`echo`'d stdin will just get "A terminal (TTY) is
-  required...".
 
 ## Troubleshooting
 
-- **`tmux: command not found`**: not preinstalled on macOS. `brew install
-  tmux` (Linux: `apt-get install -y tmux`).
 - **`pool server did not come up on :<port>`**: check
   `/tmp/bro-driver-pool-<port>.log` for the Bun startup error; usually
   means the port was already bound by a previous unstopped driver
