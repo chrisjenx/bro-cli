@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { applyPoolEnv } from './settings.js';
-import { waitForExit, reapplyPoolEnv, catalogSync, refreshPoolEnv, runPoolModels, POOL_SUBCOMMANDS, runPoolCommand } from './pool.js';
+import { waitForExit, reapplyPoolEnv, catalogSync, refreshPoolEnv, pointClaudeAtPool, releaseDeadOverride, listAccounts, runPoolModels, POOL_SUBCOMMANDS, runPoolCommand } from './pool.js';
 
 test('waitForExit resolves true once the process exits', async () => {
   const child = spawn('sleep', ['0.3']);
@@ -203,6 +203,69 @@ test('refreshPoolEnv gives up on a catalog body that stalls', { timeout: 3000 },
     });
   } finally {
     clearInterval(socket);
+  }
+});
+
+// `bro`, `bro pool up` and `bro pool restart` all go through pointClaudeAtPool,
+// so every launch moves a stale pin to the live catalog's newest model.
+test('every bro launch refreshes the pins of a running pool', async () => {
+  await withStalePool({}, async (paths) => {
+    await pointClaudeAtPool(4321, paths);
+    assert.equal(appliedEnv(paths).ANTHROPIC_DEFAULT_SONNET_MODEL, 'claude-sonnet-5-5[1m]');
+  });
+});
+
+// --dry-run previews the launch; it must not rewrite the live profile's
+// .claude.json cached Fable row.
+test('catalogSync with write: false leaves .claude.json alone', async () => {
+  const fable5 = { id: 'claude-fable-5', display_name: 'Claude Fable 5', created: 1, owned_by: 'anthropic-claude-max-pool' };
+  const fable51 = { id: 'claude-fable-5-1', display_name: 'Claude Fable 5.1', created: 2, owned_by: 'anthropic-claude-max-pool' };
+  await withStalePool({ catalog: [fable5, fable51, SONNET_5_5] }, async () => {
+    const file = path.join(process.env.CLAUDE_CONFIG_DIR, '.claude.json');
+    const stale = JSON.stringify({ additionalModelOptionsCache: [{ value: 'claude-fable-5', label: 'Fable', description: 'Fable 5 · Most capable' }] });
+    fs.writeFileSync(file, stale);
+    const derived = await catalogSync(4321, { write: false });
+    assert.equal(derived.pins.ANTHROPIC_DEFAULT_SONNET_MODEL, 'claude-sonnet-5-5[1m]');
+    assert.equal(fs.readFileSync(file, 'utf8'), stale);
+    await catalogSync(4321);
+    assert.notEqual(fs.readFileSync(file, 'utf8'), stale, 'the non-dry-run sync should refresh the row');
+  });
+});
+
+// A failed bring-up must not leave settings.json pointing at a dead pool, and a
+// non-pool server answering /health on the port must not pass for the pool.
+test('releaseDeadOverride clears the override when the port does not answer as the pool', async () => {
+  await withStalePool({}, async (paths) => {
+    // withStalePool's /health says plain "ok" — the shape of some other server.
+    assert.equal(await releaseDeadOverride(4321, paths), true);
+    assert.equal(appliedEnv(paths)?.ANTHROPIC_BASE_URL, undefined);
+  });
+});
+
+test('releaseDeadOverride keeps the override while the pool is healthy', async () => {
+  const fetch = async () => new Response(JSON.stringify({ status: 'ok', accounts: 2, available: 2, pending: 0 }));
+  await withStalePool({ fetch }, async (paths) => {
+    assert.equal(await releaseDeadOverride(4321, paths), false);
+    assert.equal(appliedEnv(paths).ANTHROPIC_BASE_URL, APPLIED_URL);
+  });
+});
+
+test('listAccounts counts ChatGPT (Codex) accounts by their openai-auth.json', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bro-pool-accounts-'));
+  try {
+    fs.mkdirSync(path.join(dir, 'codex'));
+    fs.writeFileSync(path.join(dir, 'codex', 'openai-auth.json'), JSON.stringify({ accessToken: 'at' }));
+    fs.mkdirSync(path.join(dir, 'codex-out'));
+    fs.writeFileSync(path.join(dir, 'codex-out', 'openai-auth.json'), JSON.stringify({}));
+    fs.mkdirSync(path.join(dir, 'claude'));
+    fs.writeFileSync(path.join(dir, 'claude', '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'x', subscriptionType: 'max' } }));
+    assert.deepEqual(listAccounts(dir), [
+      { name: 'claude', provider: 'anthropic', authenticated: true, subscriptionType: 'max' },
+      { name: 'codex', provider: 'openai', authenticated: true, subscriptionType: 'chatgpt' },
+      { name: 'codex-out', provider: 'openai', authenticated: false, subscriptionType: 'chatgpt' }
+    ]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 

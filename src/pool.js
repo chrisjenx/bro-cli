@@ -1,8 +1,9 @@
-// "Multiple Claude Account Proxy" — the top bro option.
+// "Multiple Claude Account Proxy" — everything bro does.
 //
-// Pools any number of Claude Max / Team logins behind one local Anthropic-
-// compatible endpoint and launches Claude Code against it, so a single session
-// draws from several plans and fails over automatically when one runs out.
+// Pools any number of Claude Max / Team and ChatGPT (Codex) logins behind one
+// local Anthropic-compatible endpoint and launches Claude Code against it, so a
+// single session draws from several plans and fails over automatically when one
+// runs out.
 //
 // The pool server itself lives in ../pool (a Bun/TypeScript app). This module is
 // the Node-side orchestrator: it ensures at least one account is authenticated,
@@ -18,7 +19,7 @@ import { createHash } from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { which, globalBinDirs, runInherit } from './proc.js';
-import { permissionArgs } from './config.js';
+import { permissionArgs, BRO_DIR } from './config.js';
 import { applyPoolEnv, clearPoolEnv, isPoolEnvActive, poolEnvBlock, appliedPoolEnv, scrubLegacyPins, scrubManagedContext, refreshCachedFableRowFile, sonnetPinFromCatalog, haikuPinFromCatalog, codexDefaultContextFromCatalog } from './settings.js';
 import { select, prompt, holdOrContinue } from './ui.js';
 
@@ -29,8 +30,8 @@ const POOL_ENTRY = path.join(POOL_ROOT, 'src', 'index.ts');
 const DEFAULT_PORT = 3456;
 const POOL_DIR = process.env.CLAUDE_POOL_DIR || path.join(os.homedir(), '.claude-max-pool');
 const ACCOUNTS_DIR = path.join(POOL_DIR, 'accounts');
-const PROXY_LOG = path.join(os.homedir(), '.bro', 'pool-proxy.log');
-const PROXY_PID = path.join(os.homedir(), '.bro', 'pool-proxy.pid');
+const PROXY_LOG = path.join(BRO_DIR, 'pool-proxy.log');
+const PROXY_PID = path.join(BRO_DIR, 'pool-proxy.pid');
 
 // --- account inspection (read the pool's on-disk state directly) -----------
 
@@ -54,11 +55,11 @@ function readMacKeychainCreds(configDir) {
   }
 }
 
-function listAccounts() {
+export function listAccounts(accountsDir = ACCOUNTS_DIR) {
   let names = [];
   try {
     names = fs
-      .readdirSync(ACCOUNTS_DIR, { withFileTypes: true })
+      .readdirSync(accountsDir, { withFileTypes: true })
       .filter((d) => d.isDirectory())
       .map((d) => d.name)
       .sort();
@@ -66,26 +67,34 @@ function listAccounts() {
     return [];
   }
   return names.map((name) => {
-    let authenticated = false;
-    let subscriptionType = null;
+    // Mirrors the pool's AccountManager: an openai-auth.json makes the account a
+    // ChatGPT (Codex) one, authenticated by its access token.
+    try {
+      const openai = JSON.parse(fs.readFileSync(path.join(accountsDir, name, 'openai-auth.json'), 'utf8'));
+      return { name, provider: 'openai', authenticated: Boolean(openai && openai.accessToken), subscriptionType: 'chatgpt' };
+    } catch {}
     let creds = null;
     try {
-      creds = JSON.parse(fs.readFileSync(path.join(ACCOUNTS_DIR, name, '.credentials.json'), 'utf8'));
+      creds = JSON.parse(fs.readFileSync(path.join(accountsDir, name, '.credentials.json'), 'utf8'));
     } catch {
       // No file on disk — on macOS the login lives in the Keychain.
-      creds = readMacKeychainCreds(path.join(ACCOUNTS_DIR, name));
+      creds = readMacKeychainCreds(path.join(accountsDir, name));
     }
     const oauth = creds && creds.claudeAiOauth;
-    authenticated = Boolean(oauth && oauth.accessToken);
-    subscriptionType = (oauth && oauth.subscriptionType) || null;
-    return { name, authenticated, subscriptionType };
+    return {
+      name,
+      provider: 'anthropic',
+      authenticated: Boolean(oauth && oauth.accessToken),
+      subscriptionType: (oauth && oauth.subscriptionType) || null
+    };
   });
 }
 
 // --- bun discovery ---------------------------------------------------------
 
 function findBun() {
-  const bun = which('bun', globalBinDirs());
+  // PATH first: globalBinDirs() shells out to npm, so only pay for it as a fallback.
+  const bun = which('bun') || which('bun', globalBinDirs());
   if (!bun) {
     throw new Error(
       'This feature needs Bun to run the pool server.\n' +
@@ -125,12 +134,13 @@ async function ensureAccount(bun) {
     const authed = accounts.filter((a) => a.authenticated);
     if (authed.length > 0) return authed;
 
-    console.log('\nNo authenticated Claude accounts in the pool yet.');
+    console.log('\nNo authenticated accounts in the pool yet.');
     const choice = await select({
       message: 'Add your first account:',
       choices: [
         { label: 'Log in a new Claude account (opens Claude to sign in)', value: 'login' },
         { label: "Import this machine's existing Claude login", value: 'import' },
+        { label: 'Log in a ChatGPT subscription (Codex) account', value: 'openai' },
         { label: 'Cancel', value: 'cancel' }
       ]
     }).catch(() => ({ value: 'cancel' }));
@@ -140,6 +150,9 @@ async function ensureAccount(bun) {
     if (choice.value === 'import') {
       const name = (await prompt('Name for the imported account [primary]: ').catch(() => '')) || 'primary';
       await runPoolCli(bun, ['accounts', 'import', name]);
+    } else if (choice.value === 'openai') {
+      const name = (await prompt('Name for the ChatGPT account [codex]: ').catch(() => '')) || 'codex';
+      await runPoolCli(bun, ['accounts', 'login', name, '--provider', 'openai']);
     } else {
       const name = (await prompt('Name for the new account [work]: ').catch(() => '')) || 'work';
       console.log(`\nOpening Claude to sign in as "${name}". Run /login, finish sign-in, then /exit.\n`);
@@ -151,6 +164,9 @@ async function ensureAccount(bun) {
 
 // --- proxy server lifecycle ------------------------------------------------
 
+// True only when the pool itself answers: any other server on the port (a dev
+// server's SPA fallback happily 200s /health) must not pass for the pool, or bro
+// would point every Claude session at it.
 async function healthy(port) {
   try {
     const ctrl = new AbortController();
@@ -160,7 +176,9 @@ async function healthy(port) {
       headers: { connection: 'close' }
     });
     clearTimeout(t);
-    return res.ok;
+    if (!res.ok) return false;
+    const body = await res.json();
+    return body?.status === 'ok' && Number.isFinite(body.accounts);
   } catch {
     return false;
   }
@@ -240,7 +258,9 @@ async function pendingRequests(port) {
   }
 }
 
-// Stop the (detached) server: by recorded pid, else by whatever holds the port.
+// Stop the (detached) server: by recorded pid, else by whatever holds the port —
+// but only when the port answers as the pool, so a failed start never kills an
+// unrelated server that happened to own it.
 // SIGTERM asks the server to drain in-flight streams; wait for the process to
 // actually exit so we never cut a response off mid-stream, and SIGKILL only if
 // the drain window is exhausted.
@@ -253,12 +273,14 @@ async function killProxy(port) {
   // Also whatever is LISTENING on the port (macOS/Linux) — covers a stale or
   // missing pid file. -sTCP:LISTEN is essential: a bare `lsof -ti tcp:<port>`
   // also matches the Claude sessions *connected* to the pool.
-  try {
-    const out = execFileSync('lsof', ['-ti', `tcp:${port}`, '-sTCP:LISTEN'], { stdio: ['ignore', 'pipe', 'ignore'] })
-      .toString()
-      .trim();
-    for (const p of out.split(/\s+/).filter(Boolean)) pids.add(Number.parseInt(p, 10));
-  } catch {}
+  if (await healthy(port)) {
+    try {
+      const out = execFileSync('lsof', ['-ti', `tcp:${port}`, '-sTCP:LISTEN'], { stdio: ['ignore', 'pipe', 'ignore'] })
+        .toString()
+        .trim();
+      for (const p of out.split(/\s+/).filter(Boolean)) pids.add(Number.parseInt(p, 10));
+    } catch {}
+  }
 
   const pending = await pendingRequests(port);
   const signaled = [];
@@ -363,8 +385,10 @@ function printStatus(status, baseUrl) {
 
 // --- entry point -----------------------------------------------------------
 
+// BRO_POOL_PORT, not the generic PORT: plenty of shells export PORT for a dev
+// server, and bare `bro` always goes through the pool.
 function poolPort() {
-  return Number.parseInt(process.env.PORT || '', 10) || DEFAULT_PORT;
+  return Number.parseInt(process.env.BRO_POOL_PORT || '', 10) || DEFAULT_PORT;
 }
 
 // The values written both to settings.json (for every session, agents included)
@@ -401,14 +425,15 @@ async function liveCatalog(baseUrl, timeoutMs = 8000) {
 // write, and a refresh of Claude Code's cached Fable row (see settings.js for
 // why the two families need different treatment). Best effort: with no catalog
 // nothing is pinned and the cached row is left as it is.
-export async function catalogSync(port) {
+// `write: false` derives without touching .claude.json (for --dry-run).
+export async function catalogSync(port, { write = true } = {}) {
   const models = await liveCatalog(poolEnvValues(port).baseUrl);
   if (!models) return { pins: {}, maxContextTokens: null };
-  return syncFromCatalog(models);
+  return syncFromCatalog(models, { write });
 }
 
-function syncFromCatalog(models) {
-  refreshCachedFableRowFile(models);
+function syncFromCatalog(models, { write = true } = {}) {
+  if (write) refreshCachedFableRowFile(models);
   return {
     pins: { ...sonnetPinFromCatalog(models), ...haikuPinFromCatalog(models) },
     maxContextTokens: codexDefaultContextFromCatalog(models)
@@ -421,6 +446,40 @@ function syncFromCatalog(models) {
 // already applied (see appliedPoolEnv). Unlike up/restart, an unreachable
 // catalog changes nothing: dropping the Sonnet pin would bring the duplicate
 // 200K row back. Returns true when it re-applied.
+// Point this profile's settings.json at the running pool with pins derived from
+// its live catalog. Shared by `bro`, `bro pool up` and `bro pool restart`, so
+// every launch brings stale pins current. Returns the derived values.
+export async function pointClaudeAtPool(port, paths) {
+  const derived = await catalogSync(port);
+  reapplyPoolEnv(port, paths, derived);
+  return derived;
+}
+
+// When the pool couldn't be brought up, don't leave settings.json pointing at
+// it: Claude Code has no fallback for an unreachable base URL, so every session
+// (agents included) would fail until `bro pool down`.
+export async function releaseDeadOverride(port, paths) {
+  if (!isPoolEnvActive(paths) || (await healthy(port))) return false;
+  clearPoolEnv(paths);
+  console.error(
+    'bro: the pool is not running, so it was removed as your Claude backend —\n' +
+      '     Claude Code uses your normal login again. (`bro` or `bro pool up` to retry.)'
+  );
+  return true;
+}
+
+// Run the bring-up steps; if they throw or bail out, release a dead override.
+async function withOverrideGuard(port, fn) {
+  try {
+    const result = await fn();
+    if (result === null) await releaseDeadOverride(port);
+    return result;
+  } catch (e) {
+    await releaseDeadOverride(port);
+    throw e;
+  }
+}
+
 export async function refreshPoolEnv({ paths, timeoutMs } = {}) {
   const applied = appliedPoolEnv(paths);
   if (!applied) return false;
@@ -437,14 +496,18 @@ export async function refreshPoolEnv({ paths, timeoutMs } = {}) {
 export async function poolUp() {
   const port = poolPort();
   const baseUrl = `http://127.0.0.1:${port}`;
-  const bun = findBun();
-  const authed = await ensureAccount(bun);
-  if (authed.length === 0) {
-    console.log('No accounts configured — nothing to start.');
-    return 0;
-  }
-  await ensureServer(bun, port, baseUrl);
-  reapplyPoolEnv(port, undefined, await catalogSync(port));
+  const up = await withOverrideGuard(port, async () => {
+    const bun = findBun();
+    const authed = await ensureAccount(bun);
+    if (authed.length === 0) {
+      console.log('No accounts configured — nothing to start.');
+      return null;
+    }
+    await ensureServer(bun, port, baseUrl);
+    await pointClaudeAtPool(port);
+    return true;
+  });
+  if (!up) return 0;
   printStatus(await fetchStatus(port), baseUrl);
   console.log('  ' + C.green('Pool is now the backend for all Claude Code sessions') + C.dim(' (agents included).'));
   console.log('  ' + C.dim('Stop it with ') + 'bro pool down');
@@ -472,15 +535,17 @@ export async function poolDown() {
 export async function poolRestart() {
   const port = poolPort();
   const baseUrl = `http://127.0.0.1:${port}`;
-  const bun = findBun();
-  if (await healthy(port)) {
-    console.log('Restarting the pool — stopping the server (in-flight requests drain first)…');
-    await killProxy(port);
-  } else {
-    console.log('Pool server not running — starting it.');
-  }
-  await ensureServer(bun, port, baseUrl);
-  reapplyPoolEnv(port, undefined, await catalogSync(port));
+  await withOverrideGuard(port, async () => {
+    const bun = findBun();
+    if (await healthy(port)) {
+      console.log('Restarting the pool — stopping the server (in-flight requests drain first)…');
+      await killProxy(port);
+    } else {
+      console.log('Pool server not running — starting it.');
+    }
+    await ensureServer(bun, port, baseUrl);
+    await pointClaudeAtPool(port);
+  });
   printStatus(await fetchStatus(port), baseUrl);
   console.log('  ' + C.green('Pool restarted.') + '\n');
   return 0;
@@ -535,7 +600,7 @@ export async function runPool({ extraArgs = [], permissionMode = 'auto', dryRun 
   const { baseUrl: b, token } = poolEnvValues(port);
 
   if (dryRun) {
-    const derived = await catalogSync(port);
+    const derived = await catalogSync(port, { write: false });
     const settingsEnv = poolEnvBlock({ baseUrl: b, token, ...derived });
     return {
       via: 'multiple-account pool',
@@ -553,20 +618,21 @@ export async function runPool({ extraArgs = [], permissionMode = 'auto', dryRun 
     };
   }
 
-  const bun = findBun();
-
-  // 1) At least one authenticated account.
-  const authed = await ensureAccount(bun);
-  if (authed.length === 0) {
-    console.log('No accounts configured — nothing to launch.');
-    return 0;
-  }
-
-  // 2) Bring the (persistent) server up and make the pool the backend for every
-  //    Claude Code session, including agents started from the agents view.
-  await ensureServer(bun, port, baseUrl);
-  const derived = await catalogSync(port);
-  reapplyPoolEnv(port, undefined, derived);
+  // 1) At least one authenticated account, then 2) bring the (persistent) server
+  //    up and make the pool the backend for every Claude Code session, including
+  //    agents started from the agents view. A failure or cancel here must not
+  //    leave a dead pool as the backend.
+  const derived = await withOverrideGuard(port, async () => {
+    const bun = findBun();
+    const authed = await ensureAccount(bun);
+    if (authed.length === 0) {
+      console.log('No accounts configured — nothing to launch.');
+      return null;
+    }
+    await ensureServer(bun, port, baseUrl);
+    return pointClaudeAtPool(port);
+  });
+  if (!derived) return 0;
 
   // 3) Flash the live status, then launch. Hold ~1.5s; enter launches now,
   //    any other key pauses so you can read it, esc cancels.

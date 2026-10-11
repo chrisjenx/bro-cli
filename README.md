@@ -41,9 +41,11 @@ bro pool down     # stop the pool and restore your normal Claude login
 ```
 
 The override stays active until you run `bro pool down`. Claude Code has no
-fallback for an unreachable base URL, so if the pool server stops while the
-override is set, run `bro` or `bro pool up` to restart it (or `bro pool down` to
-go back to your normal login). Note: pointing Claude at a local proxy disables MCP tool
+fallback for an unreachable base URL, so if `bro` or `bro pool up` can't bring
+the pool up (no accounts, Bun missing, server won't start) it removes the
+override again rather than leave Claude pointed at nothing. If the server dies
+on its own later, run `bro` or `bro pool up` to restart it (or `bro pool down`
+to go back to your normal login). Note: pointing Claude at a local proxy disables MCP tool
 search and Remote Control for those sessions.
 
 Manage pool accounts directly through `bro`:
@@ -72,6 +74,12 @@ bro models update   # add newly listed Codex models from authenticated accounts
 Built-in Codex ids include the `gpt-6` Astra/Sol/Luna family, the `gpt-5.6` Sol/Terra/Luna family, `gpt-5.5`, `gpt-5.4`, and `gpt-5.4-mini`. Extended-context models appear once in Claude Code's picker with a `[1m]` selector. When cross-provider mapping is enabled, the defaults are Fable → GPT-6 Astra, Opus and Sonnet → GPT-6 Sol (GPT-6 has no Terra), and Haiku → GPT-6 Luna; dashboard overrides still win. Run `bro pool restart` after an update to load new routes into a running pool; edit the pool's `models.json` for custom aliases or overrides. Full details in [`pool/README.md`](./pool/README.md#openai--codex-chatgpt-subscription-accounts).
 
 **Failover:** when the serving account's usage/rate limit runs out before any output has streamed, the pool transparently sidelines it and retries the turn on the next account — you just keep going. Set `CLAUDE_POOL_BACKEND=cli` to use the older subprocess backend. Requires Bun (`bro` finds it automatically; install from [bun.sh](https://bun.sh)). See [`pool/README.md`](./pool/README.md) for the pool's own docs, endpoints, and configuration.
+
+## Port
+
+The pool listens on `127.0.0.1:3456`. Set `BRO_POOL_PORT` to use another port
+(the generic `PORT` is deliberately ignored — many shells export it for a dev
+server).
 
 ## Permission mode
 

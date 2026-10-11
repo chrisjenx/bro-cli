@@ -2,7 +2,6 @@ node_modules/
 *.log
 .DS_Store
 .bro/
-tmp_imagegen_test/
 .superpowers/
 docs/superpowers/
 .claude/worktrees/

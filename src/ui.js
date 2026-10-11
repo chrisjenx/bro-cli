@@ -8,12 +8,12 @@ export const isInteractive = Boolean(stdin.isTTY && stdout.isTTY);
 // A tiny zero-dependency arrow-key list selector. Works in Windows Terminal,
 // conhost, macOS and Linux (Node's readline normalises the key sequences).
 // Returns the chosen item, or throws Error('cancelled') on Esc / Ctrl-C.
-export function select({ message, choices, startIndex = 0 }) {
+export function select({ message, choices }) {
   if (!isInteractive) {
     return Promise.reject(new Error('A terminal (TTY) is required to choose interactively.'));
   }
   return new Promise((resolve, reject) => {
-    let index = Math.max(0, Math.min(startIndex, choices.length - 1));
+    let index = 0;
     const lines = choices.length + 1; // message + choices
     const hint = `\x1b[2m  ↑/↓ move · enter select · esc cancel\x1b[0m`;
 

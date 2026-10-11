@@ -32,11 +32,31 @@ Usage:
   bro -v, --version      Show version
   bro --resume <id>      Launch through the pool, passing args to claude
   bro -- <args...>       Force everything after -- straight to claude
+                         (e.g. \`bro -- -p "prompt"\` for claude's print mode)
+  bro -p pool            Same as \`bro\` — kept from when bro had other providers
 
 Put bro flags first. The first unrecognized arg, and everything after it,
 is passed verbatim to claude.
 
 Config:  ${CONFIG_PATH}`;
+
+// Flags and commands from when bro also launched other providers. Rejected with
+// a pointer instead of falling through to claude, where they would run only
+// after the pool had been started and set as the global backend — and where
+// `update` and `-p` mean something else entirely.
+const REMOVED = {
+  '--provider': 'bro only launches through the pool now — run `bro` (or `bro -- -p "prompt"` for claude print mode)',
+  '-p': 'bro only launches through the pool now — run `bro` (or `bro -- -p "prompt"` for claude print mode)',
+  '--model': 'pick a model inside Claude Code with /model, or pass it through: `bro -- --model <id>`',
+  '-m': 'pick a model inside Claude Code with /model, or pass it through: `bro -- --model <id>`',
+  '--list': 'see the pool routing table with `bro models list`',
+  '-l': 'see the pool routing table with `bro models list`',
+  update: 'refresh pool models with `bro models update`',
+  '--update': 'refresh pool models with `bro models update`',
+  image: 'image generation was removed from bro',
+  'image-gen': 'image generation was removed from bro',
+  '--image': 'image generation was removed from bro'
+};
 
 function parseArgs(argv) {
   const a = { _: [] };
@@ -49,6 +69,7 @@ function parseArgs(argv) {
     else if (t === '--dry-run') a.dryRun = true;
     else if (t === '--safe') a.safe = true;
     else if (t === '--help' || t === '-h') a.help = true;
+    else if (Object.hasOwn(REMOVED, t)) { a.removed = t; break; }
     else if (t === '--version' || t === '-v') a.version = true;
     else {
       // Unknown args belong to Claude. Once Claude args begin, preserve the
@@ -76,6 +97,10 @@ export async function main(argv) {
   const args = parseArgs(argv);
   if (args.help) { console.log(HELP); return 0; }
   if (args.version) { console.log(pkg.version); return 0; }
+  if (args.removed) {
+    console.error(`bro: \`${args.removed}\` was removed — ${REMOVED[args.removed]}.`);
+    return 1;
+  }
 
   // Claude starts in auto mode by default; --safe forces manual.
   const permissionMode = args.safe ? 'manual' : configPermissionMode(loadConfig());

@@ -11,9 +11,10 @@ server you can hit with curl. All paths and commands
 below are relative to the repo root.
 
 **Never let the driver actually spawn `claude`** — a bare `bro` starts the
-real pool and launches Claude, so every launch path goes through `--dry-run`. `bro` uses whatever OAuth/API-key state already
-exists on the machine, so a real launch opens an actual interactive Claude
-Code session (or a real proxy/browser) — outside what this driver is for.
+real pool and launches Claude, so every launch path goes through `--dry-run`.
+`bro` uses whatever OAuth state already exists on the machine, so a real
+launch opens an actual interactive Claude Code session — outside what this
+driver is for.
 
 ## Prerequisites
 
@@ -44,7 +45,7 @@ chmod +x .claude/skills/run-bro-cli/driver.sh   # already executable in git, but
 the settings.json env block, and the `claude` command/args) — the fast path
 for testing permission-mode flags and claude-arg passthrough without ever
 spawning a process. It does read the live pool's `/v1/models` if one is
-running, but never starts or mutates anything.
+running, but never starts the pool or writes settings.json / `.claude.json`.
 
 ### Standalone pool server (isolated — never touches a live pool)
 

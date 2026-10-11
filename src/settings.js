@@ -7,6 +7,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
+import { BRO_DIR } from './config.js';
 
 // Keys bro writes today: just enough to point Claude Code at the pool.
 const MANAGED_CONTEXT_MARKER = 'BRO_POOL_MANAGED_MAX_CONTEXT_TOKENS';
@@ -233,17 +234,16 @@ function snapshotValue(env, k) {
 // state left for bro to find it by. The default profile keeps the original
 // filename so state written by an earlier bro still round-trips.
 function stateFileFor(claudeDir) {
-  const broDir = path.join(os.homedir(), '.bro');
   const resolved = path.resolve(claudeDir);
   if (resolved === path.resolve(path.join(os.homedir(), '.claude'))) {
-    return path.join(broDir, 'pool-settings.json');
+    return path.join(BRO_DIR, 'pool-settings.json');
   }
   // Readable stem for eyeballing ~/.bro, hash for collision-free + bounded.
   // Profile dirs are dot-prefixed, so drop leading dots or the name reads
   // `pool-settings..claude-personal.<hash>.json`.
   const stem = path.basename(resolved).replace(/^\.+/, '').replace(/[^a-zA-Z0-9._-]+/g, '-').slice(0, 40);
   const hash = createHash('sha256').update(resolved).digest('hex').slice(0, 8);
-  return path.join(broDir, `pool-settings.${stem}.${hash}.json`);
+  return path.join(BRO_DIR, `pool-settings.${stem}.${hash}.json`);
 }
 
 // Where Claude Code actually reads settings from (honor CLAUDE_CONFIG_DIR, which

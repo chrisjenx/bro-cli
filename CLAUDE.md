@@ -9,7 +9,7 @@ Root package (Node ESM CLI):
 ```sh
 npm start                 # run bro via node bin/bro.js
 node bin/bro.js --help    # inspect CLI commands and flags
-node bin/bro.js --dry-run # preview the pool launch without starting anything
+node bin/bro.js --dry-run # preview the pool launch; starts nothing, writes no settings
 node --test src/*.test.js # run root Node tests
 node --test src/settings.test.js # run one root test file
 ```
@@ -35,9 +35,9 @@ This repo ships the `bro` CLI (`bin/bro.js` -> `src/cli.js`) plus a nested Bun s
 
 The root CLI is a thin launcher/manager for the pool; it has no other providers.
 
-- `src/cli.js` is the top-level command dispatcher. It handles `bro accounts`, `bro models`, `bro pool`, and otherwise launches Claude Code through the pool (`--dry-run`, `--safe`, and passthrough claude args). `-p pool` is still accepted as a no-op alias.
+- `src/cli.js` is the top-level command dispatcher. It handles `bro accounts`, `bro models`, `bro pool`, and otherwise launches Claude Code through the pool (`--dry-run`, `--safe`, and passthrough claude args). `-p pool` is still accepted as a no-op alias; other removed flags/commands (`-p <x>`, `-m`, `-l`, `update`, `image`) are rejected so they never reach `claude` after the global override is written.
 - `src/config.js` reads the optional `~/.bro/config.json` (only `permissionMode` / legacy `dangerouslySkipPermissions` are used) and maps the posture to claude flags.
-- `src/pool.js` bridges root commands to the nested pool service: account/model management, starting/stopping the detached pool, health checks, launching `claude` against it, and managing the global Claude Code backend override in `~/.claude/settings.json`.
+- `src/pool.js` bridges root commands to the nested pool service: account/model management, starting/stopping the detached pool, health checks, launching `claude` against it, and managing the global Claude Code backend override in `~/.claude/settings.json`. A failed or cancelled bring-up releases a dead override (`withOverrideGuard`). The pool port comes from `BRO_POOL_PORT` (not `PORT`), and `/health` must look like the pool's before it is trusted or its listener killed.
 - `src/settings.js` owns applying/clearing the pool backend override while preserving pre-existing Claude settings, plus catalog-derived model pins.
 - `src/proc.js` (cross-platform `which`/spawn) and `src/ui.js` (arrow-key select, prompts) are shared helpers.
 
