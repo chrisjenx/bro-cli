@@ -180,3 +180,21 @@ test("models update reports token-refresh failures without printing provider res
     }
   }, { refreshToken: "fixture-refresh" });
 });
+
+test("models update fetches the catalog from CODEX_API_BASE_URL when set", async () => {
+  const previous = process.env.CODEX_API_BASE_URL;
+  process.env.CODEX_API_BASE_URL = "http://127.0.0.1:9999/fake/codex";
+  try {
+    await withPool(async (config) => {
+      const urls: string[] = [];
+      const fetchFn = (async (url: string | URL | Request) => {
+        urls.push(String(url));
+        return Response.json({ models: [{ slug: "gpt-6.1-sol", visibility: "list", supported_reasoning_levels: [{ effort: "high" }] }] });
+      }) as typeof fetch;
+      expect(await runModelsCommand(config, ["update"], fetchFn)).toBe(0);
+      expect(urls).toEqual(["http://127.0.0.1:9999/fake/codex/models?client_version=0.200.0"]);
+    });
+  } finally {
+    if (previous === undefined) delete process.env.CODEX_API_BASE_URL; else process.env.CODEX_API_BASE_URL = previous;
+  }
+});

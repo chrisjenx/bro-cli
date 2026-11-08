@@ -2,9 +2,8 @@ import type { AccountManager } from "../accounts/manager.ts";
 import type { Config } from "../config.ts";
 import { isCodexEffort, type ModelRoute } from "../models.ts";
 import { ensureFreshToken } from "./openai-codex.ts";
-import { CODEX_ACCOUNT_ID_HEADER, CODEX_ORIGINATOR } from "./codex-constants.ts";
+import { CODEX_ACCOUNT_ID_HEADER, CODEX_ORIGINATOR, codexModelsUrl } from "./codex-constants.ts";
 
-const CODEX_MODELS_URL = "https://chatgpt.com/backend-api/codex/models?client_version=0.200.0";
 const CATALOG_TIMEOUT_MS = 8_000;
 
 function positiveInteger(value: unknown): number | undefined {
@@ -68,7 +67,7 @@ async function fetchAccountCatalog(
   let creds = await credentials(false);
   const request = async (): Promise<Response> => {
     try {
-      return await fetchFn(CODEX_MODELS_URL, {
+      return await fetchFn(codexModelsUrl(), {
         headers: {
           authorization: `Bearer ${creds.accessToken}`,
           [CODEX_ACCOUNT_ID_HEADER]: creds.accountId ?? "",

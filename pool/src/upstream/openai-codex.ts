@@ -15,7 +15,7 @@ import { supportedEffortsFor, type ModelRoute } from "../models.ts";
 import { refreshOpenAIToken } from "../accounts/openai-oauth.ts";
 import { anthropicToCodexRequest, CodexToAnthropicStream } from "./codex-translate.ts";
 import { durationToWindowKey } from "./codex-windows.ts";
-import { CODEX_RESPONSES_URL, CODEX_ORIGINATOR, CODEX_ACCOUNT_ID_HEADER, CODEX_RATE_LIMIT_HEADERS } from "./codex-constants.ts";
+import { codexResponsesUrl, CODEX_ORIGINATOR, CODEX_ACCOUNT_ID_HEADER, CODEX_RATE_LIMIT_HEADERS } from "./codex-constants.ts";
 import { anthropicError, clientAbortedResponse, makeAbort, fetchWithIdleTimeout, SseParser, isRateLimit, retryAfterMs, parseJson, stringProp, objectProp, RETRYABLE_TRANSPORT_HEADER } from "./shared.ts";
 import type { ProxyHooks } from "./shared.ts";
 
@@ -309,7 +309,7 @@ async function fetchCodex(
 ): Promise<{ response: Response; cleanup: () => void; failureSignal: AbortSignal }> {
   const abort = makeAbort(config, signal);
   try {
-    const upstream = await fetchWithIdleTimeout(CODEX_RESPONSES_URL, {
+    const upstream = await fetchWithIdleTimeout(codexResponsesUrl(), {
       method: "POST",
       headers: {
         "content-type": "application/json",
