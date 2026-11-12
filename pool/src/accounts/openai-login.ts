@@ -9,7 +9,7 @@ import type { AccountManager } from "./manager.ts";
 import { normalizeCodexAuthJson } from "./openai-oauth.ts";
 import {
   CODEX_AUTH_URL,
-  CODEX_TOKEN_URL,
+  codexTokenUrl,
   CODEX_CLIENT_ID,
   CODEX_OAUTH_REDIRECT_PORT,
   CODEX_OAUTH_REDIRECT_PORT_FALLBACK,
@@ -115,7 +115,7 @@ export async function loginOpenAI(mgr: AccountManager, name: string): Promise<bo
   // with grant_type=authorization_code, code, redirect_uri, client_id, code_verifier.
   let res: Response;
   try {
-    res = await fetch(CODEX_TOKEN_URL, {
+    res = await fetch(codexTokenUrl(), {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({

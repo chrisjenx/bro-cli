@@ -47,6 +47,35 @@ export const CODEX_OAUTH_SCOPES =
  * Matches the brief's guess exactly. */
 export const CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
 
+/** Default Codex API base (the prefix of CODEX_RESPONSES_URL; `/models` hangs off it too). */
+export const CODEX_API_BASE_URL_DEFAULT = "https://chatgpt.com/backend-api/codex";
+
+/** Codex API base URL. `CODEX_API_BASE_URL` overrides the default (used by pooltime's
+ * differential harness to point bro at a local fake). Read at CALL time, not module load,
+ * so tests and wrappers can set the env after import (config.ts likewise reads its env
+ * overrides when loadConfig runs, not at import). Unset or empty means the default; a
+ * trailing slash is trimmed. The usage endpoint (`/backend-api/wham/usage`) is NOT under
+ * this base — it has its own `CODEX_USAGE_URL` override in config.ts. */
+export function codexApiBaseUrl(): string {
+  return (process.env.CODEX_API_BASE_URL || CODEX_API_BASE_URL_DEFAULT).replace(/\/+$/, "");
+}
+
+/** `POST {base}/responses` — honors CODEX_API_BASE_URL. */
+export function codexResponsesUrl(): string {
+  return `${codexApiBaseUrl()}/responses`;
+}
+
+/** `GET {base}/models?client_version=…` — honors CODEX_API_BASE_URL. */
+export function codexModelsUrl(): string {
+  return `${codexApiBaseUrl()}/models?client_version=0.200.0`;
+}
+
+/** OAuth token endpoint. `OPENAI_OAUTH_TOKEN_URL` overrides CODEX_TOKEN_URL; read at call
+ * time, unset or empty means the default. */
+export function codexTokenUrl(): string {
+  return process.env.OPENAI_OAUTH_TOKEN_URL || CODEX_TOKEN_URL;
+}
+
 /** `originator` header value identifying the client (only sent when it differs
  * from this default — see codex-rs/core/src/client.rs:1885-1897 `add_originator_header`).
  * — codex-rs/login/src/auth/default_client.rs:42 (`pub const DEFAULT_ORIGINATOR: &str = "codex_cli_rs";`)

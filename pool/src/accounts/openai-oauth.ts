@@ -3,7 +3,7 @@
  * and refresh. The interactive browser login lives in the CLI layer.
  */
 import type { OpenAIOauthCreds } from "./types.ts";
-import { CODEX_TOKEN_URL, CODEX_CLIENT_ID } from "../upstream/codex-constants.ts";
+import { codexTokenUrl, CODEX_CLIENT_ID } from "../upstream/codex-constants.ts";
 
 export function normalizeCodexAuthJson(raw: unknown): OpenAIOauthCreds | null {
   if (raw == null || typeof raw !== "object") return null;
@@ -28,7 +28,7 @@ export async function refreshOpenAIToken(
   if (!creds.refreshToken) throw new Error("OpenAI account has no refresh token; re-run accounts login");
   let response: Response;
   try {
-    response = await fetchFn(CODEX_TOKEN_URL, {
+    response = await fetchFn(codexTokenUrl(), {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
